@@ -207,6 +207,7 @@ mod tests {
             exited: None,
             created_unix_ms: created,
             worktree: wt.map(PathBuf::from),
+            agent: None,
         }
     }
 

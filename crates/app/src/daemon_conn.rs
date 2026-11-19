@@ -153,6 +153,7 @@ async fn session(
                         ClientMsg::RemoveWorktree { project_id, path, force, delete_branch }
                     }
                     Cmd::Kill(id) => ClientMsg::KillTerminal { id },
+                    Cmd::MarkSeen(id) => ClientMsg::MarkSeen { id },
                     Cmd::Input(id, bytes) => ClientMsg::Input { id, bytes },
                     Cmd::Resize(id, cols, rows) => ClientMsg::Resize { id, cols, rows },
                 };
@@ -223,6 +224,18 @@ impl Conn {
             }
             ServerMsg::TerminalRemoved { id } => {
                 self.state.lock().terminals.retain(|t| t.info.id != id);
+            }
+            ServerMsg::AgentStatusChanged { id, status } => {
+                let mut st = self.state.lock();
+                if let Some(t) = st.terminals.iter_mut().find(|t| t.info.id == id) {
+                    t.info.agent = status;
+                }
+            }
+            ServerMsg::TerminalTitle { id, title } => {
+                let mut st = self.state.lock();
+                if let Some(t) = st.terminals.iter_mut().find(|t| t.info.id == id) {
+                    t.info.title = title;
+                }
             }
             ServerMsg::Output { id, seq, bytes } => {
                 if let Some(s) = self.session_of(id) {

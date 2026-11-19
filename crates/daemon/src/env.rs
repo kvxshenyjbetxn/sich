@@ -83,7 +83,13 @@ pub fn with_forced(base: Vec<(OsString, OsString)>) -> Vec<(OsString, OsString)>
 ///
 /// The Windows registry environment is what the user configured on purpose, so it is kept
 /// as-is (launcher leaks can't be in it). Only an inherited environment gets filtered.
-pub fn terminal_env() -> Vec<(OsString, OsString)> {
+pub fn terminal_env(term_id: u64, socket: &str) -> Vec<(OsString, OsString)> {
+    let mut env = base_terminal_env();
+    add_term_vars(&mut env, term_id, socket);
+    env
+}
+
+fn base_terminal_env() -> Vec<(OsString, OsString)> {
     #[cfg(windows)]
     {
         match windows_user_env() {
@@ -92,6 +98,13 @@ pub fn terminal_env() -> Vec<(OsString, OsString)> {
         }
     }
     build_env(std::env::vars_os().collect())
+}
+
+/// Per-terminal variables (`sich hook` finds its terminal and the daemon through them). Applied
+/// after filtering, because the filter strips inherited `SICH_*`.
+pub fn add_term_vars(env: &mut Vec<(OsString, OsString)>, term_id: u64, socket: &str) {
+    upsert(env, "SICH_TERM_ID".into(), term_id.to_string().into());
+    upsert(env, "SICH_SOCKET".into(), socket.into());
 }
 
 /// Parses a UTF-16 double-NUL-terminated environment block. Skips `=`-prefixed entries.
@@ -170,6 +183,26 @@ mod tests {
         assert_eq!(get(&env, "PATH"), Some(&os("C:\\bin")));
         assert_eq!(get(&env, "TERM_PROGRAM"), Some(&os("sich")));
         assert_eq!(get(&env, "COLORTERM"), Some(&os("truecolor")));
+    }
+
+    #[test]
+    fn term_vars_survive_the_filter_and_override_inherited() {
+        let mut env = build_env(pairs(&[("SICH_TERM_ID", "99"), ("SICH_SOCKET", "old"), ("KEEP", "1")]));
+        assert!(get(&env, "SICH_TERM_ID").is_none(), "inherited SICH_* is stripped");
+        add_term_vars(&mut env, 7, "sich-x");
+        assert_eq!(get(&env, "SICH_TERM_ID"), Some(&os("7")));
+        assert_eq!(get(&env, "SICH_SOCKET"), Some(&os("sich-x")));
+        assert!(get(&env, "KEEP").is_some());
+        add_term_vars(&mut env, 8, "sich-y");
+        assert_eq!(env.iter().filter(|(k, _)| k == "SICH_TERM_ID").count(), 1);
+        assert_eq!(get(&env, "SICH_TERM_ID"), Some(&os("8")));
+    }
+
+    #[test]
+    fn terminal_env_has_term_vars() {
+        let env = terminal_env(5, "sock");
+        assert_eq!(get(&env, "SICH_TERM_ID"), Some(&os("5")));
+        assert_eq!(get(&env, "SICH_SOCKET"), Some(&os("sock")));
     }
 
     #[test]

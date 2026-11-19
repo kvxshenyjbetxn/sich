@@ -61,6 +61,7 @@ pub(crate) enum Cmd {
     CreateWorktree { project_id: ProjectId, name: String, base: Option<String> },
     RemoveWorktree { project_id: ProjectId, path: PathBuf, force: bool, delete_branch: bool },
     Kill(TermId),
+    MarkSeen(TermId),
     Input(TermId, Vec<u8>),
     Resize(TermId, u16, u16),
 }
@@ -174,5 +175,11 @@ impl DaemonClient {
 
     pub fn kill_terminal(&self, id: TermId) {
         let _ = self.cmd_tx.send(Cmd::Kill(id));
+    }
+
+    /// Tells the daemon the user has looked at the terminal (clears its `unread`).
+    #[allow(dead_code)] // wired to the UI separately
+    pub fn mark_seen(&self, id: TermId) {
+        let _ = self.cmd_tx.send(Cmd::MarkSeen(id));
     }
 }

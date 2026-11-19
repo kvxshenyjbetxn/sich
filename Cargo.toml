@@ -30,6 +30,7 @@ log = "0.4"
 sich-proto = { path = "crates/proto" }
 sich-daemon = { path = "crates/daemon" }
 sich-term = { path = "crates/term" }
+sich-hooks = { path = "crates/hooks" }
 
 [profile.release]
 opt-level = 3

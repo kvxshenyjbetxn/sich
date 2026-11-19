@@ -168,6 +168,10 @@ async fn handle_msg(msg: ClientMsg, mgr: &Arc<Manager>, conn: &ConnHandle) {
         ClientMsg::RemoveWorktree { project_id, path, force, delete_branch } => {
             projects::remove_worktree(mgr, conn, project_id, path, force, delete_branch).await;
         }
+        ClientMsg::AgentHook { term_id, agent, payload } => {
+            mgr.agent_hook(term_id, agent, &payload);
+        }
+        ClientMsg::MarkSeen { id } => mgr.mark_seen(id),
         ClientMsg::Shutdown => {
             tracing::info!(conn = conn.id, "shutdown requested");
             mgr.shutdown.cancel();

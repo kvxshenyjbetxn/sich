@@ -12,6 +12,17 @@ fn info() -> TerminalInfo {
         exited: Some(Some(-1)),
         created_unix_ms: 1_700_000_000_000,
         worktree: Some(PathBuf::from("/wt/a")),
+        agent: Some(status()),
+    }
+}
+
+fn status() -> AgentStatus {
+    AgentStatus {
+        kind: AgentKind::Claude,
+        state: AgentState::Waiting,
+        unread: true,
+        since_unix_ms: 1_700_000_000_123,
+        detail: Some("Claude needs your permission".into()),
     }
 }
 
@@ -73,6 +84,13 @@ fn client_msgs_round_trip() {
             force: true,
             delete_branch: false,
         },
+        ClientMsg::AgentHook {
+            term_id: 3,
+            agent: AgentKind::Claude,
+            payload: r#"{"hook_event_name":"Stop"}"#.into(),
+        },
+        ClientMsg::AgentHook { term_id: 1, agent: AgentKind::Gemini, payload: String::new() },
+        ClientMsg::MarkSeen { id: 8 },
         ClientMsg::Shutdown,
     ];
     for m in msgs {
@@ -95,12 +113,38 @@ fn server_msgs_round_trip() {
         ServerMsg::Projects(vec![project()]),
         ServerMsg::Projects(vec![]),
         ServerMsg::OpFailed { op: "create_worktree".into(), message: "exists".into() },
+        ServerMsg::AgentStatusChanged { id: 2, status: Some(status()) },
+        ServerMsg::AgentStatusChanged { id: 2, status: None },
+        ServerMsg::TerminalTitle { id: 2, title: "Claude Code".into() },
         ServerMsg::Error { message: "boom".into() },
     ];
     for m in msgs {
         let bytes = encode(&m).unwrap();
         assert_eq!(decode::<ServerMsg>(&bytes).unwrap(), m);
     }
+}
+
+#[test]
+fn agent_enums_round_trip() {
+    for kind in [AgentKind::Claude, AgentKind::Gemini, AgentKind::Codex, AgentKind::Other] {
+        let st = AgentStatus { kind, ..status() };
+        assert_eq!(decode::<AgentStatus>(&encode(&st).unwrap()).unwrap(), st);
+    }
+    for state in [
+        AgentState::Working,
+        AgentState::Waiting,
+        AgentState::Done,
+        AgentState::Failed,
+        AgentState::Idle,
+    ] {
+        let st = AgentStatus { state, detail: None, ..status() };
+        assert_eq!(decode::<AgentStatus>(&encode(&st).unwrap()).unwrap(), st);
+    }
+}
+
+#[test]
+fn proto_version_is_3() {
+    assert_eq!(PROTO_VERSION, 3);
 }
 
 #[test]

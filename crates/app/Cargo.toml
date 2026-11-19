@@ -11,6 +11,7 @@ path = "src/main.rs"
 sich-proto.workspace = true
 sich-daemon.workspace = true
 sich-term.workspace = true
+sich-hooks.workspace = true
 gpui-kit.workspace = true
 alacritty_terminal.workspace = true
 tokio.workspace = true

@@ -12,13 +12,15 @@ sich/
     proto/   (sich-proto)    типи повідомлень + кодек кадрів, спільні для всіх клієнтів
     daemon/  (sich-daemon)   lib: PTY-менеджер, ring buffer, IPC-сервер
     term/    (sich-term)     клієнтська модель терміналу: alacritty_terminal + keys/mouse (з ssh.client)
-    app/     (sich-app)      bin `sich`: GPUI UI + підкоманда `sich daemon`
+    hooks/   (sich-hooks)    `sich hook <agent>` (хук-CLI) + інсталятор хуків у settings.json Claude
+    app/     (sich-app)      bin `sich`: GPUI UI + підкоманди `sich daemon`, `sich hook`
 ```
 
 Один бінарник `sich`:
 - `sich` — запускає UI. Якщо демон не відповідає, спершу стартує `sich daemon` окремим від'єднаним процесом (без консольного вікна) і чекає, поки підключиться.
 - `sich daemon` — запускає демон у поточному процесі.
 - `sich daemon stop` — надсилає демону `Shutdown`.
+- `sich hook <agent>` — хук для агента (див. «Статус агентів»); диспетчеризується в `main` до будь-якої іншої ініціалізації.
 
 ## Залежності (зафіксовані версії)
 - UI: `gpui-kit = "=0.10.0"` (тягне gpui-component 0.10.0 і gpui-pre 0.3.12), так само як у `E:\dev\program\ssh.client`
@@ -36,7 +38,7 @@ sich/
 - Ім'я сокета: `sich-daemon` (namespaced: `\\.\pipe\sich-daemon` на Windows). Для тестів ім'я можна перевизначити змінною `SICH_SOCKET`.
 - Кадри: `LengthDelimitedCodec` (u32 BE довжина, максимум 16 MiB), тіло — `postcard`.
 - Перше повідомлення клієнта — `Hello { proto_version }`. При невідповідності версії сервер відповідає `Error` і закриває з'єднання. `PROTO_VERSION = 1`.
-- **Правило рукостискання (назавжди):** `ClientMsg::Hello` і `ServerMsg::Welcome` лишаються ПЕРШИМИ варіантами своїх enum-ів із незмінними полями, а `ClientMsg::Shutdown` приймається до `Hello` у кожній версії. При невідповідності версії демон спершу шле `Welcome { proto_version, daemon_pid }`, потім `Error` і закриває з'єднання; клієнт за цим показує «несумісний демон» і пропонує його перезапустити (старий демон v1 шле лише `Error` — це теж трактується як несумісність). Поточна `PROTO_VERSION = 2`.
+- **Правило рукостискання (назавжди):** `ClientMsg::Hello` і `ServerMsg::Welcome` лишаються ПЕРШИМИ варіантами своїх enum-ів із незмінними полями, а `ClientMsg::Shutdown` приймається до `Hello` у кожній версії. При невідповідності версії демон спершу шле `Welcome { proto_version, daemon_pid }`, потім `Error` і закриває з'єднання; клієнт за цим показує «несумісний демон» і пропонує його перезапустити (старий демон v1 шле лише `Error` — це теж трактується як несумісність). Поточна `PROTO_VERSION = 3`.
 - TODO (безпека, пізніше): явний DACL пайпа лише для поточного користувача.
 
 ### Повідомлення (`sich-proto`)
@@ -110,6 +112,18 @@ struct TerminalInfo { id: TermId, title: String, cwd: PathBuf, cols: u16, rows: 
   - **Права частина:** активний термінал (`TerminalElement`/`TerminalView` з ssh.client). `prepaint` → resize → `ClientMsg::Resize`.
   - Внизу статус-рядок: «connected to daemon (pid N)» / «reconnecting…».
 - Гарячі клавіші: `Ctrl+Shift+T` — новий термінал, `Ctrl+Tab` / `Ctrl+Shift+Tab` — перемикання між терміналами.
+
+## Статус агентів
+Стан AI-агентів у терміналах (Claude Code; Gemini — лише за заголовком) живе в **демоні**, щоб його бачили всі клієнти (і майбутній телефон). Типи: `AgentKind`, `AgentState`, `AgentStatus` у `sich-proto`; `TerminalInfo.agent` і `ServerMsg::AgentStatusChanged` / `TerminalTitle` розсилаються всім клієнтам.
+
+- **Стани:** `Working` (працює), `Waiting` (чекає користувача: дозвіл, питання, idle-prompt), `Done` (завершив хід), `Failed` (помилка), `Idle` (завершив і це вже побачено, або свіжа сесія). Немає агента = `None`.
+- **`unread`:** `Stop`/`StopFailure` ставлять `unread = true`. `ClientMsg::MarkSeen { id }` (користувач подивився на термінал) скидає `unread`; `Done` стає `Idle`, `Failed` лишається `Failed`, але прочитаним.
+- **Хуки (основне джерело).** Кожен термінал отримує `SICH_TERM_ID` і `SICH_SOCKET`. Claude Code викликає `"<sich.exe>" hook claude` на подіях з `settings.json`; хук читає stdin (≤ 1 МіБ), підключається до демона (500 мс), шле `Hello` + `AgentHook { term_id, agent, payload }` і завжди виходить з кодом 0, нічого не друкуючи в stdout (бюджет 2 с, watchdog). Поза Sich (`SICH_TERM_ID` немає) хук одразу виходить.
+- **Відображення подій Claude** (чиста функція `agent::apply`): `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `SubagentStart` → Working; `PermissionRequest`, `Notification`, `Elicitation`, `PreToolUse` з `AskUserQuestion` → Waiting; `Stop` → Done (unread); `StopFailure` → Failed (unread); `SessionStart` → Idle; `SessionEnd` → None. `PostToolUse` протягом 1 с після `Stop` ігнорується.
+- **Fallback за заголовком** — лише поки термінал не отримав жодного хука в поточній сесії агента. Демон сканує вивід PTY (`osc.rs`, інкрементально, через межі чанків): OSC 0/2 (заголовок, ≤ 256 символів) і BEL. Claude: брайлівський спінер U+2800–28FF або ◐◓◑◒ → Working, ✳ → Idle (або Done + unread, якщо було Working). Gemini: ✦ / ⏲ → Working, ◇ → Idle/Done, ✋ → Waiting. Прості заголовки після Idle/Done означають вихід агента.
+- **Заголовок терміналу** тепер живий OSC-заголовок із демона (`TerminalInfo.title`, `TerminalTitle`), без нього — назва шела.
+- Завершення процесу або видалення терміналу скидає статус у `None`.
+- **Інсталятор** (`sich-hooks::claude_install`): додає наші записи (`{"type":"command","command":"\"<exe>\" hook claude","timeout":5}`) у `~/.claude/settings.json` (або `CLAUDE_CONFIG_DIR`). Лише події, відомі встановленій версії Claude (`claude --version`; невідома версія → стабільний набір). Користувацькі хуки та порядок ключів зберігаються, перед першою зміною створюється `settings.json.sich-backup`, запис атомарний, некоректний JSON не чіпається. Наші записи впізнаються за командою `…/sich[.exe] hook claude`, тож перевстановлення замінює старий шлях.
 
 ## Що свідомо відкладено
 - Snapshot стану екрана через `vt100` на демоні. Поки що replay сирого ring buffer: при обрізаному буфері можливі артефакти на початку.

@@ -1,10 +1,12 @@
 //! Sich daemon: owns the PTYs and serves clients over a local socket.
 
+mod agent;
 mod env;
 mod git;
 mod hub;
 mod ipc;
 mod manager;
+mod osc;
 mod projects;
 mod ring;
 mod server;
@@ -50,7 +52,7 @@ pub async fn run(socket_name: &str) -> anyhow::Result<()> {
     };
     tracing::info!(pid = std::process::id(), socket = socket_name, "daemon started");
 
-    let mgr = manager::Manager::new();
+    let mgr = manager::Manager::new(socket_name);
     loop {
         tokio::select! {
             _ = mgr.shutdown.cancelled() => break,

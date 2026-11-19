@@ -30,6 +30,11 @@ use crate::app_view::AppView;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `sich hook <agent>` runs on every agent hook event: dispatch before any other init. It
+    // never returns (always exits 0, prints nothing).
+    if args.first().is_some_and(|a| a == "hook") {
+        sich_hooks::hook_main(args.get(1).map_or("", String::as_str));
+    }
     let socket = sich_daemon::socket_name_from_env();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => run_ui(socket),

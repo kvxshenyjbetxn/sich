@@ -6065,6 +6065,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sich-daemon",
+ "sich-hooks",
  "sich-proto",
  "sich-term",
  "sys-locale",
@@ -6097,6 +6098,21 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sich-hooks"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "dirs 6.0.0",
+ "futures",
+ "serde_json",
+ "sich-daemon",
+ "sich-proto",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

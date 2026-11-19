@@ -9,9 +9,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use parking_lot::Mutex;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use sich_proto::{MAX_OUTPUT_CHUNK, ServerMsg, TermId, TerminalInfo};
+use sich_proto::{AgentKind, MAX_OUTPUT_CHUNK, ServerMsg, TermId, TerminalInfo};
 
+use crate::agent::{self, AgentTracker};
 use crate::hub::{ConnHandle, ConnId, Hub};
+use crate::osc::{OscEvent, OscScanner};
 use crate::ring::{DEFAULT_CAPACITY, RingBuffer};
 use crate::shell::{default_shell, shell_title};
 
@@ -30,6 +32,10 @@ struct State {
     cols: u16,
     rows: u16,
     exited: Option<Option<i32>>,
+    scanner: OscScanner,
+    /// Live OSC title; `None` until the shell/program sets one.
+    live_title: Option<String>,
+    agent: AgentTracker,
 }
 
 /// State shared with the reader / waiter threads (deliberately not owning the PTY master, so
@@ -52,7 +58,12 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    pub fn spawn(id: TermId, req: SpawnRequest, hub: Arc<Hub>) -> anyhow::Result<Arc<Terminal>> {
+    pub fn spawn(
+        id: TermId,
+        req: SpawnRequest,
+        hub: Arc<Hub>,
+        socket_name: &str,
+    ) -> anyhow::Result<Arc<Terminal>> {
         let (cols, rows) = (req.cols.max(1), req.rows.max(1));
         let shell = req.shell.filter(|s| !s.is_empty()).unwrap_or_else(default_shell);
         let cwd = req
@@ -68,7 +79,7 @@ impl Terminal {
         cmd.args(&req.args);
         cmd.cwd(&cwd);
         cmd.env_clear();
-        for (k, v) in crate::env::terminal_env() {
+        for (k, v) in crate::env::terminal_env(id, socket_name) {
             cmd.env(k, v);
         }
         let mut child =
@@ -94,6 +105,9 @@ impl Terminal {
                 cols,
                 rows,
                 exited: None,
+                scanner: OscScanner::new(),
+                live_title: None,
+                agent: AgentTracker::default(),
             }),
         });
 
@@ -133,8 +147,15 @@ impl Terminal {
                 let code = child.wait().ok().map(|s| s.exit_code() as i32);
                 // Give the reader a moment to drain the last output.
                 std::thread::sleep(Duration::from_millis(150));
-                sh.state.lock().exited = Some(code);
+                let agent_cleared = {
+                    let mut st = sh.state.lock();
+                    st.exited = Some(code);
+                    st.agent.on_exit()
+                };
                 sh.hub.broadcast(ServerMsg::TerminalExited { id: sh.id, code });
+                if agent_cleared {
+                    sh.hub.broadcast(ServerMsg::AgentStatusChanged { id: sh.id, status: None });
+                }
             })
             .context("spawn wait thread")?;
 
@@ -154,14 +175,39 @@ impl Terminal {
         let st = self.shared.state.lock();
         TerminalInfo {
             id: self.shared.id,
-            title: self.shared.title.clone(),
+            title: self.shared.effective_title(&st),
             cwd: self.shared.cwd.clone(),
             cols: st.cols,
             rows: st.rows,
             exited: st.exited,
             created_unix_ms: self.shared.created_unix_ms,
             worktree: self.shared.worktree.clone(),
+            agent: st.agent.status().cloned(),
         }
+    }
+
+    /// Applies a hook payload sent by `sich hook` and broadcasts the status if it changed.
+    pub fn agent_hook(&self, kind: AgentKind, payload: &str) {
+        if kind != AgentKind::Claude {
+            return; // Other agents have no hook integration yet.
+        }
+        let Some(hook) = agent::parse_claude_payload(payload) else {
+            tracing::debug!(id = self.shared.id, "ignoring unparsable hook payload");
+            return;
+        };
+        let now = now_ms();
+        self.shared.update_agent(|a| a.on_claude_hook(&hook, now));
+    }
+
+    /// The user looked at the terminal.
+    pub fn mark_seen(&self) {
+        let now = now_ms();
+        self.shared.update_agent(|a| a.mark_seen(now));
+    }
+
+    /// Drops the agent status (terminal removed).
+    pub fn clear_agent(&self) {
+        self.shared.update_agent(AgentTracker::on_exit);
     }
 
     /// Atomically replays the buffered output (from `resume_from_seq`, clamped to the retained
@@ -208,8 +254,69 @@ impl Terminal {
     }
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
 impl Shared {
+    fn effective_title(&self, st: &State) -> String {
+        match &st.live_title {
+            Some(t) if !t.trim().is_empty() => t.clone(),
+            _ => self.title.clone(),
+        }
+    }
+
+    /// Runs `f` on the agent tracker; broadcasts the new status when `f` reports a change.
+    fn update_agent(&self, f: impl FnOnce(&mut AgentTracker) -> bool) {
+        let status = {
+            let mut st = self.state.lock();
+            if !f(&mut st.agent) {
+                return;
+            }
+            st.agent.status().cloned()
+        };
+        self.hub.broadcast(ServerMsg::AgentStatusChanged { id: self.id, status });
+    }
+
+    /// Scans a PTY chunk for title changes and bells.
+    fn scan(&self, bytes: &[u8]) {
+        let mut titles: Vec<String> = Vec::new();
+        {
+            let mut st = self.state.lock();
+            st.scanner.feed(bytes, |e| match e {
+                OscEvent::Title(t) => titles.push(t),
+                OscEvent::Bell => {}
+            });
+        }
+        for t in titles {
+            self.set_title(t);
+        }
+    }
+
+    fn set_title(&self, title: String) {
+        let now = now_ms();
+        let (effective, agent_status, agent_changed) = {
+            let mut st = self.state.lock();
+            if st.live_title.as_deref() == Some(title.as_str()) {
+                return;
+            }
+            let before = self.effective_title(&st);
+            st.live_title = Some(title.clone());
+            let agent_changed = st.agent.on_title(&title, now);
+            let after = self.effective_title(&st);
+            let changed = (after != before).then_some(after);
+            (changed, st.agent.status().cloned(), agent_changed)
+        };
+        if let Some(title) = effective {
+            self.hub.broadcast(ServerMsg::TerminalTitle { id: self.id, title });
+        }
+        if agent_changed {
+            self.hub.broadcast(ServerMsg::AgentStatusChanged { id: self.id, status: agent_status });
+        }
+    }
+
     fn on_output(&self, bytes: &[u8]) {
+        self.scan(bytes);
         let mut st = self.state.lock();
         let seq = st.ring.push(bytes);
         let id = self.id;

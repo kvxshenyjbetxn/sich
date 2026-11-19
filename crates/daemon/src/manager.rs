@@ -16,16 +16,19 @@ pub struct Manager {
     pub hub: Arc<Hub>,
     pub shutdown: CancellationToken,
     pub projects: crate::projects::Registry,
+    /// Socket name this daemon listens on; handed to terminals as `SICH_SOCKET`.
+    pub socket_name: String,
     terminals: Mutex<BTreeMap<TermId, Arc<Terminal>>>,
     next_term: AtomicU64,
     next_conn: AtomicU64,
 }
 
 impl Manager {
-    pub fn new() -> Arc<Self> {
+    pub fn new(socket_name: &str) -> Arc<Self> {
         Arc::new(Self {
             hub: Arc::new(Hub::default()),
             projects: crate::projects::Registry::load(),
+            socket_name: socket_name.to_string(),
             shutdown: CancellationToken::new(),
             terminals: Mutex::new(BTreeMap::new()),
             next_term: AtomicU64::new(1),
@@ -50,7 +53,7 @@ impl Manager {
         let me = self.clone();
         let term = tokio::task::spawn_blocking(move || {
             let id = me.next_term.fetch_add(1, Ordering::Relaxed);
-            Terminal::spawn(id, req, me.hub.clone())
+            Terminal::spawn(id, req, me.hub.clone(), &me.socket_name)
         })
         .await
         .context("spawn task")??;
@@ -64,8 +67,22 @@ impl Manager {
     pub fn kill(&self, id: TermId) -> bool {
         let Some(term) = self.terminals.lock().remove(&id) else { return false };
         term.kill();
+        term.clear_agent();
         self.hub.broadcast(ServerMsg::TerminalRemoved { id });
         true
+    }
+
+    /// Feeds a hook payload to the terminal's agent tracker. Unknown terminals are ignored.
+    pub fn agent_hook(&self, id: TermId, agent: sich_proto::AgentKind, payload: &str) {
+        if let Some(t) = self.get(id) {
+            t.agent_hook(agent, payload);
+        }
+    }
+
+    pub fn mark_seen(&self, id: TermId) {
+        if let Some(t) = self.get(id) {
+            t.mark_seen();
+        }
     }
 
     /// Kills and removes every terminal that belongs to `worktree`.
