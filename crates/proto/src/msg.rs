@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTO_VERSION: u32 = 6;
+pub const PROTO_VERSION: u32 = 7;
 
 /// Maximum payload of a single `ServerMsg::Output` frame.
 pub const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
@@ -50,6 +50,10 @@ pub enum ClientMsg {
     /// Projects inside become ungrouped.
     RemoveGroup { id: GroupId },
     SetProjectGroup { project_id: ProjectId, group: Option<GroupId> },
+    GetDaemonInfo,
+    SaveScrollback,
+    /// Create a session restore shell with an acknowledgment specific to the requester.
+    RestoreTerminal { request_id: u64, cwd: Option<PathBuf>, cols: u16, rows: u16, worktree: Option<PathBuf> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +78,9 @@ pub enum ServerMsg {
     /// Broadcast to all clients when the live (OSC) title of a terminal changes.
     TerminalTitle { id: TermId, title: String },
     Error { message: String },
+    DaemonInfo { build_id: String, proto_version: u32, started_unix_ms: u64 },
+    ScrollbackSaved { files: Vec<(TermId, String)> },
+    TerminalRestored { request_id: u64, terminal: Option<TerminalInfo> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +122,7 @@ pub struct AgentStatus {
     pub message: Option<String>,
     /// Live Claude Code subagents of this terminal, in start order.
     pub subagents: Vec<SubagentStatus>,
+    pub session_id: Option<String>,
 }
 
 /// One running Claude Code subagent (attributed by the hook payload's `agent_id`).

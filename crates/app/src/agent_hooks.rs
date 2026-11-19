@@ -112,7 +112,7 @@ pub fn apply(enable: bool, window: Option<&Window>, cx: &mut App) {
 
     let handle = window.map(|w| w.window_handle());
     let dir = claude_install::default_claude_config_dir();
-    let exe = std::env::current_exe().ok();
+    let exe = crate::daemon_host::launcher_exe();
     cx.spawn(async move |cx: &mut AsyncApp| {
         let status = cx.background_executor().spawn(async move { run(enable, dir, exe) }).await;
         let error = match &status {
@@ -135,7 +135,7 @@ pub fn startup(cx: &mut App) {
         apply(true, None, cx);
     } else {
         let dir = claude_install::default_claude_config_dir();
-        let exe = std::env::current_exe().ok();
+        let exe = crate::daemon_host::launcher_exe();
         let status = current_status(dir.as_deref(), exe.as_deref());
         set_state(HooksState { status, busy: false }, cx);
     }

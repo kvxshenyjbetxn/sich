@@ -9,7 +9,8 @@ mod codex_hooks;
 mod colors;
 mod daemon_client;
 mod daemon_conn;
-mod daemon_kill;
+mod daemon_host;
+mod daemon_restart;
 mod diff_tabs;
 mod diff_view;
 mod element;
@@ -53,48 +54,49 @@ fn main() -> anyhow::Result<()> {
     if args.first().is_some_and(|a| a == "hook") {
         sich_hooks::hook_main(args.get(1).map_or("", String::as_str));
     }
+    // The GUI runs from a private copy so rebuilding the user-facing exe never hits a lock.
+    if daemon_host::relocate_gui(&args) {
+        return Ok(());
+    }
     let socket = sich_daemon::socket_name_from_env();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        [] => run_ui(socket),
+        [] => run_ui(socket, false),
+        ["--takeover"] => run_ui(socket, true),
         ["daemon"] => cli::run_daemon(&socket),
+        ["daemon", "start"] => cli::start_daemon(&socket),
         ["daemon", "stop"] => cli::stop_daemon(&socket),
         _ => {
-            eprintln!("usage: sich [daemon [stop]]");
+            eprintln!("usage: sich [daemon [start|stop]]");
             std::process::exit(2);
         }
     }
 }
 
-fn run_ui(socket: String) -> anyhow::Result<()> {
-    if cfg!(debug_assertions) {
-        let _ = tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .try_init();
-    }
-
-    // A second GUI launch just shows the running window and exits.
-    let (events_tx, events_rx) = futures::channel::mpsc::unbounded::<UiEvent>();
-    match single_instance::acquire(&socket) {
-        Acquire::AlreadyRunning => return Ok(()),
-        Acquire::Primary(listener) => {
-            let tx = events_tx.clone();
-            single_instance::serve(listener, move || {
-                let _ = tx.unbounded_send(UiEvent::Show);
-            });
-        }
-        Acquire::Unavailable => {}
-    }
-    let session = Session::load();
-
+fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
     let handle = rt.handle().clone();
+    let (events_tx, events_rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+    match rt.block_on(single_instance::acquire(&socket, sich_app::build_id(), force_takeover)) {
+        Acquire::AlreadyRunning => return Ok(()),
+        Acquire::Primary(listener) => {
+            let tx = events_tx.clone();
+            handle.spawn(single_instance::serve(listener, sich_app::build_id(), move |event| {
+                let _ = tx.unbounded_send(event);
+            }));
+        }
+        Acquire::Unavailable => {}
+    }
+    let session = Session::load();
 
     // Start the daemon if it is not running; the client keeps retrying if this fails.
     if let Err(e) = rt.block_on(cli::ensure_daemon(&socket)) {

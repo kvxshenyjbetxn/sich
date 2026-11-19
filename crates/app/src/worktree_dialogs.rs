@@ -112,7 +112,7 @@ pub fn open_remove_project(
     );
 }
 
-pub fn open_restart_daemon(app: Entity<AppView>, pid: Option<u32>, window: &mut Window, cx: &mut App) {
+pub fn open_restart_daemon(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
     let lang = settings::language(cx);
     open_confirm(
         window,
@@ -120,10 +120,36 @@ pub fn open_restart_daemon(app: Entity<AppView>, pid: Option<u32>, window: &mut 
         tr(lang, Tr::RestartDaemon).to_string(),
         tr(lang, Tr::RestartDaemonWarning).to_string(),
         None,
-        tr(lang, Tr::Restart),
+        tr(lang, Tr::RestartDaemon),
         true,
-        Rc::new(move |_, cx| app.read(cx).client.restart_daemon(pid)),
+        Rc::new(move |_, cx| app.update(cx, |this, cx| this.request_daemon_restart(cx))),
     );
+}
+
+pub fn open_incompatible_daemon(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
+    if window.has_active_dialog(cx) {
+        window.close_dialog(cx);
+    }
+    window.open_dialog(cx, move |dialog, _window, cx| {
+        let lang = settings::language(cx);
+        let (restart, quit) = (app.clone(), app.clone());
+        dialog.title(tr(lang, Tr::RestartDaemon))
+            .w(px(460.))
+            .close_button(false)
+            .overlay_closable(false)
+            .keyboard(false)
+            .child(div().text_sm().child(tr(lang, Tr::DaemonUpdateRequired)))
+            .footer(
+                DialogFooter::new()
+                    .child(Button::new("quit-for-daemon-update").label(tr(lang, Tr::Quit))
+                        .on_click(move |_, _, cx| quit.update(cx, |this, cx| this.quit_ui_only(cx))))
+                    .child(Button::new("restart-for-daemon-update").primary().label(tr(lang, Tr::RestartDaemon))
+                        .on_click(move |_, window, cx| {
+                            restart.update(cx, |this, cx| this.request_daemon_restart(cx));
+                            window.close_dialog(cx);
+                        })),
+            )
+    });
 }
 
 pub fn open_remove_worktree(app: Entity<AppView>, wt: WorktreeRef, window: &mut Window, cx: &mut App) {

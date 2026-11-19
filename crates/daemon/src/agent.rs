@@ -53,6 +53,7 @@ pub const MAX_TEXT_CHARS: usize = 400;
 /// The fields we use from a Claude hook payload (only documented hook input fields).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeHook {
+    pub session_id: Option<String>,
     pub event: String,
     pub tool_name: Option<String>,
     /// Ready-made label for the tool call: `Bash: <command>`, `Edit: <file name>`.
@@ -247,6 +248,7 @@ pub fn parse_claude_payload(json: &str) -> Option<ClaudeHook> {
         _ => None,
     };
     Some(ClaudeHook {
+        session_id: get("session_id").filter(|id| !id.is_empty()),
         event,
         agent_id,
         agent_type: nonempty("agent_type"),
@@ -283,6 +285,7 @@ const KNOWN_CODEX_EVENTS: &[&str] = &[
 /// The fields we use from a Codex hook payload (documented hook input fields only).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CodexHook {
+    pub session_id: Option<String>,
     pub event: String,
     pub tool_name: Option<String>,
     /// `<tool>: <command>` when `tool_input.command` exists (string, or array joined by spaces),
@@ -334,6 +337,7 @@ pub fn parse_codex_payload(json: &str) -> Option<CodexHook> {
     let description =
         input.and_then(|i| i.get("description")).and_then(|x| x.as_str()).and_then(|s| normalize_text(s, false));
     Some(CodexHook {
+        session_id: get("session_id").filter(|id| !id.is_empty()),
         event: get("hook_event_name")?,
         tool_name,
         tool_label,
@@ -385,7 +389,7 @@ fn settle(
         Some(p) if p.kind == kind && p.state == state => p.since_unix_ms,
         _ => now,
     };
-    // Model, title, prompt and message are sticky within one agent session.
+    // Model, title, prompt, message and session ID are sticky within one agent session.
     let (model, title, prompt, message) = match &prev {
         Some(p) if p.kind == kind => (p.model.clone(), p.title.clone(), p.prompt.clone(), p.message.clone()),
         _ => (None, None, None, None),
@@ -394,7 +398,8 @@ fn settle(
         Some(p) if p.kind == kind => p.subagents.clone(),
         _ => Vec::new(),
     };
-    Some(AgentStatus { kind, state, unread, since_unix_ms: since, detail, model, title, prompt, message, subagents })
+    let session_id = prev.filter(|p| p.kind == kind).and_then(|p| p.session_id);
+    Some(AgentStatus { kind, state, unread, since_unix_ms: since, detail, model, title, prompt, message, subagents, session_id })
 }
 
 /// All transitions. Returns the new status; equal to `prev` when nothing changed.
@@ -550,6 +555,9 @@ fn apply_claude(
         // Only record the model / the subagent's final message; the state does not change.
         "PostModelSwitch" | "SubagentStop" => {
             let mut p = prev?;
+            if h.event == "PostModelSwitch" && h.agent_id.is_none() && h.session_id.is_some() && p.kind == kind {
+                p.session_id.clone_from(&h.session_id);
+            }
             if let Some(m) = &h.to_model {
                 p.model = Some(m.clone());
             }
@@ -595,6 +603,9 @@ fn apply_claude(
         _ => return prev,
     };
     let mut s = settle(prev, kind, state, unread, detail, now)?;
+    if h.agent_id.is_none() && h.session_id.is_some() {
+        s.session_id.clone_from(&h.session_id);
+    }
     if h.event == "SessionStart" {
         s.subagents.clear();
     }
@@ -710,6 +721,9 @@ fn apply_codex(prev: Option<AgentStatus>, h: &CodexHook, now: u64) -> Option<Age
         _ => return prev,
     };
     let mut s = settle(prev, kind, state, unread, detail, now)?;
+    if h.session_id.is_some() {
+        s.session_id.clone_from(&h.session_id);
+    }
     // New session / the turn ended or was cancelled: any child still listed is stale (Codex
     // sometimes misses child stops).
     if matches!(h.event.as_str(), "SessionStart" | "Stop" | "Interrupt") {
@@ -976,6 +990,7 @@ mod tests {
             prompt: None,
             message: None,
             subagents: Vec::new(),
+            session_id: None,
         })
     }
 
@@ -1115,6 +1130,26 @@ mod tests {
         let extra = format!(r#","tool_name":"Bash","tool_input":{{"command":{}}}"#, json_str(&cmd));
         let s = run(None, "PreToolUse", &extra, T0).unwrap();
         assert_eq!(s.detail.unwrap().chars().count(), MAX_DETAIL_CHARS);
+    }
+
+    #[test]
+    fn root_hook_session_ids_are_sticky_and_end_with_the_session() {
+        for (agent, root) in [("claude", "claude1234"), ("codex", "codex1234")] {
+            let apply = |prev, event: &str, extra: &str| {
+                let json = format!(r#"{{"hook_event_name":"{event}"{extra}}}"#);
+                match agent {
+                    "claude" => super::apply(prev, AgentInput::Claude(&parse_claude_payload(&json).unwrap()), T0),
+                    _ => super::apply(prev, AgentInput::Codex(&parse_codex_payload(&json).unwrap()), T0),
+                }
+            };
+            let root_status = apply(None, "SessionStart", &format!(r#","session_id":"{root}""#));
+            assert_eq!(root_status.as_ref().unwrap().session_id.as_deref(), Some(root));
+            let working = apply(root_status, "UserPromptSubmit", "");
+            assert_eq!(working.as_ref().unwrap().session_id.as_deref(), Some(root));
+            let child = apply(working, "PreToolUse", r#","session_id":"other1234","agent_id":"child1234""#);
+            assert_eq!(child.as_ref().unwrap().session_id.as_deref(), Some(root));
+            assert_eq!(apply(child, "SessionEnd", ""), None);
+        }
     }
 
     #[test]

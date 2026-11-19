@@ -5,6 +5,20 @@ use sich_proto::{ClientMsg, PROTO_VERSION, ServerMsg, TermId, decode, encode, fr
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
+fn isolate_config() {
+    static CONFIG: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    CONFIG.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: the environment is initialized once, before any test daemon starts.
+        unsafe {
+            std::env::set_var("SICH_CONFIG_DIR", dir.path().join("config"));
+            std::env::set_var("SICH_DATA_DIR", dir.path().join("data"));
+            std::env::set_var("SICH_WORKTREE_ROOT", dir.path().join("worktrees"));
+        }
+        dir
+    });
+}
+
 const MARKER: &[u8] = b"SICH_MARKER";
 
 type Conn = Framed<interprocess::local_socket::tokio::Stream, tokio_util::codec::LengthDelimitedCodec>;
@@ -85,6 +99,7 @@ fn shell_command() -> (String, Vec<String>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_subscribe_replay_shutdown() {
+    isolate_config();
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let name = format!("sich-test-{}-{stamp}", std::process::id());
     let daemon = tokio::spawn({
@@ -145,6 +160,7 @@ async fn create_subscribe_replay_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn version_mismatch_is_rejected() {
+    isolate_config();
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let name = format!("sich-test-ver-{}-{stamp}", std::process::id());
     let daemon = tokio::spawn({
@@ -173,6 +189,7 @@ async fn version_mismatch_is_rejected() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_before_hello_stops_daemon() {
+    isolate_config();
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
     let name = format!("sich-test-sd-{}-{stamp}", std::process::id());
     let daemon = tokio::spawn({

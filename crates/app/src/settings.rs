@@ -29,6 +29,7 @@ pub struct AppSettings {
     pub codex_hooks: bool,
     /// Closing the window hides it to the system tray instead of quitting.
     pub close_to_tray: bool,
+    pub resume_agents_on_restore: bool,
     pub(crate) diff_mode: DiffMode,
     pub(crate) diff_wrap_lines: bool,
 }
@@ -42,6 +43,7 @@ impl Default for AppSettings {
             agent_hooks: true,
             codex_hooks: true,
             close_to_tray: true,
+            resume_agents_on_restore: true,
             diff_mode: DiffMode::default(),
             diff_wrap_lines: false,
         }
@@ -144,6 +146,14 @@ pub fn set_codex_hooks(enabled: bool, cx: &mut App) {
     }
     s.codex_hooks = enabled;
     store(s, cx);
+}
+
+pub fn set_resume_agents_on_restore(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.resume_agents_on_restore != enabled {
+        s.resume_agents_on_restore = enabled;
+        store(s, cx);
+    }
 }
 
 pub fn set_close_to_tray(enabled: bool, cx: &mut App) {
@@ -252,6 +262,15 @@ mod tests {
         let s = AppSettings { codex_hooks: false, ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(!back.codex_hooks);
+    }
+
+    #[test]
+    fn agent_resume_defaults_to_true_and_can_be_disabled() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(old.resume_agents_on_restore);
+        let prefs = AppSettings { resume_agents_on_restore: false, ..Default::default() };
+        let roundtrip: AppSettings = serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert!(!roundtrip.resume_agents_on_restore);
     }
 
     #[test]

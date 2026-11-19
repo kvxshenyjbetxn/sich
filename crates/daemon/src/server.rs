@@ -127,7 +127,7 @@ async fn handle_msg(msg: ClientMsg, mgr: &Arc<Manager>, conn: &ConnHandle) {
         ClientMsg::CreateTerminal { cwd, shell, args, cols, rows, worktree } => {
             let cwd = cwd.or_else(|| worktree.clone());
             let req = SpawnRequest { cwd, shell, args, cols, rows, worktree };
-            if let Err(e) = mgr.create(req).await {
+            if let Err(e) = mgr.create(req, |_| {}).await {
                 tracing::warn!("create terminal failed: {e:#}");
                 conn.send(ServerMsg::Error { message: format!("create terminal failed: {e:#}") });
             }
@@ -178,6 +178,29 @@ async fn handle_msg(msg: ClientMsg, mgr: &Arc<Manager>, conn: &ConnHandle) {
             mgr.agent_hook(term_id, agent, &payload);
         }
         ClientMsg::MarkSeen { id } => mgr.mark_seen(id),
+        ClientMsg::GetDaemonInfo => {
+            conn.send(ServerMsg::DaemonInfo {
+                build_id: mgr.build_id.clone(),
+                proto_version: PROTO_VERSION,
+                started_unix_ms: mgr.started_unix_ms,
+            });
+        }
+        ClientMsg::SaveScrollback => {
+            let files = mgr.save_scrollback().await;
+            conn.send(ServerMsg::ScrollbackSaved { files });
+        }
+        ClientMsg::RestoreTerminal { request_id, cwd, cols, rows, worktree } => {
+            let cwd = cwd.or_else(|| worktree.clone());
+            let req = SpawnRequest { cwd, shell: None, args: Vec::new(), cols, rows, worktree };
+            let result = mgr.create(req, |info| {
+                conn.send(ServerMsg::TerminalRestored { request_id, terminal: Some(info.clone()) });
+            }).await;
+            if let Err(err) = result {
+                tracing::warn!("restore terminal failed: {err:#}");
+                conn.send(ServerMsg::TerminalRestored { request_id, terminal: None });
+                conn.send(ServerMsg::Error { message: format!("restore terminal failed: {err:#}") });
+            }
+        }
         ClientMsg::Shutdown => {
             tracing::info!(conn = conn.id, "shutdown requested");
             mgr.shutdown.cancel();

@@ -27,6 +27,7 @@ fn status() -> AgentStatus {
         title: Some("Sync phone feature".into()),
         prompt: Some("fix the bug".into()),
         message: Some("Done, tests pass".into()),
+        session_id: Some("abc12345-6789".into()),
         subagents: vec![
             SubagentStatus {
                 id: "agent-abc123".into(),
@@ -120,6 +121,11 @@ fn client_msgs_round_trip() {
         ClientMsg::RenameGroup { id: 2, name: "игры".into() },
         ClientMsg::RemoveGroup { id: 2 },
         ClientMsg::SetProjectGroup { project_id: 1, group: Some(2) },
+        ClientMsg::GetDaemonInfo,
+        ClientMsg::SaveScrollback,
+        ClientMsg::RestoreTerminal {
+            request_id: 7, cwd: None, cols: 80, rows: 24, worktree: Some("/test".into()),
+        },
         ClientMsg::SetProjectGroup { project_id: 1, group: None },
     ];
     for m in msgs {
@@ -149,6 +155,11 @@ fn server_msgs_round_trip() {
         ServerMsg::AgentStatusChanged { id: 2, status: None },
         ServerMsg::TerminalTitle { id: 2, title: "Claude Code".into() },
         ServerMsg::Error { message: "boom".into() },
+        ServerMsg::DaemonInfo { build_id: "0.0.1-abc-123".into(), proto_version: PROTO_VERSION, started_unix_ms: 100 },
+        ServerMsg::ScrollbackSaved { files: vec![(7, "7-100.bin".into())] },
+        ServerMsg::ScrollbackSaved { files: Vec::new() },
+        ServerMsg::TerminalRestored { request_id: 7, terminal: Some(info()) },
+        ServerMsg::TerminalRestored { request_id: 8, terminal: None },
     ];
     for m in msgs {
         let bytes = encode(&m).unwrap();
@@ -175,8 +186,8 @@ fn agent_enums_round_trip() {
 }
 
 #[test]
-fn proto_version_is_6() {
-    assert_eq!(PROTO_VERSION, 6);
+fn proto_version_is_7() {
+    assert_eq!(PROTO_VERSION, 7);
 }
 
 #[test]

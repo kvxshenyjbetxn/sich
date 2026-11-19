@@ -22,7 +22,7 @@ use sich_git::compare::CompareKey;
 use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
-use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot};
+use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, RestartResult, RestoreData, Snapshot};
 use crate::diff_tabs::{DiffTab, DiffTabs};
 use crate::diff_view::DiffView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
@@ -110,6 +110,8 @@ pub struct AppView {
     last_session: Option<Session>,
     pending_save: Option<Session>,
     save_scheduled: bool,
+    restarting_daemon: bool,
+    restart_dialog_shown: bool,
     /// Sidebar width in logical pixels (drag the handle on its right edge).
     pub(crate) sidebar_w: f32,
     /// The sidebar handle is being dragged.
@@ -213,6 +215,8 @@ impl AppView {
             last_session: None,
             pending_save: None,
             save_scheduled: false,
+            restarting_daemon: false,
+            restart_dialog_shown: false,
             sidebar_w,
             sidebar_dragging: false,
             git_panel,
@@ -223,6 +227,7 @@ impl AppView {
     }
 
     fn on_wake(&mut self, cx: &mut Context<Self>) {
+        self.finish_daemon_restart();
         for view in self.views.values() {
             view.update(cx, |v, cx| v.refresh(cx));
         }
@@ -341,6 +346,19 @@ impl AppView {
     fn on_ui_event(&mut self, ev: UiEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             UiEvent::Show => self.show_window(cx),
+            UiEvent::Takeover if !self.restarting_daemon => {
+                match self.save_current_session() {
+                    Ok(()) => self.quit_ui_only(cx),
+                    Err(err) => notifications::show_error(format!("{err:#}"), window, cx),
+                }
+            }
+            UiEvent::Restart if !self.restarting_daemon => {
+                if let Err(err) = self.save_current_session().and_then(|()| crate::cli::spawn_replacement_ui()) {
+                    self.show_window(cx);
+                    notifications::show_error(format!("{err:#}"), window, cx);
+                }
+            }
+            UiEvent::Takeover | UiEvent::Restart => {}
             UiEvent::Quit => self.request_quit(window, cx),
         }
     }
@@ -357,6 +375,10 @@ impl AppView {
 
     /// The window's close button / Alt+F4: hide to the tray, or quit.
     fn on_close_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.client.snapshot().status, ConnStatus::Incompatible { .. }) {
+            self.quit_ui_only(cx);
+            return;
+        }
         match self.hwnd {
             Some(hwnd) if self.tray.is_some() && settings::get(cx).close_to_tray => {
                 self.hidden_to_tray = true;
@@ -369,6 +391,9 @@ impl AppView {
 
     /// Quits, after a confirmation when agents are still busy.
     fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.restarting_daemon {
+            return;
+        }
         let infos: Vec<TerminalInfo> =
             self.client.snapshot().terminals.iter().map(|t| t.info.clone()).collect();
         if !tray::needs_quit_confirm(&infos) {
@@ -395,21 +420,71 @@ impl AppView {
         );
     }
 
+    fn save_current_session(&mut self) -> anyhow::Result<()> {
+        if self.session_ready() {
+            let infos: Vec<_> = self.client.snapshot().terminals.into_iter().map(|t| t.info).collect();
+            let session = self.build_session(&infos);
+            session.save()?;
+            self.pending_save = None;
+        }
+        Ok(())
+    }
+
     /// Saves the session, stops the daemon (and with it every terminal) and exits.
     fn quit_now(&mut self, cx: &mut Context<Self>) {
-        let infos: Vec<TerminalInfo> =
-            self.client.snapshot().terminals.iter().map(|t| t.info.clone()).collect();
-        if self.session_ready() {
-            let session = self.build_session(&infos);
-            if let Err(e) = session.save() {
-                tracing::error!("failed to save session: {e:#}");
-            }
+        if let Err(err) = self.save_current_session() {
+            tracing::error!("failed to save session: {err:#}");
         }
         if let Err(e) = crate::cli::stop_daemon(&self.socket) {
             tracing::warn!("could not stop the daemon: {e:#}");
         }
+        self.quit_ui_only(cx);
+    }
+
+    pub(crate) fn quit_ui_only(&mut self, cx: &mut Context<Self>) {
         self.tray = None;
         cx.quit();
+    }
+
+    pub(crate) fn request_daemon_restart(&mut self, cx: &mut Context<Self>) {
+        if self.restarting_daemon {
+            return;
+        }
+        let snap = self.client.snapshot();
+        let session = match snap.status {
+            ConnStatus::Connected { .. } if self.session_ready() => {
+                let infos: Vec<_> = snap.terminals.into_iter().map(|t| t.info).collect();
+                Some(self.build_session(&infos))
+            }
+            ConnStatus::Incompatible { .. } => None,
+            _ => return,
+        };
+        self.restarting_daemon = true;
+        self.pending_save = None;
+        self.client.restart_daemon(crate::daemon_restart::Request { expected: snap.status, session });
+        cx.notify();
+    }
+
+    fn finish_daemon_restart(&mut self) {
+        let Some(result) = self.client.take_restart_result() else { return };
+        self.restarting_daemon = false;
+        self.restart_dialog_shown = false;
+        self.last_session = None;
+        if let RestartResult::Stopped(session) = result {
+            self.suppress_auto_create = session.has_terminals();
+            self.restore = Some(session.selected.clone());
+            self.saved = Some(session);
+            self.restored = false;
+            self.restore_targets.clear();
+            self.restore_started = None;
+            self.pending_creates.clear();
+            self.pending_worktree = None;
+            self.views.clear();
+            self.ws.prune(&[]);
+            self.attention.clear();
+            self.seen_sent.clear();
+            self.focused = None;
+        }
     }
 
     // ---- session ---------------------------------------------------------------------------
@@ -417,11 +492,11 @@ impl AppView {
     /// True once the saved state has been applied; before that the live state is incomplete and
     /// must not overwrite the file on disk.
     fn session_ready(&self) -> bool {
-        self.restored && self.restore.is_none() && self.restore_targets.is_empty()
+        !self.restarting_daemon && self.restored && self.restore.is_none() && self.restore_targets.is_empty()
     }
 
     fn build_session(&self, infos: &[TerminalInfo]) -> Session {
-        session::build_session(&SessionInput {
+        let mut session = session::build_session(&SessionInput {
             terminals: infos,
             ws: &self.ws,
             projects: &self.projects,
@@ -431,7 +506,9 @@ impl AppView {
             window: self.window_state,
             sidebar_w: Some(self.sidebar_w),
             right_panel: self.right_panel,
-        })
+        });
+        session.daemon_pid = self.client.daemon_pid();
+        session
     }
 
     /// Schedules a debounced save when the session differs from the last one seen.
@@ -466,13 +543,26 @@ impl AppView {
 
     /// Recreates the saved terminals once, after the first terminal list and the projects have
     /// arrived and only when the daemon started out empty.
-    fn maybe_restore_terminals(&mut self) {
+    fn maybe_restore_terminals(&mut self, infos: &[TerminalInfo], cx: &Context<Self>) {
         if self.restored || self.restore.is_some() {
             return;
         }
         let Some(count) = self.client.first_list_count() else { return };
         self.restored = true;
         let plan = match self.saved.take() {
+            Some(saved) if count > 0 => {
+                for workspace in saved.workspaces {
+                    let key = WorkspaceKey::of(workspace.worktree.as_deref());
+                    let saved_id = workspace.active.and_then(|index| workspace.terminals.get(index)).and_then(|term| term.id);
+                    let ids = terminals_in(&key, infos);
+                    if saved.daemon_pid == self.client.daemon_pid() {
+                        if let Some(id) = saved_id.filter(|id| ids.contains(id)) {
+                            self.ws.set_active(&key, id);
+                        }
+                    }
+                }
+                Vec::new()
+            }
             Some(saved) => session::restore_plan(&saved, count, &self.projects),
             None => Vec::new(),
         };
@@ -483,13 +573,23 @@ impl AppView {
             }
             return;
         }
-        for (key, cwds, active) in plan {
+        let lang = settings::language(cx);
+        let resume_agents = settings::get(cx).resume_agents_on_restore;
+        for (key, terminals, active) in plan {
             let worktree = key.path().map(PathBuf::from);
-            for cwd in &cwds {
-                let cwd = (!cwd.as_os_str().is_empty()).then(|| cwd.clone());
-                self.client.create_terminal_at(DEFAULT_COLS, DEFAULT_ROWS, worktree.clone(), cwd);
+            self.restore_targets.push(RestoreTarget { key, expected: terminals.len(), active });
+            for term in terminals {
+                let resume = term.agent.filter(|_| resume_agents)
+                    .and_then(|a| session::resume_command(a.kind, &a.session_id));
+                let data = RestoreData {
+                    scrollback: term.scrollback,
+                    separator: tr(lang, Tr::RestoredScrollback),
+                    interruption: term.interrupted.then(|| tr(lang, Tr::AgentInterrupted)),
+                    resume,
+                };
+                let cwd = (!term.cwd.as_os_str().is_empty()).then_some(term.cwd);
+                self.client.restore_terminal(worktree.clone(), cwd, data);
             }
-            self.restore_targets.push(RestoreTarget { key, expected: cwds.len(), active });
         }
         self.restore_started = Some(Instant::now());
     }
@@ -779,7 +879,7 @@ impl AppView {
             self.on_projects_changed(cx);
         }
 
-        self.maybe_restore_terminals();
+        self.maybe_restore_terminals(infos, cx);
         self.finish_restore_targets(infos);
 
         if let Some(id) = self.active_diff().map(|tab| tab.id) {
@@ -900,18 +1000,24 @@ impl AppView {
 
     fn render_status_bar(
         &self,
-        status: ConnStatus,
+        snap: &Snapshot,
         lang: i18n::Language,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
-        let (text, restart_pid) = match status {
-            ConnStatus::Connected { pid } => (i18n::connected(lang, pid), None),
-            ConnStatus::Reconnecting => (tr(lang, Tr::Reconnecting).to_string(), None),
-            ConnStatus::Incompatible { pid, version } => {
-                (i18n::daemon_incompatible(lang, version, PROTO_VERSION), Some(pid))
+        let old_build = matches!(snap.status, ConnStatus::Connected { .. })
+            && snap.daemon_build.as_deref().is_some_and(|id| id != sich_app::build_id());
+        let text = if self.restarting_daemon {
+            tr(lang, Tr::DaemonRestarting).to_string()
+        } else {
+            match snap.status {
+                ConnStatus::Connected { .. } if old_build => tr(lang, Tr::DaemonOlderBuild).to_string(),
+                ConnStatus::Connected { pid } => i18n::connected(lang, pid),
+                ConnStatus::Reconnecting => tr(lang, Tr::Reconnecting).to_string(),
+                ConnStatus::Incompatible { version, .. } => i18n::daemon_incompatible(lang, version, PROTO_VERSION),
             }
         };
+        let restart = old_build && self.session_ready();
         let app = cx.entity();
         h_flex()
             .h(px(24.))
@@ -924,12 +1030,12 @@ impl AppView {
             .border_t_1()
             .border_color(theme.status_bar_border)
             .text_size(px(12.))
-            .text_color(if restart_pid.is_some() { theme.warning } else { theme.muted_foreground })
+            .text_color(if old_build { theme.warning } else { theme.muted_foreground })
             .child(div().flex_1().child(text))
-            .children(restart_pid.map(|pid| {
+            .children(restart.then(|| {
                 Button::new("restart-daemon").xsmall().label(tr(lang, Tr::RestartDaemon)).on_click(
                     move |_, window, cx| {
-                        worktree_dialogs::open_restart_daemon(app.clone(), pid, window, cx)
+                        worktree_dialogs::open_restart_daemon(app.clone(), window, cx)
                     },
                 )
             }))
@@ -1055,6 +1161,7 @@ impl AppView {
 
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.finish_daemon_restart();
         let snap = self.client.snapshot();
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
         self.sync(&snap, &infos, window, cx);
@@ -1070,7 +1177,14 @@ impl Render for AppView {
         let right_w = clamp_right_w(self.right_panel.width.unwrap_or(DEFAULT_RIGHT_W), window_w, sidebar_w);
         let sidebar = self.render_sidebar(&snap, &infos, lang, sidebar_w, cx);
         let main = self.render_main(&snap, &infos, lang, cx);
-        let status_bar = self.render_status_bar(snap.status, lang, cx);
+        let status_bar = self.render_status_bar(&snap, lang, cx);
+        if matches!(snap.status, ConnStatus::Incompatible { .. })
+            && !self.restarting_daemon && !self.restart_dialog_shown
+        {
+            self.restart_dialog_shown = true;
+            let app = cx.entity();
+            cx.defer_in(window, move |_, window, cx| worktree_dialogs::open_incompatible_daemon(app, window, cx));
+        }
 
         // Thin hit area straddling the sidebar's right border.
         let handle = div()

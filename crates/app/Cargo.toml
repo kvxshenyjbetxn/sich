@@ -28,6 +28,7 @@ regex = "1"
 serde.workspace = true
 serde_json = "1"
 dirs.workspace = true
+tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 sys-locale = "0.3"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }

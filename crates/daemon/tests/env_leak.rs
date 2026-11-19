@@ -21,8 +21,12 @@ async fn recv(c: &mut Conn) -> ServerMsg {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_env_is_clean() {
+    let dir = tempfile::tempdir().unwrap();
     // SAFETY: the only test in this binary; set before the daemon starts.
     unsafe {
+        std::env::set_var("SICH_CONFIG_DIR", dir.path().join("config"));
+        std::env::set_var("SICH_DATA_DIR", dir.path().join("data"));
+        std::env::set_var("SICH_WORKTREE_ROOT", dir.path().join("worktrees"));
         std::env::set_var("CLAUDECODE", "1");
         std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
     }

@@ -1,6 +1,7 @@
 //! Connection task: owns the daemon connection, routes server messages to sessions and
 //! reconnects forever with backoff.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,16 +12,18 @@ use sich_proto::{
     ClientMsg, PROTO_VERSION, ServerMsg, TermId, TerminalInfo, decode, encode, frame_codec,
 };
 use sich_term::TermSession;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 use crate::daemon_client::{
-    ClientState, Cmd, ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, TermEntry, Wake,
+    ClientState, Cmd, ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, RestartResult, RestoreData, TermEntry, Wake,
 };
 
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(2);
+const RESUME_DELAY: Duration = Duration::from_millis(1500);
 
 pub(crate) struct Conn {
     pub socket: String,
@@ -30,7 +33,7 @@ pub(crate) struct Conn {
     pub wake: Wake,
 }
 
-type Stream = Framed<sich_daemon::ClientStream, LengthDelimitedCodec>;
+type Stream<S> = Framed<S, LengthDelimitedCodec>;
 
 /// How a connection ended (when it did not fail with an error).
 enum End {
@@ -38,6 +41,7 @@ enum End {
     Closed,
     /// The daemon speaks another protocol version.
     Incompatible,
+    Restart(crate::daemon_restart::Request),
 }
 
 /// Detects a daemon we cannot talk to: a `Welcome` with another version, or an `Error` before
@@ -56,7 +60,7 @@ pub(crate) fn classify_incompatible(msg: &ServerMsg, welcomed: bool) -> Option<C
 
 pub(crate) async fn run(conn: Conn, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
     let mut backoff = BACKOFF_MIN;
-    loop {
+    'connect: loop {
         match sich_daemon::connect(&conn.socket).await {
             Ok(stream) => {
                 let mut welcomed = false;
@@ -64,15 +68,23 @@ pub(crate) async fn run(conn: Conn, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
                 match session(&conn, framed, &mut cmd_rx, &mut welcomed).await {
                     Ok(End::Closed) => return,
                     Ok(End::Incompatible) => {
-                        // Stay put until the user restarts the daemon.
-                        loop {
-                            match cmd_rx.recv().await {
-                                Some(Cmd::Reconnect) => break,
-                                Some(_) => {}
-                                None => return,
+                        // Stay put until the user confirms a restart.
+                        while let Some(cmd) = cmd_rx.recv().await {
+                            if let Cmd::Restart(request) = cmd {
+                                if conn.restart(request).await {
+                                    backoff = BACKOFF_MIN;
+                                    while cmd_rx.try_recv().is_ok() {}
+                                    continue 'connect;
+                                }
                             }
                         }
+                        return;
+                    }
+                    Ok(End::Restart(request)) => {
+                        conn.restart(request).await;
+                        while cmd_rx.try_recv().is_ok() {}
                         backoff = BACKOFF_MIN;
+                        continue 'connect;
                     }
                     Err(e) => tracing::warn!("daemon connection lost: {e:#}"),
                 }
@@ -91,20 +103,24 @@ pub(crate) async fn run(conn: Conn, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
         loop {
             tokio::select! {
                 _ = &mut sleep => break,
-                cmd = cmd_rx.recv() => if cmd.is_none() { return },
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(Cmd::Restart(_)) => conn.restart_failed(anyhow::anyhow!("daemon connection changed before restart")),
+                    Some(_) => {}
+                    None => return,
+                },
             }
         }
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
 }
 
-async fn send(stream: &mut Stream, msg: &ClientMsg) -> anyhow::Result<()> {
+async fn send<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut Stream<S>, msg: &ClientMsg) -> anyhow::Result<()> {
     stream.send(encode(msg)?).await.context("send to daemon")
 }
 
-async fn session(
+async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &Conn,
-    mut stream: Stream,
+    mut stream: Stream<S>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
     welcomed: &mut bool,
 ) -> anyhow::Result<End> {
@@ -114,7 +130,12 @@ async fn session(
     )
     .await?;
 
+    let incarnation = Arc::new(());
+    let mut restores = HashMap::new();
+    let mut resumes = HashMap::new();
+    let mut next_restore = 0_u64;
     loop {
+        let resume_at = resumes.values().map(|(when, _)| *when).min();
         tokio::select! {
             frame = stream.next() => {
                 let frame = frame.context("daemon closed the connection")?.context("read frame")?;
@@ -127,14 +148,60 @@ async fn session(
                 if matches!(msg, ServerMsg::Welcome { .. }) {
                     *welcomed = true;
                 }
-                for out in conn.on_server(msg)? {
-                    send(&mut stream, &out).await?;
+                match msg {
+                    ServerMsg::TerminalRestored { request_id, terminal } => {
+                        if let Some(data) = restores.remove(&request_id) {
+                            if let Some(info) = terminal {
+                                let id = info.id;
+                                let exited = info.exited.is_some();
+                                if let Some(command) = conn.restore_terminal(info, data).filter(|_| !exited) {
+                                    resumes.insert(id, (tokio::time::Instant::now() + RESUME_DELAY, command));
+                                }
+                                send(&mut stream, &ClientMsg::Subscribe { id, resume_from_seq: None }).await?;
+                            }
+                        }
+                    }
+                    msg => {
+                        let resume_id = match &msg {
+                            ServerMsg::Output { id, bytes, .. } if !bytes.is_empty() => Some(*id),
+                            ServerMsg::TerminalExited { id, .. } | ServerMsg::TerminalRemoved { id } => {
+                                resumes.remove(id);
+                                None
+                            }
+                            _ => None,
+                        };
+                        for out in conn.on_server(msg)? {
+                            send(&mut stream, &out).await?;
+                        }
+                        if let Some(id) = resume_id {
+                            if let Some((_, bytes)) = resumes.remove(&id) {
+                                // Terminal replies generated by feed, including ConPTY's initial
+                                // cursor-position reply, are already ahead of this command.
+                                let _ = conn.cmd_tx.send(Cmd::Resume(incarnation.clone(), id, bytes));
+                            }
+                        }
+                    }
+                }
+            }
+            _ = wait_for_resume(resume_at) => {
+                let now = tokio::time::Instant::now();
+                let ready: Vec<_> = resumes.iter().filter_map(|(&id, (when, _))| (*when <= now).then_some(id)).collect();
+                for id in ready {
+                    if let Some((_, bytes)) = resumes.remove(&id) {
+                        let _ = conn.cmd_tx.send(Cmd::Resume(incarnation.clone(), id, bytes));
+                    }
                 }
             }
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return Ok(End::Closed) };
                 let msg = match cmd {
-                    Cmd::Reconnect => continue,
+                    Cmd::Restart(request) => return Ok(End::Restart(request)),
+                    Cmd::Restore { worktree, cwd, data } => {
+                        let request_id = next_restore;
+                        next_restore += 1;
+                        restores.insert(request_id, data);
+                        ClientMsg::RestoreTerminal { request_id, worktree, cwd, cols: DEFAULT_COLS, rows: DEFAULT_ROWS }
+                    }
                     Cmd::Create { cols, rows, worktree, cwd } => ClientMsg::CreateTerminal {
                         cwd,
                         shell: None,
@@ -160,7 +227,14 @@ async fn session(
                     }
                     Cmd::Kill(id) => ClientMsg::KillTerminal { id },
                     Cmd::MarkSeen(id) => ClientMsg::MarkSeen { id },
-                    Cmd::Input(id, bytes) => ClientMsg::Input { id, bytes },
+                    Cmd::Input(id, bytes) => {
+                        resumes.remove(&id);
+                        ClientMsg::Input { id, bytes }
+                    }
+                    Cmd::Resume(connection, id, bytes) if Arc::ptr_eq(&connection, &incarnation) => {
+                        ClientMsg::Input { id, bytes }
+                    }
+                    Cmd::Resume(..) => continue,
                     Cmd::Resize(id, cols, rows) => ClientMsg::Resize { id, cols, rows },
                 };
                 send(&mut stream, &msg).await?;
@@ -169,7 +243,85 @@ async fn session(
     }
 }
 
+async fn wait_for_resume(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(when) => tokio::time::sleep_until(when).await,
+        None => std::future::pending().await,
+    }
+}
+
 impl Conn {
+    fn restart_failed(&self, err: anyhow::Error) {
+        tracing::warn!("restart daemon failed: {err:#}");
+        let mut st = self.state.lock();
+        st.restart_result = Some(RestartResult::Failed);
+        st.last_error = Some(("restart daemon".into(), format!("{err:#}"), Instant::now()));
+        drop(st);
+        (self.wake)();
+    }
+
+    async fn restart(&self, request: crate::daemon_restart::Request) -> bool {
+        let session = match request.save_and_shutdown(&self.socket).await {
+            Ok(session) => session,
+            Err(err) => {
+                self.restart_failed(err);
+                return false;
+            }
+        };
+        if let Err(err) = crate::daemon_restart::wait_for_exit(&self.socket).await {
+            self.restart_failed(err);
+            return false;
+        }
+        {
+            let mut st = self.state.lock();
+            st.terminals.clear();
+            st.status = ConnStatus::Reconnecting;
+            st.daemon_pid = None;
+            st.daemon_build = None;
+            st.synced = false;
+            st.first_list_count = None;
+            st.auto_create = !session.has_terminals();
+            st.restart_result = Some(RestartResult::Stopped(session));
+        }
+        (self.wake)();
+        if let Err(err) = crate::cli::ensure_daemon(&self.socket).await {
+            self.state.lock().last_error = Some(("restart daemon".into(), format!("{err:#}"), Instant::now()));
+            (self.wake)();
+        }
+        true
+    }
+
+    fn restore_terminal(&self, info: TerminalInfo, data: RestoreData) -> Option<Vec<u8>> {
+        let session = self.new_session(&info);
+        let history = data.scrollback.and_then(|name| {
+            let dir = sich_daemon::scrollback::directory()?;
+            let bytes = match sich_daemon::scrollback::load(&dir, &name) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    tracing::warn!("could not read terminal scrollback: {err}");
+                    return None;
+                }
+            };
+            Some((dir, name, bytes))
+        });
+        let mut lines = Vec::new();
+        if history.is_some() {
+            lines.push(data.separator);
+        }
+        lines.extend(data.interruption);
+        if !lines.is_empty() {
+            session.replay_history(history.as_ref().map_or(&[], |(_, _, bytes)| bytes.as_slice()), &lines);
+        }
+        if let Some((dir, name, _)) = history {
+            if let Err(err) = sich_daemon::scrollback::remove(&dir, &name) {
+                tracing::warn!("could not remove restored scrollback: {err}");
+            }
+        }
+        self.state.lock().terminals.push(TermEntry { info, session });
+        (self.wake)();
+        data.resume.map(|cmd| format!("{cmd}\r").into_bytes())
+    }
+
     fn new_session(&self, info: &TerminalInfo) -> TermSession {
         let id = info.id;
         let input_tx = self.cmd_tx.clone();
@@ -207,11 +359,19 @@ impl Conn {
                         st.terminals.clear();
                     }
                     st.daemon_pid = Some(daemon_pid);
+                    st.daemon_build = None;
                     st.status = ConnStatus::Connected { pid: daemon_pid };
                 }
+                out.push(ClientMsg::GetDaemonInfo);
                 out.push(ClientMsg::ListTerminals);
                 out.push(ClientMsg::ListProjects);
             }
+            ServerMsg::DaemonInfo { build_id, proto_version, .. } => {
+                if proto_version == PROTO_VERSION {
+                    self.state.lock().daemon_build = Some(build_id);
+                }
+            }
+            ServerMsg::ScrollbackSaved { .. } | ServerMsg::TerminalRestored { .. } => {}
             ServerMsg::Terminals(list) => self.reconcile(list, &mut out),
             ServerMsg::TerminalCreated(info) => {
                 let mut st = self.state.lock();
@@ -358,10 +518,14 @@ mod tests {
     }
 
     fn test_conn(rt: &tokio::runtime::Runtime, auto_create: bool) -> Conn {
-        let (cmd_tx, _rx) = mpsc::unbounded_channel();
-        Conn {
+        test_conn_with_rx(rt.handle(), auto_create).0
+    }
+
+    fn test_conn_with_rx(handle: &Handle, auto_create: bool) -> (Conn, mpsc::UnboundedReceiver<Cmd>) {
+        let (cmd_tx, rx) = mpsc::unbounded_channel();
+        (Conn {
             socket: "unused".into(),
-            rt: rt.handle().clone(),
+            rt: handle.clone(),
             state: Arc::new(Mutex::new(ClientState {
                 status: ConnStatus::Reconnecting,
                 terminals: Vec::new(),
@@ -369,6 +533,8 @@ mod tests {
                 first_list_count: None,
                 auto_create,
                 daemon_pid: None,
+                daemon_build: None,
+                restart_result: None,
                 projects: Vec::new(),
                 groups: Vec::new(),
                 projects_rev: 0,
@@ -376,7 +542,7 @@ mod tests {
             })),
             cmd_tx,
             wake: Arc::new(|| {}),
-        }
+        }, rx)
     }
 
     #[test]
@@ -395,6 +561,61 @@ mod tests {
             assert!(out.is_empty());
             assert_eq!(conn.state.lock().first_list_count, Some(0));
         }
+    }
+
+    async fn recv_client(peer: &mut Stream<tokio::io::DuplexStream>) -> ClientMsg {
+        let frame = tokio::time::timeout(Duration::from_secs(3), peer.next()).await.unwrap().unwrap().unwrap();
+        decode(&frame).unwrap()
+    }
+
+    async fn send_server(peer: &mut Stream<tokio::io::DuplexStream>, msg: ServerMsg) {
+        peer.send(encode(&msg).unwrap()).await.unwrap();
+    }
+
+    async fn exercise_resume(first_output: bool) {
+        let (conn, mut commands) = test_conn_with_rx(&Handle::current(), false);
+        let cmd_tx = conn.cmd_tx.clone();
+        let (local, peer) = tokio::io::duplex(8192);
+        let mut peer = Framed::new(peer, frame_codec());
+        let task = tokio::spawn(async move {
+            session(&conn, Framed::new(local, frame_codec()), &mut commands, &mut false).await
+        });
+
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Hello { .. }));
+        send_server(&mut peer, welcome(PROTO_VERSION)).await;
+        for expected in [ClientMsg::GetDaemonInfo, ClientMsg::ListTerminals, ClientMsg::ListProjects] {
+            assert_eq!(recv_client(&mut peer).await, expected);
+        }
+        cmd_tx.send(Cmd::Restore {
+            worktree: None, cwd: None,
+            data: RestoreData { scrollback: None, separator: "restored", interruption: None, resume: Some("codex resume abcdef12".into()) },
+        }).unwrap();
+        let ClientMsg::RestoreTerminal { request_id, .. } = recv_client(&mut peer).await else { panic!("expected restore request") };
+        let terminal = TerminalInfo {
+            id: 15, title: String::new(), cwd: Default::default(), cols: 80, rows: 24,
+            exited: None, created_unix_ms: 1, worktree: None, agent: None,
+        };
+        send_server(&mut peer, ServerMsg::TerminalRestored {
+            request_id: request_id + 1, terminal: Some(TerminalInfo { id: 16, ..terminal.clone() }),
+        }).await;
+        send_server(&mut peer, ServerMsg::TerminalRestored { request_id, terminal: Some(terminal) }).await;
+        assert_eq!(recv_client(&mut peer).await, ClientMsg::Subscribe { id: 15, resume_from_seq: None });
+        if first_output {
+            send_server(&mut peer, ServerMsg::Output { id: 15, seq: 0, bytes: b"\x1b[6n".to_vec() }).await;
+            assert_eq!(recv_client(&mut peer).await, ClientMsg::Input { id: 15, bytes: b"\x1b[1;1R".to_vec() });
+        }
+        assert_eq!(recv_client(&mut peer).await, ClientMsg::Input { id: 15, bytes: b"codex resume abcdef12\r".to_vec() });
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn agent_resume_waits_for_initial_terminal_reply() {
+        exercise_resume(true).await;
+    }
+
+    #[tokio::test]
+    async fn agent_resume_falls_back_to_timer_when_the_shell_is_quiet() {
+        exercise_resume(false).await;
     }
 
     #[test]

@@ -187,6 +187,16 @@ impl Terminal {
         }
     }
 
+    pub fn scrollback_tail(&self) -> Option<Vec<u8>> {
+        let st = self.shared.state.lock();
+        if st.exited.is_some() {
+            return None;
+        }
+        let cap = crate::scrollback::TAIL_BYTES;
+        let from = st.ring.end_seq().saturating_sub(cap as u64);
+        Some(st.ring.chunks_from(Some(from), cap).pop().map_or_else(Vec::new, |(_, bytes)| bytes))
+    }
+
     /// Applies a hook payload sent by `sich hook` and broadcasts the status if it changed.
     pub fn agent_hook(&self, kind: AgentKind, payload: &str) {
         let now = now_ms();
@@ -269,7 +279,7 @@ impl Terminal {
     }
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 

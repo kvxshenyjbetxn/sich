@@ -5,10 +5,11 @@
 //! live state, planning the terminal restore, resolving collapse state and window placement.
 
 use std::collections::HashSet;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sich_proto::{GroupId, GroupInfo, ProjectId, ProjectInfo, TerminalInfo};
+use sich_proto::{AgentKind, AgentState, GroupId, GroupInfo, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use crate::workspace::{WorkspaceKey, Workspaces, same_path, terminals_in, workspace_exists};
 
@@ -17,6 +18,7 @@ use crate::workspace::{WorkspaceKey, Workspaces, same_path, terminals_in, worksp
 pub struct Session {
     /// Selected worktree; `None` = Home.
     pub selected: Option<PathBuf>,
+    pub daemon_pid: Option<u32>,
     pub workspaces: Vec<SavedWorkspace>,
     /// Collapsed projects by path (ids may change between daemon runs).
     pub collapsed_projects: Vec<PathBuf>,
@@ -89,7 +91,56 @@ pub struct SavedWorkspace {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SavedTerminal {
+    pub id: Option<TermId>,
     pub cwd: PathBuf,
+    #[serde(deserialize_with = "read_saved_agent")]
+    pub agent: Option<SavedAgent>,
+    pub scrollback: Option<String>,
+    pub interrupted: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedAgent {
+    pub kind: AgentKind,
+    pub session_id: String,
+}
+
+fn read_saved_agent<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<SavedAgent>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+/// Produces only supported official CLI invocations. A leading dash would be a CLI option.
+pub fn resume_command(kind: AgentKind, session_id: &str) -> Option<String> {
+    if !(8..=64).contains(&session_id.len())
+        || session_id.starts_with('-')
+        || !session_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    let cmd = match kind {
+        AgentKind::Claude => "claude --resume",
+        AgentKind::Codex => "codex resume",
+        _ => return None,
+    };
+    Some(format!("{cmd} {session_id}"))
+}
+
+impl SavedTerminal {
+    fn from_info(info: &TerminalInfo) -> Self {
+        let agent = info.agent.as_ref();
+        Self {
+            id: Some(info.id),
+            cwd: info.cwd.clone(),
+            agent: agent.and_then(|a| {
+                let session_id = a.session_id.as_ref()?;
+                resume_command(a.kind, session_id)?;
+                Some(SavedAgent { kind: a.kind, session_id: session_id.clone() })
+            }),
+            interrupted: agent.is_some_and(|a| a.state == AgentState::Working),
+            scrollback: None,
+        }
+    }
 }
 
 /// Window bounds in logical pixels (`width`/`height` are the restore size when maximized).
@@ -107,6 +158,17 @@ impl Session {
     /// True when there is at least one terminal to bring back.
     pub fn has_terminals(&self) -> bool {
         self.workspaces.iter().any(|w| !w.terminals.is_empty())
+    }
+
+    /// Associates filenames with the saved IDs only when this is their daemon.
+    pub fn attach_scrollback(&mut self, pid: Option<u32>, files: &[(TermId, String)]) -> bool {
+        if pid.is_none() || self.daemon_pid != pid {
+            return false;
+        }
+        for term in self.workspaces.iter_mut().flat_map(|w| &mut w.terminals) {
+            term.scrollback = files.iter().find(|(id, _)| Some(*id) == term.id).map(|(_, name)| name.clone());
+        }
+        true
     }
 
     /// Parses file contents; `None` for garbage.
@@ -127,12 +189,11 @@ impl Session {
 
     /// Atomic write: temp file + rename.
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, path)?;
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        tmp.write_all(&serde_json::to_vec_pretty(self)?)?;
+        tmp.persist(path)?;
         Ok(())
     }
 
@@ -146,7 +207,7 @@ impl Session {
     }
 }
 
-fn file_path() -> Option<PathBuf> {
+pub(crate) fn file_path() -> Option<PathBuf> {
     crate::settings::config_file("session.json")
 }
 
@@ -200,7 +261,7 @@ pub fn build_session(input: &SessionInput) -> Session {
         let terminals = ids
             .iter()
             .filter_map(|id| live.iter().find(|t| t.id == *id))
-            .map(|t| SavedTerminal { cwd: t.cwd.clone() })
+            .map(SavedTerminal::from_info)
             .collect();
         let active = input.ws.active_in(&key, &ids).and_then(|a| ids.iter().position(|i| *i == a));
         workspaces.push(SavedWorkspace { worktree: key.path().map(Path::to_path_buf), terminals, active });
@@ -208,6 +269,7 @@ pub fn build_session(input: &SessionInput) -> Session {
 
     Session {
         selected: input.ws.selected.path().map(Path::to_path_buf),
+        daemon_pid: None,
         workspaces,
         collapsed_projects: input
             .projects
@@ -246,9 +308,9 @@ pub fn resolve_collapsed(
     (projs, grps)
 }
 
-/// One workspace to refill: its key, the cwd of each terminal to create (in order) and the
+/// One workspace to refill: its key, each terminal to recreate (in order) and the
 /// index of the tab to activate.
-pub type RestoreItem = (WorkspaceKey, Vec<PathBuf>, Option<usize>);
+pub type RestoreItem = (WorkspaceKey, Vec<SavedTerminal>, Option<usize>);
 
 /// What to recreate after a full quit. Nothing when the daemon still has terminals.
 pub fn restore_plan(session: &Session, daemon_terminal_count: usize, projects: &[ProjectInfo]) -> Vec<RestoreItem> {
@@ -289,15 +351,14 @@ pub fn restore_plan_with(
             continue;
         }
         let fallback = key.path().map(Path::to_path_buf).or_else(|| home.clone()).unwrap_or_default();
-        let cwds: Vec<PathBuf> = saved
-            .terminals
-            .iter()
-            .map(|t| {
-                if !t.cwd.as_os_str().is_empty() && dir_exists(&t.cwd) { t.cwd.clone() } else { fallback.clone() }
-            })
-            .collect();
-        let active = saved.active.filter(|i| *i < cwds.len());
-        plan.push((key, cwds, active));
+        let mut terminals = saved.terminals.clone();
+        for terminal in &mut terminals {
+            if terminal.cwd.as_os_str().is_empty() || !dir_exists(&terminal.cwd) {
+                terminal.cwd = fallback.clone();
+            }
+        }
+        let active = saved.active.filter(|i| *i < terminals.len());
+        plan.push((key, terminals, active));
     }
     plan
 }
@@ -374,7 +435,7 @@ mod tests {
     fn saved_ws(wt: Option<&str>, cwds: &[&str], active: Option<usize>) -> SavedWorkspace {
         SavedWorkspace {
             worktree: wt.map(PathBuf::from),
-            terminals: cwds.iter().map(|c| SavedTerminal { cwd: PathBuf::from(c) }).collect(),
+            terminals: cwds.iter().map(|c| SavedTerminal { cwd: PathBuf::from(c), ..Default::default() }).collect(),
             active,
         }
     }
@@ -383,6 +444,50 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         std::env::temp_dir().join(format!("sich-session-{tag}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)))
+    }
+
+    #[test]
+    fn old_and_unknown_agent_records_leave_other_terminal_data_intact() {
+        let old = Session::parse(r#"{"workspaces":[{"terminals":[{"cwd":"abc"}]}]}"#).unwrap();
+        assert_eq!(old.workspaces[0].terminals, saved_ws(None, &["abc"], None).terminals);
+        let future = Session::parse(r#"{"workspaces":[{"terminals":[{"cwd":"abc","agent":{"kind":"Future","session_id":"abcd1234"},"scrollback":"1-2.bin"}]}]}"#).unwrap();
+        let terminal = &future.workspaces[0].terminals[0];
+        assert_eq!(terminal.cwd, Path::new("abc"));
+        assert_eq!(terminal.scrollback.as_deref(), Some("1-2.bin"));
+        assert_eq!(terminal.agent, None);
+    }
+
+    #[test]
+    fn resume_commands_accept_only_safe_provider_ids() {
+        assert_eq!(resume_command(AgentKind::Claude, "Ab12-456").as_deref(), Some("claude --resume Ab12-456"));
+        assert_eq!(resume_command(AgentKind::Codex, "Ab12-456").as_deref(), Some("codex resume Ab12-456"));
+        for kind in [AgentKind::Other, AgentKind::Gemini] {
+            assert_eq!(resume_command(kind, "Ab12-456"), None);
+        }
+        for id in ["short", "abc;abcd", "abc/abcd", "abcd 1234", "abcd1234\r", "abcd1234\n", "─abcd1234", "--dangerous"] {
+            assert_eq!(resume_command(AgentKind::Claude, id), None, "{id:?}");
+        }
+        assert!(resume_command(AgentKind::Claude, &"a".repeat(64)).is_some());
+        assert!(resume_command(AgentKind::Claude, &"a".repeat(65)).is_none());
+    }
+
+    #[test]
+    fn scrollback_is_matched_by_live_terminal_id_in_restore_order() {
+        let mut session = Session {
+            daemon_pid: Some(5),
+            workspaces: vec![saved_ws(None, &["/h", "/h"], None), saved_ws(Some("/w"), &["/w"], None)],
+            ..Default::default()
+        };
+        session.workspaces[0].terminals[0].id = Some(4);
+        session.workspaces[0].terminals[1].id = Some(2);
+        session.workspaces[1].terminals[0].id = Some(8);
+        let files = [(8, "8-1.bin".into()), (2, "2-1.bin".into())];
+        assert!(!session.attach_scrollback(Some(6), &files));
+        assert_eq!(session.workspaces[0].terminals[1].scrollback, None);
+        assert!(session.attach_scrollback(Some(5), &files));
+        assert_eq!(session.workspaces[0].terminals[0].scrollback, None);
+        assert_eq!(session.workspaces[0].terminals[1].scrollback.as_deref(), Some("2-1.bin"));
+        assert_eq!(session.workspaces[1].terminals[0].scrollback.as_deref(), Some("8-1.bin"));
     }
 
     // ---- serde / disk ----
@@ -441,6 +546,7 @@ mod tests {
         let path = unique_path("rt").join("nested").join("session.json");
         let s = Session {
             selected: Some("/w/a".into()),
+            daemon_pid: Some(45),
             workspaces: vec![saved_ws(None, &["/h"], Some(0)), saved_ws(Some("/w/a"), &["/w/a", "/w/a/src"], Some(1))],
             collapsed_projects: vec!["/w".into()],
             collapsed_groups: vec!["game".into()],
@@ -494,9 +600,15 @@ mod tests {
         });
         assert_eq!(s.selected, Some(PathBuf::from("/w/a-x")));
         assert_eq!(s.workspaces.len(), 3);
-        assert_eq!(s.workspaces[0], saved_ws(None, &["/home"], Some(0)));
-        assert_eq!(s.workspaces[1], saved_ws(Some("/w/a"), &["/w/a", "/w/a/src"], Some(1)));
-        assert_eq!(s.workspaces[2], saved_ws(Some("/w/a-x"), &["/w/a-x"], Some(0)));
+        let mut expected = [
+            saved_ws(None, &["/home"], Some(0)),
+            saved_ws(Some("/w/a"), &["/w/a", "/w/a/src"], Some(1)),
+            saved_ws(Some("/w/a-x"), &["/w/a-x"], Some(0)),
+        ];
+        for (term, id) in expected.iter_mut().flat_map(|w| &mut w.terminals).zip([1, 2, 3, 5]) {
+            term.id = Some(id);
+        }
+        assert_eq!(s.workspaces, expected);
     }
 
     #[test]
@@ -525,7 +637,9 @@ mod tests {
         });
         assert_eq!(s.sidebar_w, Some(250.));
         assert_eq!(s.selected, None);
-        assert_eq!(s.workspaces, vec![saved_ws(Some("/w/b"), &["/w/b"], Some(0))]);
+        let mut expected = saved_ws(Some("/w/b"), &["/w/b"], Some(0));
+        expected.terminals[0].id = Some(3);
+        assert_eq!(s.workspaces, vec![expected]);
         assert_eq!(s.collapsed_projects, vec![PathBuf::from("/w/b")]);
         assert_eq!(s.collapsed_groups, vec!["game".to_string()]);
         assert_eq!(s.window.unwrap().width, 800.);
@@ -592,8 +706,8 @@ mod tests {
         };
         let plan = restore_plan_with(&session, 0, &projects, exists_only(&["/w/a-x", "/w/a-x/src", "/h"]), None);
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0], (WorkspaceKey::Worktree("/w/a-x".into()), vec!["/w/a-x".into(), "/w/a-x/src".into()], Some(1)));
-        assert_eq!(plan[1], (WorkspaceKey::Home, vec!["/h".into()], None));
+        assert_eq!(plan[0], (WorkspaceKey::Worktree("/w/a-x".into()), saved_ws(None, &["/w/a-x", "/w/a-x/src"], None).terminals, Some(1)));
+        assert_eq!(plan[1], (WorkspaceKey::Home, saved_ws(None, &["/h"], None).terminals, None));
     }
 
     #[test]
@@ -623,9 +737,9 @@ mod tests {
             ..Default::default()
         };
         let plan = restore_plan_with(&session, 0, &projects, exists_only(&["/w/a/src"]), Some("/home/u".into()));
-        assert_eq!(plan[0].1, vec![PathBuf::from("/w/a"), "/w/a/src".into(), "/w/a".into()]);
+        assert_eq!(plan[0].1, saved_ws(None, &["/w/a", "/w/a/src", "/w/a"], None).terminals);
         assert_eq!(plan[0].2, Some(2));
-        assert_eq!(plan[1].1, vec![PathBuf::from("/home/u")]);
+        assert_eq!(plan[1].1, saved_ws(None, &["/home/u"], None).terminals);
         // Out-of-range active index is dropped.
         assert_eq!(plan[1].2, None);
     }

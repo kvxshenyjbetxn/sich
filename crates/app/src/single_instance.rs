@@ -1,22 +1,62 @@
-//! Single GUI instance: a second `sich` launch asks the running one to show its window and
-//! exits. Uses a local socket named `<daemon socket>-ui`, so isolated instances (a different
-//! `SICH_SOCKET`) do not collide.
+//! The UI socket supports foregrounding the current GUI or handing it over to a newer launch.
 
-use std::io::{self, BufRead as _, BufReader, Write as _};
-use std::thread::JoinHandle;
+use std::io;
+use std::sync::Arc;
+use std::time::Duration;
 
-use interprocess::local_socket::traits::{ListenerExt as _, Stream as _};
+use interprocess::local_socket::tokio::{Listener, Stream, prelude::*};
 use interprocess::local_socket::{
-    GenericFilePath, GenericNamespaced, Listener, ListenerOptions, Name, NameType as _, Stream,
-    ToFsName as _,
-    ToNsName as _,
+    GenericFilePath, GenericNamespaced, ListenerOptions, Name,
 };
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::time::{Instant, sleep, timeout};
 
-/// The line sent by a second instance.
-const SHOW: &str = "show";
+use crate::tray::UiEvent;
 
-/// Name of the UI socket for the given daemon socket name.
-pub fn ui_socket_name(daemon_socket: &str) -> String {
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(750);
+const TAKEOVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Line<'a> {
+    Show,
+    Hello(&'a str),
+    Build(&'a str),
+    Takeover(&'a str),
+}
+
+impl<'a> Line<'a> {
+    fn parse(line: &'a str) -> Option<Self> {
+        let line = line.strip_suffix('\n')?.trim();
+        if line == "show" {
+            return Some(Self::Show);
+        }
+        let (command, id) = line.split_once(' ')?;
+        if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+')) {
+            return None;
+        }
+        match command {
+            "hello" => Some(Self::Hello(id)),
+            "build" => Some(Self::Build(id)),
+            "takeover" => Some(Self::Takeover(id)),
+            _ => None,
+        }
+    }
+
+    fn format(self) -> String {
+        match self {
+            Self::Show => "show\n".into(),
+            Self::Hello(id) => format!("hello {id}\n"),
+            Self::Build(id) => format!("build {id}\n"),
+            Self::Takeover(id) => format!("takeover {id}\n"),
+        }
+    }
+}
+
+fn decide<'a>(new: &'a str, existing: &str, force: bool) -> Line<'a> {
+    if force || new != existing { Line::Takeover(new) } else { Line::Show }
+}
+
+fn ui_socket_name(daemon_socket: &str) -> String {
     format!("{daemon_socket}-ui")
 }
 
@@ -28,96 +68,120 @@ fn to_name(name: &str) -> io::Result<Name<'static>> {
     }
 }
 
-/// Result of [`acquire`].
 pub enum Acquire {
-    /// We are the first instance; keep the listener and call [`serve`].
     Primary(Listener),
-    /// Another instance is running and was asked to show its window.
     AlreadyRunning,
-    /// The socket could not be used; carry on without single-instance protection.
     Unavailable,
 }
 
-/// Tells a running instance to show its window.
-fn signal_existing(name: &str) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        // Let the instance we are about to wake bring its window to the foreground.
-        // SAFETY: plain Win32 call without pointers.
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(u32::MAX);
-        }
-    }
-    let mut stream = Stream::connect(to_name(name)?)?;
-    stream.write_all(format!("{SHOW}\n").as_bytes())?;
-    stream.flush()
+async fn read_line(stream: &mut BufReader<Stream>) -> io::Result<String> {
+    let mut line = String::new();
+    timeout(HANDSHAKE_TIMEOUT, stream.take(256).read_line(&mut line)).await??;
+    Ok(line)
 }
 
-/// Signals a running instance, or becomes the primary one.
-pub fn acquire(daemon_socket: &str) -> Acquire {
-    let name = ui_socket_name(daemon_socket);
-    if signal_existing(&name).is_ok() {
-        return Acquire::AlreadyRunning;
-    }
-    let name_obj = match to_name(&name) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::warn!("single instance: bad socket name: {e}");
+async fn negotiate(stream: Stream, build: &str, force: bool) -> io::Result<bool> {
+    let mut stream = BufReader::new(stream);
+    stream.write_all(Line::Hello(build).format().as_bytes()).await?;
+    let line = read_line(&mut stream).await?;
+    let Some(Line::Build(existing)) = Line::parse(&line) else {
+        return Err(io::ErrorKind::InvalidData.into());
+    };
+    let command = decide(build, existing, force);
+    let takeover = matches!(command, Line::Takeover(_));
+    stream.write_all(command.format().as_bytes()).await?;
+    Ok(takeover)
+}
+
+pub async fn acquire(daemon_socket: &str, build: &str, force: bool) -> Acquire {
+    let socket = ui_socket_name(daemon_socket);
+    let name = match to_name(&socket) {
+        Ok(name) => name,
+        Err(err) => {
+            tracing::warn!("single instance: invalid socket name: {err}");
             return Acquire::Unavailable;
         }
     };
-    match ListenerOptions::new().name(name_obj).create_sync() {
-        Ok(l) => Acquire::Primary(l),
-        // Lost a race with another instance that started at the same moment.
-        Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            if signal_existing(&name).is_ok() { Acquire::AlreadyRunning } else { Acquire::Unavailable }
+    let mut takeover_requested = false;
+    let mut deadline = Instant::now() + TAKEOVER_TIMEOUT;
+    loop {
+        if let Ok(Ok(stream)) = timeout(HANDSHAKE_TIMEOUT, Stream::connect(name.borrow())).await {
+            if !takeover_requested {
+                #[cfg(windows)]
+                unsafe {
+                    // The running instance may need to foreground its window.
+                    windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(u32::MAX);
+                }
+                match timeout(HANDSHAKE_TIMEOUT, negotiate(stream, build, force)).await {
+                    Ok(Ok(true)) => {
+                        takeover_requested = true;
+                        deadline = Instant::now() + TAKEOVER_TIMEOUT;
+                    }
+                    Ok(Ok(false)) => return Acquire::AlreadyRunning,
+                    _ => {
+                        // Older UIs only understand "show".
+                        if let Ok(Ok(mut legacy)) = timeout(HANDSHAKE_TIMEOUT, Stream::connect(name.borrow())).await {
+                            let _ = timeout(HANDSHAKE_TIMEOUT, legacy.write_all(Line::Show.format().as_bytes())).await;
+                        }
+                        return Acquire::AlreadyRunning;
+                    }
+                }
+            }
+        } else {
+            match ListenerOptions::new().name(name.borrow()).create_tokio() {
+                Ok(listener) => return Acquire::Primary(listener),
+                Err(err) if err.kind() == io::ErrorKind::AddrInUse => {},
+                Err(err) if !takeover_requested => {
+                    tracing::warn!("single instance: cannot listen: {err}");
+                    return Acquire::Unavailable;
+                }
+                Err(_) => {},
+            }
         }
-        Err(e) => {
-            tracing::warn!("single instance: cannot listen: {e}");
-            Acquire::Unavailable
+        if Instant::now() >= deadline {
+            tracing::warn!("single instance: UI socket did not become available");
+            return Acquire::AlreadyRunning;
         }
+        sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// Runs the accept loop on a background thread; `on_show` is called for every "show" request.
-pub fn serve(listener: Listener, on_show: impl Fn() + Send + Sync + 'static) -> JoinHandle<()> {
-    let on_show = std::sync::Arc::new(on_show);
-    std::thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(conn) = conn else { continue };
-            let on_show = on_show.clone();
-            // One short-lived thread per connection: a silent client must not block the loop.
-            std::thread::spawn(move || {
-                if read_show(conn) {
-                    on_show();
-                }
-            });
-        }
+pub async fn serve(listener: Listener, build: &'static str, on_event: impl Fn(UiEvent) + Send + Sync + 'static) {
+    let on_event = Arc::new(on_event);
+    while let Ok(stream) = listener.accept().await {
+        let on_event = on_event.clone();
+        tokio::spawn(async move {
+            if let Ok(Some(event)) = receive(stream, build).await {
+                on_event(event);
+            }
+        });
+    }
+}
+
+async fn receive(stream: Stream, build: &str) -> io::Result<Option<UiEvent>> {
+    let mut stream = BufReader::new(stream);
+    let line = read_line(&mut stream).await?;
+    if Line::parse(&line) == Some(Line::Show) {
+        return Ok(Some(UiEvent::Show));
+    }
+    let Some(Line::Hello(peer)) = Line::parse(&line) else { return Ok(None) };
+    stream.write_all(Line::Build(build).format().as_bytes()).await?;
+    let next = read_line(&mut stream).await?;
+    Ok(match Line::parse(&next) {
+        Some(Line::Show) => Some(UiEvent::Show),
+        Some(Line::Takeover(id)) if id == peer => Some(UiEvent::Takeover),
+        _ => None,
     })
-}
-
-/// Reads one request line (at most 64 bytes); true when it is "show".
-fn read_show(conn: impl io::Read) -> bool {
-    let mut line = String::new();
-    let mut reader = BufReader::new(conn.take(64));
-    matches!(reader.read_line(&mut line), Ok(n) if n > 0) && is_show(&line)
-}
-
-/// True for the "show" request line.
-pub fn is_show(line: &str) -> bool {
-    line.trim() == SHOW
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn unique_socket() -> String {
-        use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
-        format!("sich-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+        format!("sich-ui-test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
     }
 
     #[test]
@@ -127,49 +191,71 @@ mod tests {
     }
 
     #[test]
-    fn only_show_lines_are_accepted() {
-        assert!(is_show("show\n"));
-        assert!(is_show("show\r\n"));
-        assert!(!is_show("quit\n"));
-        assert!(!is_show(""));
+    fn line_protocol_round_trips_and_rejects_malformed_lines() {
+        for command in [Line::Show, Line::Hello("0.0.1-ab123-123"), Line::Build("b"), Line::Takeover("b")] {
+            let line = command.format();
+            assert_eq!(Line::parse(&line), Some(command));
+        }
+        assert_eq!(Line::parse("show\r\n"), Some(Line::Show));
+        for bad in ["show", "quit\n", "hello\n", "build \n", "takeover ab cd\n", "hello abc/def\n"] {
+            assert_eq!(Line::parse(bad), None);
+        }
     }
 
     #[test]
-    fn second_instance_delivers_show_to_the_first() {
+    fn decision_uses_build_and_explicit_restart() {
+        assert_eq!(decide("new", "new", false), Line::Show);
+        assert_eq!(decide("new", "old", false), Line::Takeover("new"));
+        assert_eq!(decide("new", "new", true), Line::Takeover("new"));
+    }
+
+    #[tokio::test]
+    async fn same_build_shows_and_different_build_waits_for_handover() {
         let sock = unique_socket();
-        let Acquire::Primary(listener) = acquire(&sock) else { panic!("first instance must be primary") };
-        let (tx, rx) = mpsc::channel();
-        let tx = std::sync::Mutex::new(tx);
-        let _t = serve(listener, move || {
-            let _ = tx.lock().unwrap().send(());
-        });
+        let Acquire::Primary(listener) = acquire(&sock, "old", false).await else { panic!("primary") };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(serve(listener, "old", move |event| { let _ = tx.send(event); }));
+        assert!(matches!(acquire(&sock, "old", false).await, Acquire::AlreadyRunning));
+        assert_eq!(timeout(HANDSHAKE_TIMEOUT, rx.recv()).await.unwrap(), Some(UiEvent::Show));
 
-        assert!(matches!(acquire(&sock), Acquire::AlreadyRunning));
-        rx.recv_timeout(Duration::from_secs(5)).expect("show request delivered");
-        // And again: the listener keeps serving.
-        assert!(matches!(acquire(&sock), Acquire::AlreadyRunning));
-        rx.recv_timeout(Duration::from_secs(5)).expect("second show request delivered");
+        let next = tokio::spawn(async move { acquire(&sock, "new", false).await });
+        assert_eq!(timeout(HANDSHAKE_TIMEOUT, rx.recv()).await.unwrap(), Some(UiEvent::Takeover));
+        assert!(!next.is_finished());
+        server.abort();
+        let _ = server.await;
+        assert!(matches!(next.await.unwrap(), Acquire::Primary(_)));
     }
 
-    #[test]
-    fn other_requests_do_not_trigger_show() {
+    #[tokio::test]
+    async fn existing_server_accepts_plain_show_and_ignores_mismatched_takeover() {
         let sock = unique_socket();
-        let Acquire::Primary(listener) = acquire(&sock) else { panic!("primary") };
-        let (tx, rx) = mpsc::channel();
-        let tx = std::sync::Mutex::new(tx);
-        let _t = serve(listener, move || {
-            let _ = tx.lock().unwrap().send(());
-        });
-        let mut s = Stream::connect(to_name(&ui_socket_name(&sock)).unwrap()).unwrap();
-        s.write_all(b"hello\n").unwrap();
-        drop(s);
-        assert!(rx.recv_timeout(Duration::from_millis(500)).is_err());
+        let Acquire::Primary(listener) = acquire(&sock, "old", false).await else { panic!("primary") };
+        assert!(matches!(acquire(&unique_socket(), "old", false).await, Acquire::Primary(_)));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _server = tokio::spawn(serve(listener, "old", move |event| { let _ = tx.send(event); }));
+        let name = to_name(&ui_socket_name(&sock)).unwrap();
+        let mut wrong = BufReader::new(Stream::connect(name.borrow()).await.unwrap());
+        wrong.write_all(b"hello one\n").await.unwrap();
+        assert_eq!(read_line(&mut wrong).await.unwrap(), "build old\n");
+        wrong.write_all(b"takeover another\n").await.unwrap();
+        assert_eq!(read_line(&mut wrong).await.unwrap(), "");
+        let mut plain = Stream::connect(name).await.unwrap();
+        plain.write_all(b"show\n").await.unwrap();
+        assert_eq!(timeout(HANDSHAKE_TIMEOUT, rx.recv()).await.unwrap(), Some(UiEvent::Show));
+        assert!(rx.try_recv().is_err());
     }
 
-    #[test]
-    fn different_sockets_do_not_collide() {
-        let (a, b) = (unique_socket(), unique_socket());
-        let Acquire::Primary(_la) = acquire(&a) else { panic!("a primary") };
-        assert!(matches!(acquire(&b), Acquire::Primary(_)));
+    #[tokio::test]
+    async fn a_legacy_show_only_instance_is_foregrounded() {
+        let sock = unique_socket();
+        let Acquire::Primary(listener) = acquire(&sock, "old", false).await else { panic!("primary") };
+        let legacy = tokio::spawn(async move {
+            let hello = listener.accept().await.unwrap();
+            assert_eq!(read_line(&mut BufReader::new(hello)).await.unwrap(), "hello new\n");
+            let show = listener.accept().await.unwrap();
+            assert_eq!(read_line(&mut BufReader::new(show)).await.unwrap(), "show\n");
+        });
+        assert!(matches!(acquire(&sock, "new", false).await, Acquire::AlreadyRunning));
+        legacy.await.unwrap();
     }
 }

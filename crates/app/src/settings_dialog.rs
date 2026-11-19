@@ -32,6 +32,12 @@ pub fn open(window: &mut Window, cx: &mut App) {
                     .child(section(tr(lang, Tr::Theme), theme_cards(lang, cx), cx))
                     .child(section(tr(lang, Tr::AgentsSection), agents_section(lang, cx), cx))
                     .child(
+                        Switch::new("resume-agents-on-restore")
+                            .checked(settings::get(cx).resume_agents_on_restore)
+                            .label(tr(lang, Tr::ResumeAgentsOnRestore))
+                            .on_click(|checked, _, cx| settings::set_resume_agents_on_restore(*checked, cx)),
+                    )
+                    .child(
                         Switch::new("close-to-tray")
                             .checked(settings::get(cx).close_to_tray)
                             .label(tr(lang, Tr::CloseToTray))

@@ -284,6 +284,7 @@ mod tests {
             prompt: None,
             message: None,
             subagents: Vec::new(),
+            session_id: None,
         }
     }
 

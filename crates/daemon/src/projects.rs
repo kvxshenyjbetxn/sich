@@ -61,13 +61,6 @@ pub struct Registry {
     state: Mutex<State>,
 }
 
-fn config_dir() -> Option<PathBuf> {
-    match std::env::var_os("SICH_CONFIG_DIR") {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
-        _ => dirs::config_dir(),
-    }
-}
-
 fn worktree_root() -> PathBuf {
     match std::env::var_os("SICH_WORKTREE_ROOT") {
         Some(d) if !d.is_empty() => PathBuf::from(d),
@@ -78,7 +71,7 @@ fn worktree_root() -> PathBuf {
 impl Registry {
     pub fn load() -> Self {
         let file =
-            config_dir().unwrap_or_else(|| PathBuf::from(".")).join("sich").join("projects.json");
+            crate::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("sich").join("projects.json");
         let state = parse_state(&std::fs::read(&file).unwrap_or_default());
         Self { file, state: Mutex::new(state) }
     }

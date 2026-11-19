@@ -64,6 +64,7 @@ struct Shared {
     /// End offset of the daemon stream already fed (bytes below it are dropped as duplicates).
     seen_end: Mutex<u64>,
     dirty: AtomicBool,
+    replaying: AtomicBool,
     /// Text a program asked to put into the system clipboard (OSC 52); last write wins.
     clipboard: Mutex<Option<String>>,
     wake: Box<dyn Fn() + Send + Sync>,
@@ -86,6 +87,9 @@ pub struct Listener(Arc<Shared>);
 
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
+        if self.0.replaying.load(Ordering::Relaxed) {
+            return;
+        }
         match event {
             Event::PtyWrite(s) => self.0.write(s.into_bytes()),
             Event::Title(t) => {
@@ -148,6 +152,7 @@ impl TermSession {
             size: Mutex::new(Size { cols, rows, cell_w: 0, cell_h: 0 }),
             seen_end: Mutex::new(0),
             dirty: AtomicBool::new(true),
+            replaying: AtomicBool::new(false),
             clipboard: Mutex::new(None),
             wake: Box::new(wake),
         });
@@ -194,6 +199,25 @@ impl TermSession {
                 self.spawn_sync_timer();
             }
         }
+        self.shared.mark();
+    }
+
+    /// Replays history before subscribing to a new PTY. Terminal replies and clipboard requests
+    /// from historical output are ignored, and the live stream always starts at its own offset.
+    pub fn replay_history(&self, bytes: &[u8], lines: &[&str]) {
+        let mut term = self.term.lock();
+        self.shared.replaying.store(true, Ordering::Relaxed);
+        let mut processor = SyncProcessor::new();
+        processor.advance(&mut *term, bytes);
+        // Cancel a partial sequence, end synchronized output and leave any alternate screen.
+        processor.advance(&mut *term, b"\x18\x1b[?2026l\x1b[?1049l\x1b[0m");
+        for line in lines {
+            processor.advance(&mut *term, b"\r\n\x1b[2m");
+            processor.advance(&mut *term, line.as_bytes());
+            processor.advance(&mut *term, b"\x1b[0m\r\n");
+        }
+        self.shared.replaying.store(false, Ordering::Relaxed);
+        drop(term);
         self.shared.mark();
     }
 
@@ -369,6 +393,22 @@ mod tests {
 
     fn session(rt: &tokio::runtime::Runtime) -> TermSession {
         TermSession::new(rt.handle(), 80, 24, Arc::new(|_| {}), Arc::new(|_, _| {}), || {})
+    }
+
+    #[test]
+    fn restored_output_has_no_live_offset_or_terminal_replies() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = TermSession::new(
+            rt.handle(), 80, 24, Arc::new(move |bytes| tx.send(bytes).unwrap()),
+            Arc::new(|_, _| {}), || {},
+        );
+        s.replay_history(b"history\x1b[6n\x1b]52;c;YQ==\x07", &["restored"]);
+        assert_eq!(s.last_seq(), 0);
+        assert!(rx.try_recv().is_err());
+        s.feed(0, b"live\x1b[6n");
+        assert_eq!(s.last_seq(), 8);
+        assert!(rx.try_recv().is_ok());
     }
 
     #[test]

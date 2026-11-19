@@ -11,6 +11,8 @@ use crate::i18n::{Language, Tr, tr};
 pub enum UiEvent {
     /// Bring the window to the front.
     Show,
+    Takeover,
+    Restart,
     /// Quit Sich (daemon included), asking first when agents are busy.
     Quit,
 }
@@ -69,6 +71,7 @@ mod imp {
     use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
     const ID_SHOW: &str = "sich-tray-show";
+    const ID_RESTART: &str = "sich-tray-restart";
     const ID_QUIT: &str = "sich-tray-quit";
     /// Ordinal of the icon embedded by `app.rc` (`1 ICON assets/icon.ico`).
     const ICON_ORDINAL: u16 = 1;
@@ -82,6 +85,7 @@ mod imp {
         let menu = Menu::new();
         menu.append(&MenuItem::with_id(ID_SHOW, tr(lang, Tr::TrayShow), true, None))?;
         menu.append(&PredefinedMenuItem::separator())?;
+        menu.append(&MenuItem::with_id(ID_RESTART, tr(lang, Tr::TrayRestart), true, None))?;
         menu.append(&MenuItem::with_id(ID_QUIT, tr(lang, Tr::TrayQuit), true, None))?;
         Ok(menu)
     }
@@ -111,6 +115,9 @@ mod imp {
             MenuEvent::set_event_handler(Some(move |ev: MenuEvent| match ev.id.0.as_str() {
                 ID_SHOW => {
                     let _ = tx.unbounded_send(UiEvent::Show);
+                }
+                ID_RESTART => {
+                    let _ = tx.unbounded_send(UiEvent::Restart);
                 }
                 ID_QUIT => {
                     let _ = tx.unbounded_send(UiEvent::Quit);
@@ -175,6 +182,7 @@ mod tests {
                 prompt: None,
                 message: None,
                 subagents: Vec::new(),
+                session_id: None,
             }),
         }
     }

@@ -18,17 +18,23 @@ pub struct Manager {
     pub projects: crate::projects::Registry,
     /// Socket name this daemon listens on; handed to terminals as `SICH_SOCKET`.
     pub socket_name: String,
+    pub build_id: String,
+    pub started_unix_ms: u64,
+    scrollback_lock: Mutex<()>,
     terminals: Mutex<BTreeMap<TermId, Arc<Terminal>>>,
     next_term: AtomicU64,
     next_conn: AtomicU64,
 }
 
 impl Manager {
-    pub fn new(socket_name: &str) -> Arc<Self> {
+    pub fn new(socket_name: &str, build_id: &str) -> Arc<Self> {
         Arc::new(Self {
             hub: Arc::new(Hub::default()),
             projects: crate::projects::Registry::load(),
             socket_name: socket_name.to_string(),
+            build_id: build_id.into(),
+            started_unix_ms: crate::terminal::now_ms(),
+            scrollback_lock: Mutex::new(()),
             shutdown: CancellationToken::new(),
             terminals: Mutex::new(BTreeMap::new()),
             next_term: AtomicU64::new(1),
@@ -49,7 +55,11 @@ impl Manager {
     }
 
     /// Spawns a terminal (blocking work is moved off the async runtime) and broadcasts it.
-    pub async fn create(self: &Arc<Self>, req: SpawnRequest) -> anyhow::Result<TerminalInfo> {
+    pub async fn create(
+        self: &Arc<Self>,
+        req: SpawnRequest,
+        before_broadcast: impl FnOnce(&TerminalInfo),
+    ) -> anyhow::Result<()> {
         let me = self.clone();
         let term = tokio::task::spawn_blocking(move || {
             let id = me.next_term.fetch_add(1, Ordering::Relaxed);
@@ -59,8 +69,9 @@ impl Manager {
         .context("spawn task")??;
         let info = term.info();
         self.terminals.lock().insert(term.id(), term);
-        self.hub.broadcast(ServerMsg::TerminalCreated(info.clone()));
-        Ok(info)
+        before_broadcast(&info);
+        self.hub.broadcast(ServerMsg::TerminalCreated(info));
+        Ok(())
     }
 
     /// Kills (if alive) and removes a terminal. Returns false if it does not exist.
@@ -104,6 +115,35 @@ impl Manager {
         self.hub.unregister(conn);
         for t in self.terminals.lock().values() {
             t.unsubscribe(conn);
+        }
+    }
+
+    pub async fn save_scrollback(self: &Arc<Self>) -> Vec<(TermId, String)> {
+        let Some(dir) = crate::scrollback::directory() else { return Vec::new() };
+        let mgr = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            let _save = mgr.scrollback_lock.lock();
+            let terminals: Vec<_> = mgr.terminals.lock().values().rev().cloned().collect();
+            let mut files = Vec::new();
+            for term in terminals {
+                if files.len() == crate::scrollback::MAX_FILES {
+                    break;
+                }
+                let Some(bytes) = term.scrollback_tail() else { continue };
+                match crate::scrollback::save(&dir, term.id(), mgr.started_unix_ms, &bytes) {
+                    Ok(name) => files.push((term.id(), name)),
+                    Err(err) => tracing::warn!(id = term.id(), "could not save scrollback: {err}"),
+                }
+            }
+            crate::scrollback::prune(&dir, std::time::SystemTime::now());
+            files.retain(|(_, name)| dir.join(name).is_file());
+            files
+        }).await {
+            Ok(files) => files,
+            Err(err) => {
+                tracing::warn!("scrollback task failed: {err}");
+                Vec::new()
+            }
         }
     }
 

@@ -100,7 +100,7 @@ pub fn apply(enable: bool, window: Option<&Window>, cx: &mut App) {
 
     let handle = window.map(|w| w.window_handle());
     let dir = codex_install::default_codex_home();
-    let exe = std::env::current_exe().ok();
+    let exe = crate::daemon_host::launcher_exe();
     cx.spawn(async move |cx: &mut AsyncApp| {
         let status = cx.background_executor().spawn(async move { run(enable, dir, exe) }).await;
         let error = match &status {
@@ -122,7 +122,7 @@ pub fn startup(cx: &mut App) {
         apply(true, None, cx);
     } else {
         let dir = codex_install::default_codex_home();
-        let exe = std::env::current_exe().ok();
+        let exe = crate::daemon_host::launcher_exe();
         let status = current_status(dir.as_deref(), exe.as_deref());
         set_state(CodexState { status, busy: false }, cx);
     }

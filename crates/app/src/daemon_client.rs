@@ -13,7 +13,8 @@ use sich_term::TermSession;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use crate::daemon_conn;
+use crate::{daemon_conn, daemon_restart};
+use crate::session::Session;
 
 /// Wakes the UI thread (must be cheap and non-blocking).
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -48,6 +49,8 @@ pub(crate) struct ClientState {
     /// is going to fill it).
     pub auto_create: bool,
     pub daemon_pid: Option<u32>,
+    pub daemon_build: Option<String>,
+    pub restart_result: Option<RestartResult>,
     pub projects: Vec<ProjectInfo>,
     pub groups: Vec<GroupInfo>,
     /// Incremented on every `Projects` message (0 = none received yet).
@@ -58,8 +61,8 @@ pub(crate) struct ClientState {
 
 /// Commands from the UI to the connection task.
 pub(crate) enum Cmd {
-    /// Leave the `Incompatible` state and connect again.
-    Reconnect,
+    Restart(daemon_restart::Request),
+    Restore { worktree: Option<PathBuf>, cwd: Option<PathBuf>, data: RestoreData },
     Create { cols: u16, rows: u16, worktree: Option<PathBuf>, cwd: Option<PathBuf> },
     RefreshProjects,
     AddProject { path: PathBuf, group: Option<GroupId> },
@@ -73,21 +76,32 @@ pub(crate) enum Cmd {
     Kill(TermId),
     MarkSeen(TermId),
     Input(TermId, Vec<u8>),
+    Resume(Arc<()>, TermId, Vec<u8>),
     Resize(TermId, u16, u16),
+}
+
+pub(crate) struct RestoreData {
+    pub scrollback: Option<String>,
+    pub separator: &'static str,
+    pub interruption: Option<&'static str>,
+    pub resume: Option<String>,
+}
+
+pub(crate) enum RestartResult {
+    Stopped(Session),
+    Failed,
 }
 
 pub struct Snapshot {
     pub status: ConnStatus,
     pub terminals: Vec<TermEntry>,
+    pub daemon_build: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct DaemonClient {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     state: Arc<Mutex<ClientState>>,
-    rt: Handle,
-    socket: String,
-    wake: Wake,
 }
 
 impl DaemonClient {
@@ -101,6 +115,8 @@ impl DaemonClient {
             first_list_count: None,
             auto_create,
             daemon_pid: None,
+            daemon_build: None,
+            restart_result: None,
             projects: Vec::new(),
             groups: Vec::new(),
             projects_rev: 0,
@@ -114,12 +130,12 @@ impl DaemonClient {
             wake: wake.clone(),
         };
         rt.spawn(daemon_conn::run(conn, cmd_rx));
-        DaemonClient { cmd_tx, state, rt: rt.clone(), socket, wake }
+        DaemonClient { cmd_tx, state }
     }
 
     pub fn snapshot(&self) -> Snapshot {
         let st = self.state.lock();
-        Snapshot { status: st.status, terminals: st.terminals.clone() }
+        Snapshot { status: st.status, terminals: st.terminals.clone(), daemon_build: st.daemon_build.clone() }
     }
 
     /// Creates a terminal whose cwd is `worktree` (when given).
@@ -127,9 +143,12 @@ impl DaemonClient {
         let _ = self.cmd_tx.send(Cmd::Create { cols, rows, worktree, cwd: None });
     }
 
-    /// Like [`create_terminal_in`](Self::create_terminal_in) but starting in `cwd` (session restore).
-    pub fn create_terminal_at(&self, cols: u16, rows: u16, worktree: Option<PathBuf>, cwd: Option<PathBuf>) {
-        let _ = self.cmd_tx.send(Cmd::Create { cols, rows, worktree, cwd });
+    pub fn restore_terminal(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, data: RestoreData) {
+        let _ = self.cmd_tx.send(Cmd::Restore { worktree, cwd, data });
+    }
+
+    pub fn daemon_pid(&self) -> Option<u32> {
+        self.state.lock().daemon_pid
     }
 
     /// Terminal count of the first list received after startup; `None` until it arrives.
@@ -143,22 +162,12 @@ impl DaemonClient {
         (st.projects_rev, st.projects.clone(), st.groups.clone())
     }
 
-    /// Kills the incompatible daemon (by `pid`, else by scanning processes), starts a new one
-    /// and resumes connecting.
-    pub fn restart_daemon(&self, pid: Option<u32>) {
-        let tx = self.cmd_tx.clone();
-        let state = self.state.clone();
-        let wake = self.wake.clone();
-        let socket = self.socket.clone();
-        self.rt.spawn(async move {
-            if let Err(e) = crate::daemon_kill::restart(&socket, pid).await {
-                tracing::error!("restart daemon failed: {e:#}");
-                state.lock().last_error =
-                    Some(("restart daemon".into(), format!("{e:#}"), Instant::now()));
-            }
-            let _ = tx.send(Cmd::Reconnect);
-            wake();
-        });
+    pub fn restart_daemon(&self, request: daemon_restart::Request) {
+        let _ = self.cmd_tx.send(Cmd::Restart(request));
+    }
+
+    pub fn take_restart_result(&self) -> Option<RestartResult> {
+        self.state.lock().restart_result.take()
     }
 
     pub fn last_error(&self) -> Option<(String, String, Instant)> {

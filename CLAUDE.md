@@ -56,5 +56,6 @@ The app will grow a lot of features. Tests are what keep old features from break
 The main model, after merging, runs the full `cargo test --workspace` again. For UI changes it also launches the app and verifies with screenshots before telling the user it's done.
 
 ## Practical notes
-- A daemon running from `target/release` locks `sich.exe`. During the development stage the main model may stop the user's daemon and close Sich windows without asking (`sich daemon stop` / kill), e.g. before a release rebuild. Mention it in the report. Coders still must not kill processes.
+- Rebuilding Sich works while Sich runs: both the GUI and the daemon run from copies in `<data>/sich/daemon-host/<build_id>/`, so `target\release\sich.exe` is not locked. No need to stop the daemon. To update, launch the new executable and it takes over the old GUI. `SICH_NO_RELOCATE=1` runs the GUI in place (then it locks the exe).
+- Avoid protocol changes when a UI-only change will do. Every PROTO_VERSION bump forces a daemon restart for users.
 - On Windows, git and other child processes must use `CREATE_NO_WINDOW` (no console flashes).
