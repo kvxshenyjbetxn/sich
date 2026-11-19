@@ -27,7 +27,19 @@ use crate::tab_bar::{entry_title, tab_label};
 use crate::workspace::{WorkspaceKey, same_path, terminals_in};
 use crate::worktree_dialogs::{self, WorktreeRef};
 
-pub const SIDEBAR_W: f32 = 300.;
+pub const DEFAULT_SIDEBAR_W: f32 = 300.;
+pub const MIN_SIDEBAR_W: f32 = 200.;
+const MAX_SIDEBAR_W: f32 = 600.;
+/// Room that must stay for the main area.
+const MIN_MAIN_W: f32 = 400.;
+
+/// Sidebar width limited to `[200, min(600, window_w - 400)]`; never below 200 even in a narrow
+/// window. Non-finite input falls back to the default.
+pub fn clamp_sidebar_w(w: f32, window_w: f32) -> f32 {
+    let max = MAX_SIDEBAR_W.min(window_w - MIN_MAIN_W).max(MIN_SIDEBAR_W);
+    let w = if w.is_finite() { w } else { DEFAULT_SIDEBAR_W };
+    w.clamp(MIN_SIDEBAR_W, max)
+}
 const ROW_H: f32 = 28.;
 /// Height of a terminal row that shows an agent (title line + preview line).
 const AGENT_ROW_H: f32 = 44.;
@@ -282,6 +294,7 @@ impl AppView {
         snap: &Snapshot,
         infos: &[TerminalInfo],
         lang: Language,
+        width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
@@ -375,7 +388,7 @@ impl AppView {
         }
 
         v_flex()
-            .w(px(SIDEBAR_W))
+            .w(px(width))
             .h_full()
             .flex_shrink_0()
             .bg(theme.sidebar)
@@ -764,6 +777,24 @@ mod tests {
     use super::*;
     use crate::agent_badge::BadgeKind;
     use sich_proto::{AgentKind, AgentState, AgentStatus};
+
+    #[test]
+    fn sidebar_width_is_clamped() {
+        assert_eq!(clamp_sidebar_w(300., 1200.), 300.);
+        assert_eq!(clamp_sidebar_w(50., 1200.), 200.);
+        assert_eq!(clamp_sidebar_w(900., 2000.), 600.);
+        // Window 1000 wide leaves max 600; window 800 leaves max 400.
+        assert_eq!(clamp_sidebar_w(700., 1000.), 600.);
+        assert_eq!(clamp_sidebar_w(500., 800.), 400.);
+        // Narrow window: never below the minimum.
+        assert_eq!(clamp_sidebar_w(300., 500.), 200.);
+        assert_eq!(clamp_sidebar_w(300., 0.), 200.);
+        assert_eq!(clamp_sidebar_w(100., 300.), 200.);
+        // Garbage input.
+        assert_eq!(clamp_sidebar_w(f32::NAN, 1200.), 300.);
+        assert_eq!(clamp_sidebar_w(f32::INFINITY, 1200.), 300.);
+        assert_eq!(clamp_sidebar_w(300., f32::INFINITY), 300.);
+    }
 
     fn wt(path: &str, branch: Option<&str>) -> WorktreeInfo {
         WorktreeInfo {

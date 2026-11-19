@@ -12,7 +12,7 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, Render, Styled as _, Window, WindowBounds,
+    CursorStyle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render, Styled as _, Window, WindowBounds,
     div, px,
 };
 use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
@@ -21,6 +21,7 @@ use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
+use crate::sidebar::{DEFAULT_SIDEBAR_W, clamp_sidebar_w};
 use crate::session::{self, SavedWindow, Session, SessionInput};
 use crate::settings;
 use crate::settings_dialog;
@@ -98,6 +99,10 @@ pub struct AppView {
     last_session: Option<Session>,
     pending_save: Option<Session>,
     save_scheduled: bool,
+    /// Sidebar width in logical pixels (drag the handle on its right edge).
+    pub(crate) sidebar_w: f32,
+    /// The sidebar handle is being dragged.
+    sidebar_dragging: bool,
 }
 
 impl AppView {
@@ -108,6 +113,10 @@ impl AppView {
         saved: Option<Session>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let sidebar_w = saved
+            .as_ref()
+            .and_then(|s| s.sidebar_w)
+            .map_or(DEFAULT_SIDEBAR_W, |w| clamp_sidebar_w(w, f32::INFINITY));
         let suppress_auto_create = saved.as_ref().is_some_and(Session::has_terminals);
         // Coalescing wake path: bounded(1), try_send never blocks.
         let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
@@ -182,6 +191,8 @@ impl AppView {
             last_session: None,
             pending_save: None,
             save_scheduled: false,
+            sidebar_w,
+            sidebar_dragging: false,
         }
     }
 
@@ -372,6 +383,7 @@ impl AppView {
             collapsed: &self.collapsed,
             collapsed_groups: &self.collapsed_groups,
             window: self.window_state,
+            sidebar_w: Some(self.sidebar_w),
         })
     }
 
@@ -749,6 +761,47 @@ fn saved_window_of(window: &Window) -> Option<SavedWindow> {
     )
 }
 
+/// Width of the invisible sidebar resize hit area.
+const SIDEBAR_HANDLE_W: f32 = 6.;
+
+impl AppView {
+    fn on_sidebar_handle_down(&mut self, ev: &MouseDownEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if ev.click_count >= 2 {
+            self.sidebar_dragging = false;
+            self.sidebar_w = DEFAULT_SIDEBAR_W;
+            self.sidebar_changed(cx);
+        } else {
+            self.sidebar_dragging = true;
+            cx.notify();
+        }
+    }
+
+    fn on_sidebar_drag_move(&mut self, ev: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.sidebar_dragging {
+            return;
+        }
+        let window_w = f32::from(window.viewport_size().width);
+        self.sidebar_w = clamp_sidebar_w(f32::from(ev.position.x), window_w);
+        cx.notify();
+    }
+
+    fn on_sidebar_drag_end(&mut self, _: &MouseUpEvent, _w: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_dragging {
+            self.sidebar_dragging = false;
+            self.sidebar_changed(cx);
+        }
+    }
+
+    /// Persists the new width through the debounced session save.
+    fn sidebar_changed(&mut self, cx: &mut Context<Self>) {
+        let infos: Vec<TerminalInfo> =
+            self.client.snapshot().terminals.iter().map(|t| t.info.clone()).collect();
+        self.touch_session(&infos, cx);
+        cx.notify();
+    }
+}
+
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let snap = self.client.snapshot();
@@ -761,16 +814,52 @@ impl Render for AppView {
             cx.defer_in(window, move |_, window, cx| notifications::show_error(msg, window, cx));
         }
 
-        let sidebar = self.render_sidebar(&snap, &infos, lang, cx);
+        let window_w = f32::from(window.viewport_size().width);
+        let sidebar_w = clamp_sidebar_w(self.sidebar_w, window_w);
+        let sidebar = self.render_sidebar(&snap, &infos, lang, sidebar_w, cx);
         let main = self.render_main(&snap, &infos, lang, cx);
         let status_bar = self.render_status_bar(snap.status, lang, cx);
 
-        v_flex()
+        // Thin hit area straddling the sidebar's right border.
+        let handle = div()
+            .id("sidebar-resize")
+            .group("sidebar-resize")
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .left(px(sidebar_w - SIDEBAR_HANDLE_W / 2.))
+            .w(px(SIDEBAR_HANDLE_W))
+            .cursor(CursorStyle::ResizeLeftRight)
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_sidebar_handle_down))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(SIDEBAR_HANDLE_W / 2. - 1.))
+                    .w(px(2.))
+                    .group_hover("sidebar-resize", |s| s.bg(theme.primary.opacity(0.6))),
+            );
+
+        let mut root = v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .capture_key_down(cx.listener(Self::on_key_capture))
-            .child(h_flex().flex_1().min_h_0().child(sidebar).child(main))
-            .child(status_bar)
+            .child(h_flex().relative().flex_1().min_h_0().child(sidebar).child(main).child(handle))
+            .child(status_bar);
+        if self.sidebar_dragging {
+            // Covers the window while dragging so terminals never see the mouse.
+            root = root.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_move(cx.listener(Self::on_sidebar_drag_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_sidebar_drag_end))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_sidebar_drag_end)),
+            );
+        }
+        root
     }
 }

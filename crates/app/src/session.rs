@@ -23,6 +23,15 @@ pub struct Session {
     /// Collapsed groups by name.
     pub collapsed_groups: Vec<String>,
     pub window: Option<SavedWindow>,
+    /// Sidebar width in logical pixels; `None` = default. Garbage reads as `None`.
+    #[serde(deserialize_with = "lenient_width")]
+    pub sidebar_w: Option<f32>,
+}
+
+/// A positive finite number, anything else (wrong type, negative, zero, huge) is `None`.
+fn lenient_width<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_f64().filter(|w| w.is_finite() && *w > 0. && *w <= f32::MAX as f64).map(|w| w as f32))
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -121,6 +130,7 @@ pub struct SessionInput<'a> {
     pub collapsed: &'a HashSet<ProjectId>,
     pub collapsed_groups: &'a HashSet<GroupId>,
     pub window: Option<SavedWindow>,
+    pub sidebar_w: Option<f32>,
 }
 
 /// Builds the session to save. Workspaces come in a stable order (Home, then worktrees in
@@ -169,6 +179,7 @@ pub fn build_session(input: &SessionInput) -> Session {
             .map(|g| g.name.clone())
             .collect(),
         window: input.window,
+        sidebar_w: input.sidebar_w,
     }
 }
 
@@ -338,6 +349,19 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_width_missing_or_garbage_is_default() {
+        assert_eq!(Session::parse("{}").unwrap().sidebar_w, None);
+        assert_eq!(Session::parse(r#"{"sidebar_w":null}"#).unwrap().sidebar_w, None);
+        assert_eq!(Session::parse(r#"{"sidebar_w":320}"#).unwrap().sidebar_w, Some(320.));
+        assert_eq!(Session::parse(r#"{"sidebar_w":-5}"#).unwrap().sidebar_w, None);
+        assert_eq!(Session::parse(r#"{"sidebar_w":0}"#).unwrap().sidebar_w, None);
+        assert_eq!(Session::parse(r#"{"sidebar_w":"wide"}"#).unwrap().sidebar_w, None);
+        assert_eq!(Session::parse(r#"{"sidebar_w":1e300}"#).unwrap().sidebar_w, None);
+        // Bare NaN is not valid JSON: the file is rejected as a whole, never a crash.
+        assert_eq!(Session::parse(r#"{"sidebar_w":NaN}"#), None);
+    }
+
+    #[test]
     fn partial_and_unknown_fields_are_tolerated() {
         let s = Session::parse(r#"{"selected":"/w/a","future":1,"workspaces":[{"worktree":null}]}"#).unwrap();
         assert_eq!(s.selected, Some(PathBuf::from("/w/a")));
@@ -363,6 +387,7 @@ mod tests {
             collapsed_projects: vec!["/w".into()],
             collapsed_groups: vec!["game".into()],
             window: Some(SavedWindow { x: 10., y: 20., width: 900., height: 700., maximized: true }),
+            sidebar_w: Some(345.5),
         };
         s.save_to(&path).unwrap();
         assert!(!path.with_extension("json.tmp").exists());
@@ -405,6 +430,7 @@ mod tests {
             collapsed: &collapsed,
             collapsed_groups: &cg,
             window: None,
+            sidebar_w: None,
         });
         assert_eq!(s.selected, Some(PathBuf::from("/w/a-x")));
         assert_eq!(s.workspaces.len(), 3);
@@ -434,7 +460,9 @@ mod tests {
             collapsed: &collapsed,
             collapsed_groups: &cg,
             window: Some(SavedWindow { x: 1., y: 2., width: 800., height: 600., maximized: false }),
+            sidebar_w: Some(250.),
         });
+        assert_eq!(s.sidebar_w, Some(250.));
         assert_eq!(s.selected, None);
         assert_eq!(s.workspaces, vec![saved_ws(Some("/w/b"), &["/w/b"], Some(0))]);
         assert_eq!(s.collapsed_projects, vec![PathBuf::from("/w/b")]);
@@ -454,6 +482,7 @@ mod tests {
             collapsed: &c,
             collapsed_groups: &g,
             window: None,
+            sidebar_w: None,
         });
         assert_eq!(s, Session::default());
     }
