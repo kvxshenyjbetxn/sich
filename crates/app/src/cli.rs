@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use futures::SinkExt as _;
-use futures::StreamExt as _;
-use sich_proto::{ClientMsg, PROTO_VERSION, ServerMsg, decode, encode, frame_codec};
+use sich_proto::{ClientMsg, encode, frame_codec};
 use tokio_util::codec::Framed;
 
 const START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,21 +33,7 @@ pub fn stop_daemon(socket: &str) -> anyhow::Result<()> {
     rt.block_on(async {
         let stream = sich_daemon::connect(socket).await.context("daemon is not running")?;
         let mut framed = Framed::new(stream, frame_codec());
-        framed
-            .send(encode(&ClientMsg::Hello {
-                proto_version: PROTO_VERSION,
-                client_name: "sich-cli".into(),
-            })?)
-            .await?;
-        match framed.next().await {
-            Some(Ok(frame)) => match decode::<ServerMsg>(&frame)? {
-                ServerMsg::Welcome { .. } => {}
-                ServerMsg::Error { message } => anyhow::bail!("daemon refused: {message}"),
-                other => anyhow::bail!("unexpected reply: {other:?}"),
-            },
-            Some(Err(e)) => return Err(e).context("read reply"),
-            None => anyhow::bail!("daemon closed the connection"),
-        }
+        // `Shutdown` is accepted before `Hello` by every daemon version.
         framed.send(encode(&ClientMsg::Shutdown)?).await?;
         Ok(())
     })

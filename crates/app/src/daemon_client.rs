@@ -26,6 +26,9 @@ pub const DEFAULT_ROWS: u16 = 32;
 pub enum ConnStatus {
     Connected { pid: u32 },
     Reconnecting,
+    /// The running daemon speaks another protocol; no reconnecting until the user restarts it.
+    /// `pid`/`version` are unknown for an old v1 daemon (it only sends `Error`).
+    Incompatible { pid: Option<u32>, version: Option<u32> },
 }
 
 #[derive(Clone)]
@@ -41,13 +44,16 @@ pub(crate) struct ClientState {
     pub synced: bool,
     pub daemon_pid: Option<u32>,
     pub projects: Vec<ProjectInfo>,
+    /// Incremented on every `Projects` message (0 = none received yet).
+    pub projects_rev: u64,
     /// Last `OpFailed` from the daemon: (op, message, when).
     pub last_error: Option<(String, String, Instant)>,
 }
 
 /// Commands from the UI to the connection task.
-#[allow(dead_code)] // project variants are used by the upcoming UI
 pub(crate) enum Cmd {
+    /// Leave the `Incompatible` state and connect again.
+    Reconnect,
     Create { cols: u16, rows: u16, worktree: Option<PathBuf> },
     RefreshProjects,
     AddProject(PathBuf),
@@ -68,9 +74,11 @@ pub struct Snapshot {
 pub struct DaemonClient {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     state: Arc<Mutex<ClientState>>,
+    rt: Handle,
+    socket: String,
+    wake: Wake,
 }
 
-#[allow(dead_code)] // project API is used by the upcoming UI
 impl DaemonClient {
     /// Starts the connection task on `rt`.
     pub fn start(rt: &Handle, socket: String, wake: Wake) -> DaemonClient {
@@ -81,17 +89,18 @@ impl DaemonClient {
             synced: false,
             daemon_pid: None,
             projects: Vec::new(),
+            projects_rev: 0,
             last_error: None,
         }));
         let conn = daemon_conn::Conn {
-            socket,
+            socket: socket.clone(),
             rt: rt.clone(),
             state: state.clone(),
             cmd_tx: cmd_tx.clone(),
-            wake,
+            wake: wake.clone(),
         };
         rt.spawn(daemon_conn::run(conn, cmd_rx));
-        DaemonClient { cmd_tx, state }
+        DaemonClient { cmd_tx, state, rt: rt.clone(), socket, wake }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -99,17 +108,38 @@ impl DaemonClient {
         Snapshot { status: st.status, terminals: st.terminals.clone() }
     }
 
-    pub fn create_terminal(&self, cols: u16, rows: u16) {
-        self.create_terminal_in(cols, rows, None);
-    }
-
     /// Creates a terminal whose cwd is `worktree` (when given).
     pub fn create_terminal_in(&self, cols: u16, rows: u16, worktree: Option<PathBuf>) {
         let _ = self.cmd_tx.send(Cmd::Create { cols, rows, worktree });
     }
 
-    pub fn projects(&self) -> Vec<ProjectInfo> {
-        self.state.lock().projects.clone()
+    /// Projects plus the revision counter (changes on every `Projects` message).
+    pub fn projects_with_rev(&self) -> (u64, Vec<ProjectInfo>) {
+        let st = self.state.lock();
+        (st.projects_rev, st.projects.clone())
+    }
+
+    /// Most recent output time over all terminals.
+    pub fn latest_output(&self) -> Option<Instant> {
+        self.state.lock().terminals.iter().filter_map(|t| t.session.last_output()).max()
+    }
+
+    /// Kills the incompatible daemon (by `pid`, else by scanning processes), starts a new one
+    /// and resumes connecting.
+    pub fn restart_daemon(&self, pid: Option<u32>) {
+        let tx = self.cmd_tx.clone();
+        let state = self.state.clone();
+        let wake = self.wake.clone();
+        let socket = self.socket.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = crate::daemon_kill::restart(&socket, pid).await {
+                tracing::error!("restart daemon failed: {e:#}");
+                state.lock().last_error =
+                    Some(("restart daemon".into(), format!("{e:#}"), Instant::now()));
+            }
+            let _ = tx.send(Cmd::Reconnect);
+            wake();
+        });
     }
 
     pub fn last_error(&self) -> Option<(String, String, Instant)> {

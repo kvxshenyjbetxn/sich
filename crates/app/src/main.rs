@@ -6,14 +6,21 @@ mod cli;
 mod colors;
 mod daemon_client;
 mod daemon_conn;
+mod daemon_kill;
 mod element;
 mod i18n;
 mod links;
+mod notifications;
+mod os;
 mod settings;
 mod settings_dialog;
+mod sidebar;
+mod tab_bar;
 mod term_settings;
 mod theme;
 mod view;
+mod workspace;
+mod worktree_dialogs;
 
 use gpui_kit::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 

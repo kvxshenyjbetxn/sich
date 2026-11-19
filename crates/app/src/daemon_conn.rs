@@ -32,6 +32,28 @@ pub(crate) struct Conn {
 
 type Stream = Framed<sich_daemon::ClientStream, LengthDelimitedCodec>;
 
+/// How a connection ended (when it did not fail with an error).
+enum End {
+    /// The UI went away.
+    Closed,
+    /// The daemon speaks another protocol version.
+    Incompatible,
+}
+
+/// Detects a daemon we cannot talk to: a `Welcome` with another version, or an `Error` before
+/// any `Welcome` (an old v1 daemon only answers a version mismatch with `Error`).
+pub(crate) fn classify_incompatible(msg: &ServerMsg, welcomed: bool) -> Option<ConnStatus> {
+    match msg {
+        ServerMsg::Welcome { proto_version, daemon_pid } if *proto_version != PROTO_VERSION => {
+            Some(ConnStatus::Incompatible { pid: Some(*daemon_pid), version: Some(*proto_version) })
+        }
+        ServerMsg::Error { .. } if !welcomed => {
+            Some(ConnStatus::Incompatible { pid: None, version: None })
+        }
+        _ => None,
+    }
+}
+
 pub(crate) async fn run(conn: Conn, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
     let mut backoff = BACKOFF_MIN;
     loop {
@@ -39,8 +61,20 @@ pub(crate) async fn run(conn: Conn, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
             Ok(stream) => {
                 let mut welcomed = false;
                 let framed = Framed::new(stream, frame_codec());
-                if let Err(e) = session(&conn, framed, &mut cmd_rx, &mut welcomed).await {
-                    tracing::warn!("daemon connection lost: {e:#}");
+                match session(&conn, framed, &mut cmd_rx, &mut welcomed).await {
+                    Ok(End::Closed) => return,
+                    Ok(End::Incompatible) => {
+                        // Stay put until the user restarts the daemon.
+                        loop {
+                            match cmd_rx.recv().await {
+                                Some(Cmd::Reconnect) => break,
+                                Some(_) => {}
+                                None => return,
+                            }
+                        }
+                        backoff = BACKOFF_MIN;
+                    }
+                    Err(e) => tracing::warn!("daemon connection lost: {e:#}"),
                 }
                 if welcomed {
                     backoff = BACKOFF_MIN;
@@ -73,7 +107,7 @@ async fn session(
     mut stream: Stream,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
     welcomed: &mut bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<End> {
     send(
         &mut stream,
         &ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: "sich-app".into() },
@@ -85,6 +119,11 @@ async fn session(
             frame = stream.next() => {
                 let frame = frame.context("daemon closed the connection")?.context("read frame")?;
                 let msg: ServerMsg = decode(&frame).context("decode server message")?;
+                if let Some(status) = classify_incompatible(&msg, *welcomed) {
+                    conn.state.lock().status = status;
+                    (conn.wake)();
+                    return Ok(End::Incompatible);
+                }
                 if matches!(msg, ServerMsg::Welcome { .. }) {
                     *welcomed = true;
                 }
@@ -93,8 +132,9 @@ async fn session(
                 }
             }
             cmd = cmd_rx.recv() => {
-                let Some(cmd) = cmd else { return Ok(()) };
+                let Some(cmd) = cmd else { return Ok(End::Closed) };
                 let msg = match cmd {
+                    Cmd::Reconnect => continue,
                     Cmd::Create { cols, rows, worktree } => ClientMsg::CreateTerminal {
                         cwd: None,
                         shell: None,
@@ -190,7 +230,11 @@ impl Conn {
                 }
                 return Ok(out);
             }
-            ServerMsg::Projects(list) => self.state.lock().projects = list,
+            ServerMsg::Projects(list) => {
+                let mut st = self.state.lock();
+                st.projects = list;
+                st.projects_rev += 1;
+            }
             ServerMsg::OpFailed { op, message } => {
                 tracing::warn!("daemon op `{op}` failed: {message}");
                 self.state.lock().last_error = Some((op, message, Instant::now()));
@@ -246,5 +290,47 @@ impl Conn {
         }
         st.synced = true;
         st.terminals = terminals;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn welcome(v: u32) -> ServerMsg {
+        ServerMsg::Welcome { proto_version: v, daemon_pid: 42 }
+    }
+
+    #[test]
+    fn matching_welcome_is_compatible() {
+        assert_eq!(classify_incompatible(&welcome(PROTO_VERSION), false), None);
+    }
+
+    #[test]
+    fn welcome_with_other_version_is_incompatible() {
+        assert_eq!(
+            classify_incompatible(&welcome(PROTO_VERSION + 1), false),
+            Some(ConnStatus::Incompatible { pid: Some(42), version: Some(PROTO_VERSION + 1) })
+        );
+    }
+
+    #[test]
+    fn error_before_welcome_is_an_old_daemon() {
+        let err = ServerMsg::Error { message: "protocol version mismatch".into() };
+        assert_eq!(
+            classify_incompatible(&err, false),
+            Some(ConnStatus::Incompatible { pid: None, version: None })
+        );
+    }
+
+    #[test]
+    fn error_after_welcome_is_not_incompatibility() {
+        let err = ServerMsg::Error { message: "no such terminal: 3".into() };
+        assert_eq!(classify_incompatible(&err, true), None);
+    }
+
+    #[test]
+    fn other_messages_are_ignored() {
+        assert_eq!(classify_incompatible(&ServerMsg::Terminals(Vec::new()), false), None);
     }
 }

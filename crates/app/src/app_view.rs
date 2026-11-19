@@ -1,35 +1,51 @@
-//! Main window: terminal list sidebar, active terminal, connection status line.
+//! Main window: sidebar (projects/worktrees), tab bar, active terminal, status line.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
+    KeyDownEvent, ParentElement as _, Render, Styled as _, Window,
     div, px,
 };
-use sich_proto::TermId;
+use sich_proto::{PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
-use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot, TermEntry};
-use crate::i18n::{self, Language, Tr, tr};
+use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot};
+use crate::i18n::{self, Tr, tr};
+use crate::notifications;
 use crate::settings;
 use crate::settings_dialog;
 use crate::view::TerminalView;
+use crate::workspace::{
+    ACTIVITY_TIMER_WINDOW, PendingWorktree, WorkspaceKey, Workspaces, cycle_id,
+    match_pending_worktree, restore_selection, terminals_in, workspace_exists,
+};
+use crate::worktree_dialogs;
 
-const SIDEBAR_W: f32 = 240.;
+/// Upper bound for creations waiting to be matched with a `TerminalCreated`.
+const MAX_PENDING_CREATES: usize = 8;
 
 pub struct AppView {
-    client: DaemonClient,
+    pub(crate) client: DaemonClient,
     views: HashMap<TermId, Entity<TerminalView>>,
-    active: Option<TermId>,
-    /// Ids in sidebar order, from the last snapshot.
-    order: Vec<TermId>,
-    /// Set when this window asked for a terminal: the next new one becomes active.
-    want_activate: bool,
-    /// Last active id that received keyboard focus.
+    pub(crate) ws: Workspaces,
+    /// Saved workspace to restore when the first `Projects` update arrives.
+    restore: Option<Option<PathBuf>>,
+    pub(crate) projects: Vec<ProjectInfo>,
+    /// Projects whose tree is collapsed (default: expanded).
+    pub(crate) collapsed: HashSet<ProjectId>,
+    /// Workspaces this window asked a terminal for; the matching new terminal gets activated.
+    pending_creates: VecDeque<WorkspaceKey>,
+    pending_worktree: Option<PendingWorktree>,
+    seen_projects_rev: u64,
+    shown_error: Option<Instant>,
+    /// Terminal that last received keyboard focus.
     focused: Option<TermId>,
+    activity_timer: bool,
 }
 
 impl AppView {
@@ -56,10 +72,16 @@ impl AppView {
         Self {
             client,
             views: HashMap::new(),
-            active: None,
-            order: Vec::new(),
-            want_activate: false,
+            ws: Workspaces::default(),
+            restore: Some(settings::get(cx).last_workspace),
+            projects: Vec::new(),
+            collapsed: HashSet::new(),
+            pending_creates: VecDeque::new(),
+            pending_worktree: None,
+            seen_projects_rev: 0,
+            shown_error: None,
             focused: None,
+            activity_timer: false,
         }
     }
 
@@ -67,49 +89,66 @@ impl AppView {
         for view in self.views.values() {
             view.update(cx, |v, cx| v.refresh(cx));
         }
+        self.ensure_activity_timer(cx);
         cx.notify();
     }
 
-    /// Makes `views`/`active` match the daemon-side terminal list.
-    fn sync(&mut self, snap: &Snapshot, window: &mut Window, cx: &mut Context<Self>) {
-        let first_sync = self.order.is_empty() && self.views.is_empty();
-        let mut newest = None;
-        for entry in &snap.terminals {
-            if !self.views.contains_key(&entry.info.id) {
-                let session = entry.session.clone();
-                let view = cx.new(|cx| TerminalView::new(session, window, cx));
-                self.views.insert(entry.info.id, view);
-                newest = Some(entry.info.id);
-            }
-        }
-        let ids: Vec<TermId> = snap.terminals.iter().map(|t| t.info.id).collect();
-        self.views.retain(|id, _| ids.contains(id));
-
-        if let Some(id) = newest.filter(|_| self.want_activate) {
-            self.want_activate = false;
-            self.active = Some(id);
-        }
-        if !self.active.is_some_and(|a| ids.contains(&a)) {
-            // Active terminal vanished (or none yet): take the neighbor at the same position.
-            let old_pos = self.active.and_then(|a| self.order.iter().position(|&i| i == a));
-            self.active = match old_pos {
-                Some(p) if !ids.is_empty() => Some(ids[p.min(ids.len() - 1)]),
-                _ => ids.first().copied(),
-            };
-        }
-        let _ = first_sync;
-        self.order = ids;
-
-        if self.active != self.focused {
-            self.focused = self.active;
-            if let Some(view) = self.active.and_then(|a| self.views.get(&a)) {
-                view.update(cx, |v, cx| v.focus(window, cx));
-            }
-        }
+    fn recent_output(&self) -> bool {
+        self.client.latest_output().is_some_and(|t| t.elapsed() < ACTIVITY_TIMER_WINDOW)
     }
 
-    fn set_active(&mut self, id: TermId, window: &mut Window, cx: &mut Context<Self>) {
-        self.active = Some(id);
+    /// While any terminal produced output recently, repaints every 500 ms so the sidebar
+    /// activity dots fade out. Does nothing when idle.
+    fn ensure_activity_timer(&mut self, cx: &mut Context<Self>) {
+        if self.activity_timer || !self.recent_output() {
+            return;
+        }
+        self.activity_timer = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(500)).await;
+                let keep = this.update(cx, |this, cx| {
+                    cx.notify();
+                    let keep = this.recent_output();
+                    if !keep {
+                        this.activity_timer = false;
+                    }
+                    keep
+                });
+                if !matches!(keep, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    // ---- selection -------------------------------------------------------------------------
+
+    /// Selects `key` and persists the choice.
+    fn set_selected(&mut self, key: WorkspaceKey, cx: &mut Context<Self>) {
+        if self.ws.selected != key {
+            // Make sure the selected worktree is visible: expand its project.
+            if let WorkspaceKey::Worktree(_) = &key {
+                for p in &self.projects {
+                    if p.worktrees.iter().any(|w| WorkspaceKey::Worktree(w.path.clone()) == key) {
+                        self.collapsed.remove(&p.id);
+                    }
+                }
+            }
+            settings::set_last_workspace(key.path().map(PathBuf::from), cx);
+            self.ws.selected = key;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn select_workspace(&mut self, key: WorkspaceKey, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_selected(key, cx);
+    }
+
+    pub(crate) fn activate_terminal(&mut self, id: TermId, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.ws.selected.clone();
+        self.ws.set_active(&key, id);
         self.focused = Some(id);
         if let Some(view) = self.views.get(&id) {
             view.update(cx, |v, cx| v.focus(window, cx));
@@ -117,25 +156,53 @@ impl AppView {
         cx.notify();
     }
 
-    fn new_terminal(&mut self, cx: &mut Context<Self>) {
-        let (cols, rows) = self
-            .active
-            .and_then(|a| self.client.snapshot().terminals.into_iter().find(|t| t.info.id == a))
+    fn workspace_ids(&self, infos: &[TerminalInfo]) -> Vec<TermId> {
+        terminals_in(&self.ws.selected, infos)
+    }
+
+    // ---- commands --------------------------------------------------------------------------
+
+    pub(crate) fn new_terminal_in(&mut self, key: WorkspaceKey, cx: &mut Context<Self>) {
+        let snap = self.client.snapshot();
+        let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
+        let size = self
+            .ws
+            .active_in(&self.ws.selected, &terminals_in(&self.ws.selected, &infos))
+            .and_then(|a| snap.terminals.iter().find(|t| t.info.id == a))
             .map(|t| t.session.size())
             .unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
-        self.want_activate = true;
-        self.client.create_terminal(cols, rows);
+        self.pending_creates.push_back(key.clone());
+        while self.pending_creates.len() > MAX_PENDING_CREATES {
+            self.pending_creates.pop_front();
+        }
+        self.client.create_terminal_in(size.0, size.1, key.path().map(PathBuf::from));
+        cx.notify();
+    }
+
+    pub(crate) fn new_terminal_here(&mut self, cx: &mut Context<Self>) {
+        self.new_terminal_in(self.ws.selected.clone(), cx);
+    }
+
+    pub(crate) fn create_worktree(
+        &mut self,
+        project_id: ProjectId,
+        name: String,
+        base: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_worktree = Some(PendingWorktree { project_id, name: name.clone() });
+        self.client.create_worktree(project_id, name, base);
         cx.notify();
     }
 
     fn cycle(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let n = self.order.len() as isize;
-        if n == 0 {
-            return;
+        let infos: Vec<TerminalInfo> =
+            self.client.snapshot().terminals.iter().map(|t| t.info.clone()).collect();
+        let ids = self.workspace_ids(&infos);
+        let cur = self.ws.active_in(&self.ws.selected, &ids);
+        if let Some(next) = cycle_id(&ids, cur, delta) {
+            self.activate_terminal(next, window, cx);
         }
-        let cur = self.active.and_then(|a| self.order.iter().position(|&i| i == a)).unwrap_or(0);
-        let next = (cur as isize + delta).rem_euclid(n) as usize;
-        self.set_active(self.order[next], window, cx);
     }
 
     fn on_key_capture(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -145,7 +212,7 @@ impl AppView {
             return;
         }
         match ks.key.as_str() {
-            "t" if m.shift => self.new_terminal(cx),
+            "t" if m.shift => self.new_terminal_here(cx),
             "," if !m.shift => settings_dialog::open(window, cx),
             "tab" => self.cycle(if m.shift { -1 } else { 1 }, window, cx),
             _ => return,
@@ -153,130 +220,138 @@ impl AppView {
         cx.stop_propagation();
     }
 
-    fn row_title(entry: &TermEntry) -> String {
-        let title = entry.session.title();
-        if !title.is_empty() {
-            // Shells like pwsh set the title to their full exe path; show just the name.
-            let path = std::path::Path::new(title.trim());
-            if path.is_absolute() {
-                if let Some(stem) = path.file_stem() {
-                    return stem.to_string_lossy().into_owned();
-                }
-            }
-            return title;
-        }
-        let dir = entry
-            .info
-            .cwd
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| entry.info.cwd.display().to_string());
-        format!("{} \u{2014} {}", entry.info.title, dir)
-    }
+    // ---- per-frame sync --------------------------------------------------------------------
 
-    fn render_sidebar(&self, snap: &Snapshot, lang: Language, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let rows = snap.terminals.iter().map(|entry| {
+    /// Makes views, selection and pending actions match the daemon state.
+    fn sync(&mut self, snap: &Snapshot, infos: &[TerminalInfo], window: &mut Window, cx: &mut Context<Self>) {
+        for entry in &snap.terminals {
             let id = entry.info.id;
-            let active = self.active == Some(id);
-            let exited = entry.info.exited.is_some();
-            let bg = if active { theme.list_active } else { theme.list_active.opacity(0.0) };
-            h_flex()
-                .id(("term-row", id))
-                .w_full()
-                .px_2()
-                .py_1()
-                .gap_1()
-                .items_center()
-                .cursor_pointer()
-                .bg(bg)
-                .hover(|s| if active { s } else { s.bg(theme.list_hover) })
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.set_active(id, window, cx)
-                }))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(13.))
-                        .child(Self::row_title(entry)),
-                )
-                .children(exited.then(|| {
-                    div().flex_shrink_0().text_size(px(11.)).text_color(theme.muted_foreground).child(tr(lang, Tr::Exited))
-                }))
-                .child(
-                    Button::new(("term-close", id))
-                        .ghost()
-                        .xsmall()
-                        .icon(Icon::new(IconName::Close))
-                        .tooltip(tr(lang, Tr::CloseTerminal))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                            this.client.kill_terminal(id);
-                            cx.stop_propagation();
-                        })),
-                )
-        });
+            if self.views.contains_key(&id) {
+                continue;
+            }
+            let session = entry.session.clone();
+            let view = cx.new(|cx| TerminalView::new(session, window, cx));
+            self.views.insert(id, view);
+            // A terminal this window asked for: show its workspace and activate it.
+            let key = WorkspaceKey::of(entry.info.worktree.as_deref());
+            if let Some(pos) = self.pending_creates.iter().position(|k| *k == key) {
+                self.pending_creates.remove(pos);
+                self.ws.set_active(&key, id);
+                self.set_selected(key, cx);
+                self.focused = None;
+            }
+        }
+        let ids: Vec<TermId> = infos.iter().map(|t| t.id).collect();
+        self.views.retain(|id, _| ids.contains(id));
+        self.ws.prune(&ids);
 
-        v_flex()
-            .w(px(SIDEBAR_W))
-            .h_full()
-            .flex_shrink_0()
-            .bg(theme.sidebar)
-            .text_color(theme.sidebar_foreground)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
-            .child(v_flex().id("term-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
-            .child(
-                div().p_2().child(
-                    Button::new("new-terminal")
-                        .small()
-                        .w_full()
-                        .label(format!("+ {}", tr(lang, Tr::NewTerminal)))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.new_terminal(cx)
-                        })),
-                ),
-            )
+        let (rev, projects) = self.client.projects_with_rev();
+        if rev != self.seen_projects_rev {
+            self.seen_projects_rev = rev;
+            self.projects = projects;
+            self.on_projects_changed(cx);
+        }
+
+        let ws_ids = self.workspace_ids(infos);
+        let active = self.ws.active_in(&self.ws.selected, &ws_ids);
+        if active != self.focused {
+            self.focused = active;
+            if let Some(view) = active.and_then(|a| self.views.get(&a)) {
+                view.update(cx, |v, cx| v.focus(window, cx));
+            }
+        }
     }
-}
 
-impl Render for AppView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let snap = self.client.snapshot();
-        self.sync(&snap, window, cx);
+    fn on_projects_changed(&mut self, cx: &mut Context<Self>) {
+        if let Some(saved) = self.restore.take() {
+            let key = restore_selection(saved.as_deref(), &self.projects);
+            self.set_selected(key, cx);
+        } else if !workspace_exists(&self.ws.selected, &self.projects) {
+            self.set_selected(WorkspaceKey::Home, cx);
+        }
+        if let Some(pending) = self.pending_worktree.clone() {
+            if let Some(path) = match_pending_worktree(&pending, &self.projects) {
+                self.pending_worktree = None;
+                let key = WorkspaceKey::Worktree(path);
+                self.set_selected(key.clone(), cx);
+                self.new_terminal_in(key, cx);
+            }
+        }
+    }
+
+    // ---- rendering -------------------------------------------------------------------------
+
+    fn render_main(
+        &self,
+        snap: &Snapshot,
+        infos: &[TerminalInfo],
+        lang: i18n::Language,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
-        let lang = settings::language(cx);
-
-        let main = match self.active.and_then(|a| self.views.get(&a)) {
-            Some(view) => div().flex_1().min_w_0().h_full().child(view.clone()),
+        let ids = self.workspace_ids(infos);
+        let active = self.ws.active_in(&self.ws.selected, &ids);
+        let tab_bar = self.render_tab_bar(snap, &ids, active, lang, cx);
+        let content = match active.and_then(|a| self.views.get(&a)) {
+            Some(view) => div().flex_1().min_h_0().w_full().child(view.clone()),
             None => div()
                 .flex_1()
-                .min_w_0()
-                .h_full()
+                .min_h_0()
+                .w_full()
                 .flex()
+                .flex_col()
+                .gap_3()
                 .items_center()
                 .justify_center()
                 .text_color(theme.muted_foreground)
-                .child(tr(lang, Tr::NoTerminals)),
+                .child(tr(lang, Tr::NoTerminals))
+                .child(
+                    Button::new("empty-new-terminal")
+                        .small()
+                        .label(tr(lang, Tr::NewTerminal))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                            this.new_terminal_here(cx)
+                        })),
+                ),
         };
+        v_flex().flex_1().min_w_0().h_full().child(tab_bar).child(content)
+    }
 
-        let status = match snap.status {
-            ConnStatus::Connected { pid } => i18n::connected(lang, pid),
-            ConnStatus::Reconnecting => tr(lang, Tr::Reconnecting).to_string(),
+    fn render_status_bar(
+        &self,
+        status: ConnStatus,
+        lang: i18n::Language,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme().clone();
+        let (text, restart_pid) = match status {
+            ConnStatus::Connected { pid } => (i18n::connected(lang, pid), None),
+            ConnStatus::Reconnecting => (tr(lang, Tr::Reconnecting).to_string(), None),
+            ConnStatus::Incompatible { pid, version } => {
+                (i18n::daemon_incompatible(lang, version, PROTO_VERSION), Some(pid))
+            }
         };
-        let status_bar = h_flex()
+        let app = cx.entity();
+        h_flex()
             .h(px(24.))
             .w_full()
             .flex_shrink_0()
             .px_3()
+            .gap_2()
             .items_center()
             .bg(theme.status_bar)
             .border_t_1()
             .border_color(theme.status_bar_border)
             .text_size(px(12.))
-            .text_color(theme.muted_foreground)
-            .child(div().flex_1().child(status))
+            .text_color(if restart_pid.is_some() { theme.warning } else { theme.muted_foreground })
+            .child(div().flex_1().child(text))
+            .children(restart_pid.map(|pid| {
+                Button::new("restart-daemon").xsmall().label(tr(lang, Tr::RestartDaemon)).on_click(
+                    move |_, window, cx| {
+                        worktree_dialogs::open_restart_daemon(app.clone(), pid, window, cx)
+                    },
+                )
+            }))
             .child(
                 Button::new("open-settings")
                     .ghost()
@@ -286,14 +361,32 @@ impl Render for AppView {
                     .on_click(cx.listener(|_this, _: &ClickEvent, window, cx| {
                         settings_dialog::open(window, cx)
                     })),
-            );
+            )
+    }
+}
+
+impl Render for AppView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let snap = self.client.snapshot();
+        let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
+        self.sync(&snap, &infos, window, cx);
+        let theme = cx.theme().clone();
+        let lang = settings::language(cx);
+
+        if let Some(msg) = notifications::take_new_error(self.client.last_error(), &mut self.shown_error) {
+            cx.defer_in(window, move |_, window, cx| notifications::show_error(msg, window, cx));
+        }
+
+        let sidebar = self.render_sidebar(&snap, &infos, lang, cx);
+        let main = self.render_main(&snap, &infos, lang, cx);
+        let status_bar = self.render_status_bar(snap.status, lang, cx);
 
         v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .capture_key_down(cx.listener(Self::on_key_capture))
-            .child(h_flex().flex_1().min_h_0().child(self.render_sidebar(&snap, lang, cx)).child(main))
+            .child(h_flex().flex_1().min_h_0().child(sidebar).child(main))
             .child(status_bar)
     }
 }

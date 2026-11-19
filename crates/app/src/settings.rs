@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use crate::i18n::Language;
 use crate::theme::{self, ThemeKind};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     pub language: Language,
     pub theme: ThemeKind,
+    /// Selected worktree path; `None` = Home.
+    pub last_workspace: Option<PathBuf>,
 }
 
 impl Default for AppSettings {
@@ -20,6 +22,7 @@ impl Default for AppSettings {
         Self {
             language: Language::from_locale(sys_locale::get_locale().as_deref()),
             theme: ThemeKind::Gray,
+            last_workspace: None,
         }
     }
 }
@@ -27,7 +30,12 @@ impl Default for AppSettings {
 impl Global for AppSettings {}
 
 fn path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("sich").join("settings.json"))
+    // SICH_CONFIG_DIR isolates test/dev instances (same override the daemon uses).
+    let base = match std::env::var_os("SICH_CONFIG_DIR") {
+        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+        _ => dirs::config_dir(),
+    };
+    base.map(|d| d.join("sich").join("settings.json"))
 }
 
 impl AppSettings {
@@ -61,18 +69,27 @@ pub fn init(cx: &mut App) {
 }
 
 pub fn get(cx: &App) -> AppSettings {
-    cx.try_global::<AppSettings>().copied().unwrap_or_default()
+    cx.try_global::<AppSettings>().cloned().unwrap_or_default()
 }
 
 pub fn language(cx: &App) -> Language {
-    get(cx).language
+    cx.try_global::<AppSettings>().map(|s| s.language).unwrap_or_else(|| AppSettings::default().language)
 }
 
 fn store(s: AppSettings, cx: &mut App) {
-    cx.set_global(s);
     if let Err(e) = s.save() {
         tracing::error!("failed to save settings: {e:#}");
     }
+    cx.set_global(s);
+}
+
+pub fn set_last_workspace(path: Option<PathBuf>, cx: &mut App) {
+    let mut s = get(cx);
+    if s.last_workspace == path {
+        return;
+    }
+    s.last_workspace = path;
+    store(s, cx);
 }
 
 pub fn set_language(language: Language, cx: &mut App) {
@@ -93,4 +110,31 @@ pub fn set_theme(kind: ThemeKind, cx: &mut App) {
     s.theme = kind;
     store(s, cx);
     theme::apply(cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_settings_without_last_workspace_load() {
+        let s: AppSettings = serde_json::from_str(r#"{"language":"uk","theme":"amoled"}"#).unwrap();
+        assert_eq!(s.language, Language::Uk);
+        assert_eq!(s.theme, ThemeKind::Amoled);
+        assert_eq!(s.last_workspace, None);
+    }
+
+    #[test]
+    fn empty_object_uses_defaults() {
+        let s: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.theme, ThemeKind::Gray);
+        assert_eq!(s.last_workspace, None);
+    }
+
+    #[test]
+    fn last_workspace_round_trips() {
+        let s = AppSettings { last_workspace: Some(PathBuf::from("C:/work/app")), ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.last_workspace, Some(PathBuf::from("C:/work/app")));
+    }
 }

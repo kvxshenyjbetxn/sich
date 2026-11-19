@@ -40,7 +40,7 @@ impl Language {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Tr {
     NewTerminal,
     Reconnecting,
@@ -54,6 +54,73 @@ pub enum Tr {
     Exited,
     ProcessExited,
     CloseFromSidebar,
+    Projects,
+    Home,
+    AddProject,
+    Refresh,
+    NewWorktree,
+    MoreActions,
+    OpenInExplorer,
+    CopyPath,
+    RemoveProject,
+    RemoveWorktree,
+    MainTag,
+    UncommittedChanges,
+    NewTerminalHere,
+    NoProjectsHint,
+    NameLabel,
+    BaseLabel,
+    Cancel,
+    Create,
+    Remove,
+    RemoveAnyway,
+    DirtyWarning,
+    RestartDaemon,
+    RestartDaemonWarning,
+    Restart,
+}
+
+impl Tr {
+    /// Every key (used by the completeness test).
+    #[cfg(test)]
+    pub const ALL: &'static [Tr] = &[
+        Tr::NewTerminal,
+        Tr::Reconnecting,
+        Tr::Settings,
+        Tr::Language,
+        Tr::Theme,
+        Tr::ThemeGray,
+        Tr::ThemeAmoled,
+        Tr::CloseTerminal,
+        Tr::NoTerminals,
+        Tr::Exited,
+        Tr::ProcessExited,
+        Tr::CloseFromSidebar,
+        Tr::Projects,
+        Tr::Home,
+        Tr::AddProject,
+        Tr::Refresh,
+        Tr::NewWorktree,
+        Tr::MoreActions,
+        Tr::OpenInExplorer,
+        Tr::CopyPath,
+        Tr::RemoveProject,
+        Tr::RemoveWorktree,
+        Tr::MainTag,
+        Tr::UncommittedChanges,
+        Tr::NewTerminalHere,
+        Tr::NoProjectsHint,
+        Tr::NameLabel,
+        Tr::BaseLabel,
+        Tr::Cancel,
+        Tr::Create,
+        Tr::Remove,
+        Tr::RemoveAnyway,
+        Tr::DirtyWarning,
+        Tr::RestartDaemon,
+        Tr::RestartDaemonWarning,
+        Tr::Restart,
+    ];
 }
 
 pub fn tr(lang: Language, key: Tr) -> &'static str {
@@ -115,9 +182,129 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             En => "Process exited",
         },
         Tr::CloseFromSidebar => match lang {
-            Uk => "Закрийте термінал у бічній панелі.",
-            Ru => "Закройте терминал в боковой панели.",
-            En => "Close the terminal from the sidebar.",
+            Uk => "Закрийте термінал на вкладці.",
+            Ru => "Закройте терминал на вкладке.",
+            En => "Close the terminal from the tab bar.",
+        },
+        Tr::Projects => match lang {
+            Uk => "Проєкти",
+            Ru => "Проекты",
+            En => "Projects",
+        },
+        Tr::Home => match lang {
+            Uk => "Домівка",
+            Ru => "Домашняя",
+            En => "Home",
+        },
+        Tr::AddProject => match lang {
+            Uk => "Додати проєкт",
+            Ru => "Добавить проект",
+            En => "Add project",
+        },
+        Tr::Refresh => match lang {
+            Uk => "Оновити",
+            Ru => "Обновить",
+            En => "Refresh",
+        },
+        Tr::NewWorktree => match lang {
+            Uk => "Новий worktree",
+            Ru => "Новый worktree",
+            En => "New worktree",
+        },
+        Tr::MoreActions => match lang {
+            Uk => "Ще дії",
+            Ru => "Ещё действия",
+            En => "More actions",
+        },
+        Tr::OpenInExplorer => match lang {
+            Uk => "Відкрити в Провіднику",
+            Ru => "Открыть в Проводнике",
+            En => "Open in Explorer",
+        },
+        Tr::CopyPath => match lang {
+            Uk => "Копіювати шлях",
+            Ru => "Копировать путь",
+            En => "Copy path",
+        },
+        Tr::RemoveProject => match lang {
+            Uk => "Видалити проєкт",
+            Ru => "Удалить проект",
+            En => "Remove project",
+        },
+        Tr::RemoveWorktree => match lang {
+            Uk => "Видалити worktree",
+            Ru => "Удалить worktree",
+            En => "Remove worktree",
+        },
+        Tr::MainTag => match lang {
+            Uk => "основний",
+            Ru => "основной",
+            En => "main",
+        },
+        Tr::UncommittedChanges => match lang {
+            Uk => "Незафіксовані зміни",
+            Ru => "Незафиксированные изменения",
+            En => "Uncommitted changes",
+        },
+        Tr::NewTerminalHere => match lang {
+            Uk => "Новий термінал тут",
+            Ru => "Новый терминал здесь",
+            En => "New terminal here",
+        },
+        Tr::NoProjectsHint => match lang {
+            Uk => "Проєктів ще немає. Додайте теку з кодом.",
+            Ru => "Проектов пока нет. Добавьте папку с кодом.",
+            En => "No projects yet. Add a folder with your code.",
+        },
+        Tr::NameLabel => match lang {
+            Uk => "Назва",
+            Ru => "Название",
+            En => "Name",
+        },
+        Tr::BaseLabel => match lang {
+            Uk => "Основа",
+            Ru => "Основа",
+            En => "Base",
+        },
+        Tr::Cancel => match lang {
+            Uk => "Скасувати",
+            Ru => "Отмена",
+            En => "Cancel",
+        },
+        Tr::Create => match lang {
+            Uk => "Створити",
+            Ru => "Создать",
+            En => "Create",
+        },
+        Tr::Remove => match lang {
+            Uk => "Видалити",
+            Ru => "Удалить",
+            En => "Remove",
+        },
+        Tr::RemoveAnyway => match lang {
+            Uk => "Все одно видалити",
+            Ru => "Всё равно удалить",
+            En => "Remove anyway",
+        },
+        Tr::DirtyWarning => match lang {
+            Uk => "У цьому worktree є незафіксовані зміни — їх буде втрачено.",
+            Ru => "В этом worktree есть незафиксированные изменения — они будут потеряны.",
+            En => "This worktree has uncommitted changes — they will be lost.",
+        },
+        Tr::RestartDaemon => match lang {
+            Uk => "Перезапустити демон",
+            Ru => "Перезапустить демон",
+            En => "Restart daemon",
+        },
+        Tr::RestartDaemonWarning => match lang {
+            Uk => "Усі термінали, що працюють у старому демоні, буде закрито.",
+            Ru => "Все терминалы, работающие в старом демоне, будут закрыты.",
+            En => "All terminals running in the old daemon will be closed.",
+        },
+        Tr::Restart => match lang {
+            Uk => "Перезапустити",
+            Ru => "Перезапустить",
+            En => "Restart",
         },
     }
 }
@@ -130,6 +317,51 @@ pub fn connected(lang: Language, pid: u32) -> String {
     }
 }
 
+pub fn new_worktree_title(lang: Language, project: &str) -> String {
+    format!("{} \u{2014} {project}", tr(lang, Tr::NewWorktree))
+}
+
+pub fn remove_worktree_text(lang: Language, name: &str) -> String {
+    match lang {
+        Language::Uk => format!("Видалити worktree \u{ab}{name}\u{bb}? Його теку буде видалено, а термінали закрито."),
+        Language::Ru => format!("Удалить worktree \u{ab}{name}\u{bb}? Его папка будет удалена, а терминалы закрыты."),
+        Language::En => format!("Remove worktree \u{ab}{name}\u{bb}? Its folder will be deleted and its terminals closed."),
+    }
+}
+
+pub fn also_delete_branch(lang: Language, name: &str) -> String {
+    match lang {
+        Language::Uk => format!("Також видалити гілку \u{ab}{name}\u{bb}"),
+        Language::Ru => format!("Также удалить ветку \u{ab}{name}\u{bb}"),
+        Language::En => format!("Also delete branch \u{ab}{name}\u{bb}"),
+    }
+}
+
+pub fn remove_project_text(lang: Language, name: &str) -> String {
+    match lang {
+        Language::Uk => format!("Видалити проєкт \u{ab}{name}\u{bb} із Sich? Файли на диску не буде змінено."),
+        Language::Ru => format!("Удалить проект \u{ab}{name}\u{bb} из Sich? Файлы на диске не будут затронуты."),
+        Language::En => format!("Remove project \u{ab}{name}\u{bb} from Sich? Files on disk are not touched."),
+    }
+}
+
+/// Status-bar text for a daemon with another protocol version (`None` = older than v2).
+pub fn daemon_incompatible(lang: Language, version: Option<u32>, need: u32) -> String {
+    match (lang, version) {
+        (Language::Uk, Some(v)) => format!("Запущений демон несумісний (протокол v{v}, потрібен v{need})"),
+        (Language::Uk, None) => format!("Запущений демон несумісний (старий протокол, потрібен v{need})"),
+        (Language::Ru, Some(v)) => format!("Запущенный демон несовместим (протокол v{v}, нужен v{need})"),
+        (Language::Ru, None) => format!("Запущенный демон несовместим (старый протокол, нужен v{need})"),
+        (Language::En, Some(v)) => format!("Running daemon is incompatible (protocol v{v}, need v{need})"),
+        (Language::En, None) => format!("Running daemon is incompatible (older protocol, need v{need})"),
+    }
+}
+
+/// Tab text of an exited terminal.
+pub fn exited_tab(lang: Language, title: &str) -> String {
+    format!("{title} ({})", tr(lang, Tr::Exited))
+}
+
 /// Overlay text for a finished process, with the exit code when known.
 pub fn process_exited(lang: Language, code: Option<i32>) -> String {
     let head = tr(lang, Tr::ProcessExited);
@@ -140,5 +372,40 @@ pub fn process_exited(lang: Language, code: Option<i32>) -> String {
             Language::En => format!("{head} (code {c}). {tail}"),
         },
         None => format!("{head}. {tail}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_key_has_text_in_every_language() {
+        for &key in Tr::ALL {
+            for lang in Language::ALL {
+                assert!(!tr(lang, key).trim().is_empty(), "{key:?} is empty for {lang:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn languages_differ_for_user_facing_words() {
+        for key in [Tr::Home, Tr::Projects, Tr::Cancel, Tr::MainTag] {
+            assert_ne!(tr(Language::Uk, key), tr(Language::En, key), "{key:?}");
+            assert_ne!(tr(Language::Ru, key), tr(Language::En, key), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn parameterized_strings_are_filled_in_all_languages() {
+        for lang in Language::ALL {
+            assert!(remove_worktree_text(lang, "feat").contains("feat"));
+            assert!(also_delete_branch(lang, "feat").contains("feat"));
+            assert!(remove_project_text(lang, "proj").contains("proj"));
+            assert!(new_worktree_title(lang, "proj").contains("proj"));
+            assert!(daemon_incompatible(lang, Some(1), 2).contains("v1"));
+            assert!(daemon_incompatible(lang, None, 2).contains("v2"));
+            assert!(exited_tab(lang, "pwsh").starts_with("pwsh ("));
+        }
     }
 }

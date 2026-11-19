@@ -6067,6 +6067,7 @@ dependencies = [
  "sich-proto",
  "sich-term",
  "sys-locale",
+ "sysinfo",
  "tokio",
  "tokio-util",
  "tracing",

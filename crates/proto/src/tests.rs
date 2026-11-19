@@ -107,3 +107,14 @@ fn server_msgs_round_trip() {
 fn garbage_fails_to_decode() {
     assert!(decode::<ServerMsg>(&[0xff, 0xff, 0xff]).is_err());
 }
+
+/// Handshake compatibility rule: `Hello` / `Welcome` stay the first variants with unchanged
+/// fields, so every protocol version can decode them.
+#[test]
+fn hello_and_welcome_stay_first_variants() {
+    let hello = encode(&ClientMsg::Hello { proto_version: 1, client_name: "x".into() }).unwrap();
+    // postcard: variant index 0, then the u32 version as a varint, then the string.
+    assert_eq!(&hello[..], &[0u8, 1, 1, b'x'][..]);
+    let welcome = encode(&ServerMsg::Welcome { proto_version: 2, daemon_pid: 300 }).unwrap();
+    assert_eq!(&welcome[..], &[0u8, 2, 0xAC, 0x02][..]);
+}

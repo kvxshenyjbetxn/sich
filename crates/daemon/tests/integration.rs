@@ -154,9 +154,36 @@ async fn version_mismatch_is_rejected() {
     let mut c = connect(&name).await;
     send(&mut c, ClientMsg::Hello { proto_version: PROTO_VERSION + 1, client_name: "x".into() })
         .await;
+    // Welcome (so the client can learn version + pid) comes first, then Error, then close.
+    match recv(&mut c).await {
+        ServerMsg::Welcome { proto_version, daemon_pid } => {
+            assert_eq!(proto_version, PROTO_VERSION);
+            assert_eq!(daemon_pid, std::process::id());
+        }
+        other => panic!("expected Welcome, got {other:?}"),
+    }
     assert!(matches!(recv(&mut c).await, ServerMsg::Error { .. }));
+    let closed = timeout(Duration::from_secs(10), c.next()).await.expect("no close");
+    assert!(closed.is_none() || closed.is_some_and(|r| r.is_err()));
     let mut d = connect(&name).await;
     handshake(&mut d).await;
     send(&mut d, ClientMsg::Shutdown).await;
     let _ = timeout(Duration::from_secs(10), daemon).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_before_hello_stops_daemon() {
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let name = format!("sich-test-sd-{}-{stamp}", std::process::id());
+    let daemon = tokio::spawn({
+        let name = name.clone();
+        async move { sich_daemon::run(&name).await }
+    });
+    let mut c = connect(&name).await;
+    send(&mut c, ClientMsg::Shutdown).await;
+    timeout(Duration::from_secs(10), daemon)
+        .await
+        .expect("daemon did not stop")
+        .unwrap()
+        .unwrap();
 }

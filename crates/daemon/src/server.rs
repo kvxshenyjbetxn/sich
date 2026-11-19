@@ -36,17 +36,27 @@ where
     let (mut sink, mut source) = framed.split();
 
     // Handshake: the first message must be Hello with a matching version.
+    // `Shutdown` is accepted before Hello so any client can stop any daemon version.
     let first = source.next().await.context("closed before Hello")?.context("read Hello")?;
     match decode::<ClientMsg>(&first).context("decode Hello")? {
         ClientMsg::Hello { proto_version, client_name } if proto_version == PROTO_VERSION => {
             tracing::info!(conn = conn_id, %client_name, "client connected");
         }
         ClientMsg::Hello { proto_version, .. } => {
+            // Welcome first, so the client can learn our version and pid.
+            let welcome =
+                ServerMsg::Welcome { proto_version: PROTO_VERSION, daemon_pid: std::process::id() };
+            sink.send(encode(&welcome)?).await.ok();
             let message = format!(
                 "protocol version mismatch: client {proto_version}, daemon {PROTO_VERSION}"
             );
             sink.send(encode(&ServerMsg::Error { message: message.clone() })?).await.ok();
             anyhow::bail!(message);
+        }
+        ClientMsg::Shutdown => {
+            tracing::info!(conn = conn_id, "shutdown requested before Hello");
+            mgr.shutdown.cancel();
+            return Ok(());
         }
         _ => {
             let message = "expected Hello as the first message".to_string();

@@ -10,6 +10,10 @@ pub const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
 pub type TermId = u64;
 pub type ProjectId = u64;
 
+// Version handshake rule (forever): `ClientMsg::Hello` and `ServerMsg::Welcome` must stay the
+// FIRST variants of their enums with unchanged fields, so any version can decode them, and
+// `ClientMsg::Shutdown` must be accepted before Hello in every version, so a newer client can
+// always stop an incompatible daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientMsg {
     Hello { proto_version: u32, client_name: String },

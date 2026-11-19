@@ -4,7 +4,20 @@ use std::borrow::Cow;
 
 use gpui_kit::{AssetSource, SharedString};
 
-gpui_kit::assets::icon_assets!(ExtraIcons, [SquareTerminal, Settings]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [
+    SquareTerminal,
+    Settings,
+    House,
+    Folder,
+    GitBranch,
+    Plus,
+    RefreshCw,
+    Ellipsis,
+    Trash,
+    ChevronRight,
+    ChevronDown,
+    Terminal,
+]);
 
 pub struct AppAssets;
 
