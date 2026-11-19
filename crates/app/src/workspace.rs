@@ -90,6 +90,7 @@ pub fn terminals_in(key: &WorkspaceKey, terminals: &[TerminalInfo]) -> Vec<TermI
     list.into_iter().map(|t| t.id).collect()
 }
 
+#[cfg(test)]
 pub fn count_in(key: &WorkspaceKey, terminals: &[TerminalInfo]) -> usize {
     terminals.iter().filter(|t| key.contains(t.worktree.as_deref())).count()
 }

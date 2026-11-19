@@ -43,7 +43,7 @@ pub fn tab_label(lang: Language, title: String, exited: bool) -> String {
     if exited { i18n::exited_tab(lang, &title) } else { title }
 }
 
-fn entry_title(entry: &TermEntry) -> String {
+pub(crate) fn entry_title(entry: &TermEntry) -> String {
     // The daemon's live title (OSC title, else the shell name).
     tab_title(&entry.info.title, &entry.session.title(), &entry.info.cwd)
 }

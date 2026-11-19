@@ -186,6 +186,18 @@ impl AppView {
         cx.notify();
     }
 
+    /// Selects workspace `key` and activates terminal `id` in it (sidebar terminal rows).
+    pub(crate) fn activate_terminal_in(
+        &mut self,
+        key: WorkspaceKey,
+        id: TermId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_selected(key, cx);
+        self.activate_terminal(id, window, cx);
+    }
+
     fn workspace_ids(&self, infos: &[TerminalInfo]) -> Vec<TermId> {
         terminals_in(&self.ws.selected, infos)
     }
@@ -409,7 +421,7 @@ impl Render for AppView {
             cx.defer_in(window, move |_, window, cx| notifications::show_error(msg, window, cx));
         }
 
-        let sidebar = self.render_sidebar(&infos, lang, cx);
+        let sidebar = self.render_sidebar(&snap, &infos, lang, cx);
         let main = self.render_main(&snap, &infos, lang, cx);
         let status_bar = self.render_status_bar(snap.status, lang, cx);
 

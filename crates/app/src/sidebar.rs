@@ -9,16 +9,18 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     ClickEvent, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement as _, PathPromptOptions, SharedString, Stateful,
+    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use sich_proto::{ProjectId, ProjectInfo, TerminalInfo, WorktreeInfo};
+use sich_proto::{ProjectId, ProjectInfo, TermId, TerminalInfo, WorktreeInfo};
 
-use crate::agent_badge::{Badge, badge_element, rollup};
+use crate::agent_badge::{Badge, badge_element, badge_for, rollup};
 use crate::app_view::AppView;
+use crate::daemon_client::Snapshot;
 use crate::i18n::{Language, Tr, tr};
 use crate::os;
-use crate::workspace::{WorkspaceKey, count_in, same_path};
+use crate::tab_bar::{entry_title, tab_label};
+use crate::workspace::{WorkspaceKey, same_path, terminals_in};
 use crate::worktree_dialogs::{self, WorktreeRef};
 
 pub const SIDEBAR_W: f32 = 260.;
@@ -45,6 +47,18 @@ pub fn workspace_badge(key: &WorkspaceKey, infos: &[TerminalInfo]) -> Option<Bad
             .filter(|t| key.contains(t.worktree.as_deref()))
             .filter_map(|t| t.agent.as_ref()),
     )
+}
+
+/// Terminals shown as a nested sub-list under `key`: only when it has 2 or more (tab-bar order).
+pub fn sub_list_ids(key: &WorkspaceKey, infos: &[TerminalInfo]) -> Vec<TermId> {
+    let ids = terminals_in(key, infos);
+    if ids.len() >= 2 { ids } else { Vec::new() }
+}
+
+/// `(highlighted, shows_rollup_badge)` of a workspace row. With a sub-list the active child
+/// carries the highlight and the per-terminal badges, so the parent shows neither.
+pub fn parent_row_state(workspace_selected: bool, has_sub_list: bool) -> (bool, bool) {
+    (workspace_selected && !has_sub_list, !has_sub_list)
 }
 
 /// Roll-up badge of every worktree of a project (shown when the project row is collapsed).
@@ -134,17 +148,6 @@ fn worktree_menu(
     menu
 }
 
-fn count_badge(n: usize, bg: Hsla, fg: Hsla) -> Div {
-    div()
-        .flex_shrink_0()
-        .px_1p5()
-        .rounded_full()
-        .bg(bg)
-        .text_size(px(11.))
-        .text_color(fg)
-        .child(n.to_string())
-}
-
 fn dot(id: impl Into<gpui_kit::ElementId>, color: Hsla) -> Stateful<Div> {
     div().id(id).flex_shrink_0().size(px(7.)).rounded_full().bg(color)
 }
@@ -191,6 +194,7 @@ impl AppView {
 
     pub(crate) fn render_sidebar(
         &self,
+        snap: &Snapshot,
         infos: &[TerminalInfo],
         lang: Language,
         cx: &mut Context<Self>,
@@ -232,16 +236,25 @@ impl AppView {
                     })),
             );
 
-        let home_selected = self.ws.selected == WorkspaceKey::Home;
-        let home_count = count_in(&WorkspaceKey::Home, infos);
-        let home = row_base("ws-home", home_selected, 0., &theme)
+        let home_key = WorkspaceKey::Home;
+        let home_sub = sub_list_ids(&home_key, infos);
+        let (home_highlight, home_rollup) =
+            parent_row_state(self.ws.selected == home_key, !home_sub.is_empty());
+        let home_row = row_base("ws-home", home_highlight, 0., &theme)
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.select_workspace(WorkspaceKey::Home, window, cx)
             }))
             .child(Icon::new(Ic::House).small().text_color(muted))
             .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(tr(lang, Tr::Home)))
-            .children(workspace_badge(&WorkspaceKey::Home, infos).map(|b| badge_element(&b, lang, "home-agent", cx)))
-            .children((home_count > 0).then(|| count_badge(home_count, theme.muted, muted)));
+            .children(
+                home_rollup
+                    .then(|| workspace_badge(&home_key, infos))
+                    .flatten()
+                    .map(|b| badge_element(&b, lang, "home-agent", cx)),
+            );
+        let home = v_flex()
+            .child(home_row)
+            .children(self.render_term_rows(&home_key, &home_sub, INDENT, snap, lang, cx));
 
         let mut body = v_flex().id("sidebar-body").flex_1().min_h_0().overflow_y_scroll().child(home);
 
@@ -263,7 +276,7 @@ impl AppView {
         }
 
         for project in &self.projects {
-            body = body.child(self.render_project(project, infos, lang, &app, cx));
+            body = body.child(self.render_project(project, snap, infos, lang, &app, cx));
         }
 
         v_flex()
@@ -282,6 +295,7 @@ impl AppView {
     fn render_project(
         &self,
         project: &ProjectInfo,
+        snap: &Snapshot,
         infos: &[TerminalInfo],
         lang: Language,
         app: &Entity<AppView>,
@@ -361,7 +375,7 @@ impl AppView {
             );
         } else if expanded {
             for w in &project.worktrees {
-                col = col.child(self.render_worktree(pid, w, infos, lang, app, cx));
+                col = col.child(self.render_worktree(pid, w, snap, infos, lang, app, cx));
             }
         }
         col
@@ -372,6 +386,7 @@ impl AppView {
         &self,
         project_id: ProjectId,
         w: &WorktreeInfo,
+        snap: &Snapshot,
         infos: &[TerminalInfo],
         lang: Language,
         app: &Entity<AppView>,
@@ -380,9 +395,9 @@ impl AppView {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let key = WorkspaceKey::Worktree(w.path.clone());
-        let selected = self.ws.selected == key;
-        let count = count_in(&key, infos);
-        let agent = workspace_badge(&key, infos);
+        let sub = sub_list_ids(&key, infos);
+        let (selected, show_rollup) = parent_row_state(self.ws.selected == key, !sub.is_empty());
+        let agent = if show_rollup { workspace_badge(&key, infos) } else { None };
         let label = worktree_label(w);
         let group = SharedString::from(format!("wt-{}", crate::workspace::normalize_path(&w.path)));
         let wref = WorktreeRef {
@@ -420,9 +435,6 @@ impl AppView {
         if let Some(b) = agent {
             row = row.child(badge_element(&b, lang, SharedString::from(format!("wt-agent:{uid}")), cx));
         }
-        if count > 0 {
-            row = row.child(count_badge(count, theme.muted, muted));
-        }
         if !w.is_main {
             let (app, wref) = (app.clone(), wref.clone());
             row = row.child(
@@ -440,7 +452,68 @@ impl AppView {
             );
         }
         let (ctx_app, is_main) = (app.clone(), w.is_main);
-        row.context_menu(move |menu, _w, _cx| worktree_menu(menu, &ctx_app, &wref, is_main, lang))
+        let row = row.context_menu(move |menu, _w, _cx| worktree_menu(menu, &ctx_app, &wref, is_main, lang));
+        v_flex().child(row).children(self.render_term_rows(&key, &sub, INDENT * 2., snap, lang, cx))
+    }
+
+    /// Nested terminal rows under a workspace row (empty `ids` renders nothing).
+    fn render_term_rows(
+        &self,
+        key: &WorkspaceKey,
+        ids: &[TermId],
+        indent: f32,
+        snap: &Snapshot,
+        lang: Language,
+        cx: &mut Context<Self>,
+    ) -> Vec<Stateful<Div>> {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let active = self.ws.active_in(key, ids);
+        let ws_selected = self.ws.selected == *key;
+        ids.iter()
+            .filter_map(|&id| {
+                let entry = snap.terminals.iter().find(|t| t.info.id == id)?;
+                let exited = entry.info.exited.is_some();
+                let selected = ws_selected && active == Some(id);
+                let group = SharedString::from(format!("side-term-{id}"));
+                let label = tab_label(lang, entry_title(entry), exited);
+                let badge = entry
+                    .info
+                    .agent
+                    .as_ref()
+                    .and_then(badge_for)
+                    .map(|b| badge_element(&b, lang, ("side-term-badge", id), cx));
+                let close = Button::new(("side-term-close", id))
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(Ic::Close))
+                    .tooltip(tr(lang, Tr::CloseTerminal))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
+                        this.client.kill_terminal(id);
+                        cx.stop_propagation();
+                    }));
+                let key = key.clone();
+                Some(
+                    row_base(("side-term", id), selected, indent, &theme)
+                        .group(group.clone())
+                        .text_color(if exited { muted } else { theme.sidebar_foreground })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.activate_terminal_in(key.clone(), id, window, cx)
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(move |this, _, _w, cx| {
+                                this.client.kill_terminal(id);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
+                        .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
+                        .children(badge)
+                        .child(div().invisible().group_hover(group, |s| s.visible()).child(close)),
+                )
+            })
+            .collect()
     }
 }
 
@@ -511,6 +584,53 @@ mod tests {
         assert_eq!(kind(workspace_badge(&b, &infos)), Some(BadgeKind::Done));
         assert_eq!(kind(workspace_badge(&WorkspaceKey::Home, &infos)), Some(BadgeKind::Failed));
         assert_eq!(kind(workspace_badge(&c, &infos)), None);
+    }
+
+    #[test]
+    fn sub_list_empty_for_zero_or_one_terminal() {
+        let a = WorkspaceKey::Worktree("/w/a".into());
+        assert!(sub_list_ids(&a, &[]).is_empty());
+        let infos = vec![term(1, Some("/w/a"), None), term(2, Some("/w/b"), None)];
+        assert!(sub_list_ids(&a, &infos).is_empty());
+    }
+
+    #[test]
+    fn sub_list_is_ordered_by_creation_then_id() {
+        let a = WorkspaceKey::Worktree("/w/a".into());
+        let mut t3 = term(3, Some("/w/a"), None);
+        t3.created_unix_ms = 1;
+        let infos = vec![term(5, Some("/w/a"), None), term(2, Some("/w/a"), None), t3];
+        assert_eq!(sub_list_ids(&a, &infos), vec![3, 2, 5]);
+    }
+
+    #[test]
+    fn sub_list_only_contains_own_terminals_with_normalized_paths() {
+        let a = WorkspaceKey::Worktree("/w/a".into());
+        let infos = vec![
+            term(1, Some("/w/a"), None),
+            term(2, Some("/w/a/"), None),
+            term(3, Some("/w/b"), None),
+            term(4, None, None),
+        ];
+        assert_eq!(sub_list_ids(&a, &infos), vec![1, 2]);
+    }
+
+    #[test]
+    fn home_sub_list_collects_terminals_without_worktree() {
+        let infos = vec![
+            term(1, None, None),
+            term(2, Some("/w/a"), None),
+            term(3, None, None),
+        ];
+        assert_eq!(sub_list_ids(&WorkspaceKey::Home, &infos), vec![1, 3]);
+    }
+
+    #[test]
+    fn parent_row_state_covers_all_combinations() {
+        assert_eq!(parent_row_state(false, false), (false, true));
+        assert_eq!(parent_row_state(true, false), (true, true));
+        assert_eq!(parent_row_state(false, true), (false, false));
+        assert_eq!(parent_row_state(true, true), (false, false));
     }
 
     #[test]
