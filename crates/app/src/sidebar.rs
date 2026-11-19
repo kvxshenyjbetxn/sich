@@ -217,6 +217,11 @@ fn worktree_menu(
     menu
 }
 
+/// Expand/collapse indicator, shown at the right end of group and project rows.
+fn chevron(expanded: bool, color: Hsla) -> Icon {
+    Icon::new(if expanded { Ic::ChevronDown } else { Ic::ChevronRight }).small().text_color(color)
+}
+
 fn dot(id: impl Into<gpui_kit::ElementId>, color: Hsla) -> Stateful<Div> {
     div().id(id).flex_shrink_0().size(px(7.)).rounded_full().bg(color)
 }
@@ -427,11 +432,6 @@ impl AppView {
                 }
                 cx.notify();
             }))
-            .child(
-                Icon::new(if expanded { Ic::ChevronDown } else { Ic::ChevronRight })
-                    .small()
-                    .text_color(muted),
-            )
             .child(Icon::new(Ic::Layers).small().text_color(muted))
             .child(
                 div()
@@ -444,6 +444,7 @@ impl AppView {
             )
             .children(badge.map(|b| badge_element(&b, lang, ("group-agent", gid), cx)))
             .child(actions)
+            .child(chevron(expanded, muted))
             .context_menu(move |menu, _w, _cx| group_menu(menu, &ctx_app, &ctx_g, lang));
 
         let mut col = v_flex().child(row);
@@ -510,11 +511,6 @@ impl AppView {
                 }
                 cx.notify();
             }))
-            .child(
-                Icon::new(if expanded { Ic::ChevronDown } else { Ic::ChevronRight })
-                    .small()
-                    .text_color(muted),
-            )
             .child(Icon::new(Ic::Folder).small().text_color(muted))
             .child(
                 div()
@@ -527,6 +523,7 @@ impl AppView {
             )
             .children(collapsed_badge.map(|b| badge_element(&b, lang, ("proj-agent", pid), cx)))
             .child(actions)
+            .child(chevron(expanded, muted))
             .context_menu(move |menu, w, cx| {
                 project_menu(menu, &ctx_app, &ctx_p, &ctx_groups, lang, w, cx)
             });
