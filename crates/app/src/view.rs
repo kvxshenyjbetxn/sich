@@ -7,8 +7,9 @@ use gpui_kit::{
     App, ClipboardItem, Context, Div, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
     Pixels, Point as PxPoint, Render, ScrollDelta, ScrollEvent, Styled, Subscription, Window,
-    div, px, rgb,
+    div, px, Hsla,
 };
+use gpui_kit::component::ActiveTheme as _;
 use sich_term::alacritty_terminal::index::{Column, Line, Point, Side};
 use sich_term::alacritty_terminal::selection::SelectionType;
 use sich_term::alacritty_terminal::term::TermMode;
@@ -446,7 +447,7 @@ impl Focusable for TerminalView {
     }
 }
 
-fn overlay(text: String, color: u32, bg: u32) -> Div {
+fn overlay(text: String, color: Hsla, bg: Hsla) -> Div {
     div()
         .absolute()
         .bottom_0()
@@ -454,8 +455,8 @@ fn overlay(text: String, color: u32, bg: u32) -> Div {
         .right_0()
         .px_3()
         .py_1()
-        .bg(rgb(bg))
-        .text_color(rgb(color))
+        .bg(bg)
+        .text_color(color)
         .text_size(px(13.))
         .child(text)
 }
@@ -509,11 +510,9 @@ impl Render for TerminalView {
             ));
 
         if let Some(code) = session.exited() {
-            let text = match code {
-                Some(c) => format!("Process exited (code {c}). Close the terminal from the sidebar."),
-                None => "Process exited. Close the terminal from the sidebar.".to_string(),
-            };
-            root = root.child(overlay(text, 0xe0af68, crate::theme::OVERLAY_BG));
+            let text = crate::i18n::process_exited(crate::settings::language(cx), code);
+            let theme = cx.theme();
+            root = root.child(overlay(text, theme.warning, theme.popover));
         }
         root
     }

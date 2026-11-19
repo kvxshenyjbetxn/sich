@@ -8,12 +8,14 @@ use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
     KeyDownEvent, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
-    div, px, rgb,
+    div, px,
 };
 use sich_proto::TermId;
 
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot, TermEntry};
-use crate::theme;
+use crate::i18n::{self, Language, Tr, tr};
+use crate::settings;
+use crate::settings_dialog;
 use crate::view::TerminalView;
 
 const SIDEBAR_W: f32 = 240.;
@@ -144,6 +146,7 @@ impl AppView {
         }
         match ks.key.as_str() {
             "t" if m.shift => self.new_terminal(cx),
+            "," if !m.shift => settings_dialog::open(window, cx),
             "tab" => self.cycle(if m.shift { -1 } else { 1 }, window, cx),
             _ => return,
         }
@@ -171,13 +174,13 @@ impl AppView {
         format!("{} \u{2014} {}", entry.info.title, dir)
     }
 
-    fn render_sidebar(&self, snap: &Snapshot, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, snap: &Snapshot, lang: Language, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let rows = snap.terminals.iter().map(|entry| {
             let id = entry.info.id;
             let active = self.active == Some(id);
             let exited = entry.info.exited.is_some();
-            let bg = if active { theme.accent } else { theme.accent.opacity(0.0) };
+            let bg = if active { theme.list_active } else { theme.list_active.opacity(0.0) };
             h_flex()
                 .id(("term-row", id))
                 .w_full()
@@ -187,7 +190,7 @@ impl AppView {
                 .items_center()
                 .cursor_pointer()
                 .bg(bg)
-                .hover(|s| s.bg(theme.accent.opacity(0.6)))
+                .hover(|s| if active { s } else { s.bg(theme.list_hover) })
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.set_active(id, window, cx)
                 }))
@@ -200,14 +203,14 @@ impl AppView {
                         .child(Self::row_title(entry)),
                 )
                 .children(exited.then(|| {
-                    div().flex_shrink_0().text_size(px(11.)).text_color(theme.muted_foreground).child("exited")
+                    div().flex_shrink_0().text_size(px(11.)).text_color(theme.muted_foreground).child(tr(lang, Tr::Exited))
                 }))
                 .child(
                     Button::new(("term-close", id))
                         .ghost()
                         .xsmall()
                         .icon(Icon::new(IconName::Close))
-                        .tooltip("Close terminal")
+                        .tooltip(tr(lang, Tr::CloseTerminal))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                             this.client.kill_terminal(id);
                             cx.stop_propagation();
@@ -219,16 +222,17 @@ impl AppView {
             .w(px(SIDEBAR_W))
             .h_full()
             .flex_shrink_0()
-            .bg(rgb(theme::SIDEBAR_BG))
+            .bg(theme.sidebar)
+            .text_color(theme.sidebar_foreground)
             .border_r_1()
-            .border_color(theme.border)
+            .border_color(theme.sidebar_border)
             .child(v_flex().id("term-list").flex_1().min_h_0().overflow_y_scroll().children(rows))
             .child(
                 div().p_2().child(
                     Button::new("new-terminal")
                         .small()
                         .w_full()
-                        .label("+ New terminal")
+                        .label(format!("+ {}", tr(lang, Tr::NewTerminal)))
                         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                             this.new_terminal(cx)
                         })),
@@ -242,6 +246,7 @@ impl Render for AppView {
         let snap = self.client.snapshot();
         self.sync(&snap, window, cx);
         let theme = cx.theme().clone();
+        let lang = settings::language(cx);
 
         let main = match self.active.and_then(|a| self.views.get(&a)) {
             Some(view) => div().flex_1().min_w_0().h_full().child(view.clone()),
@@ -253,12 +258,12 @@ impl Render for AppView {
                 .items_center()
                 .justify_center()
                 .text_color(theme.muted_foreground)
-                .child("No terminals"),
+                .child(tr(lang, Tr::NoTerminals)),
         };
 
         let status = match snap.status {
-            ConnStatus::Connected { pid } => format!("Connected to daemon (pid {pid})"),
-            ConnStatus::Reconnecting => "Reconnecting\u{2026}".to_string(),
+            ConnStatus::Connected { pid } => i18n::connected(lang, pid),
+            ConnStatus::Reconnecting => tr(lang, Tr::Reconnecting).to_string(),
         };
         let status_bar = h_flex()
             .h(px(24.))
@@ -266,19 +271,29 @@ impl Render for AppView {
             .flex_shrink_0()
             .px_3()
             .items_center()
-            .bg(rgb(theme::SIDEBAR_BG))
+            .bg(theme.status_bar)
             .border_t_1()
-            .border_color(theme.border)
+            .border_color(theme.status_bar_border)
             .text_size(px(12.))
             .text_color(theme.muted_foreground)
-            .child(status);
+            .child(div().flex_1().child(status))
+            .child(
+                Button::new("open-settings")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::Settings))
+                    .tooltip(tr(lang, Tr::Settings))
+                    .on_click(cx.listener(|_this, _: &ClickEvent, window, cx| {
+                        settings_dialog::open(window, cx)
+                    })),
+            );
 
         v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .capture_key_down(cx.listener(Self::on_key_capture))
-            .child(h_flex().flex_1().min_h_0().child(self.render_sidebar(&snap, cx)).child(main))
+            .child(h_flex().flex_1().min_h_0().child(self.render_sidebar(&snap, lang, cx)).child(main))
             .child(status_bar)
     }
 }

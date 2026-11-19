@@ -7,7 +7,10 @@ mod colors;
 mod daemon_client;
 mod daemon_conn;
 mod element;
+mod i18n;
 mod links;
+mod settings;
+mod settings_dialog;
 mod term_settings;
 mod theme;
 mod view;
@@ -55,6 +58,7 @@ fn run_ui(socket: String) -> anyhow::Result<()> {
     gpui_kit::application().with_assets(crate::assets::AppAssets).run(move |cx| {
         gpui_kit::init(cx);
         term_settings::init(cx);
+        settings::init(cx);
         theme::apply(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
