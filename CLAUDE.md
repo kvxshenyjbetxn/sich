@@ -2,6 +2,28 @@
 
 Read `ARCHITECTURE.md` before changing code. The phone-sync roadmap is in `phone-sync-plan.md`.
 
+## Official integrations only — MANDATORY
+
+Sich is a terminal shell for AI agents. It is not an agent harness. The user runs the official agent CLIs (`claude`, `gemini`, `codex`, …) inside Sich terminals with their own login. Sich must never do anything that could get the user's account blocked or that violates the agents' terms.
+
+- Integrate only through documented, official mechanisms:
+  - Claude Code hooks in `settings.json`
+  - official plugin/settings APIs
+  - official CLI flags and env vars
+  - passively reading what the agent prints to the terminal (titles, OSC, BEL)
+- NEVER:
+  - read, copy or reuse the agents' credentials or OAuth tokens;
+  - call Anthropic/other model APIs using a subscription login;
+  - impersonate or spoof the agent CLI (headers, user-agent, client ids);
+  - patch, wrap, inject into or reverse-engineer the agent binaries or their private protocols;
+  - automate the agent's UI in ways its terms forbid.
+- If a feature can't be done through an official mechanism, don't do it. Raise it with the user instead.
+- When modifying the user's agent config (e.g. `~/.claude/settings.json` hooks):
+  - only touch our own entries;
+  - keep a backup;
+  - never write keys the installed version doesn't support;
+  - make it removable through a setting.
+
 ## Testing — MANDATORY
 
 The app will grow a lot of features. Tests are what keep old features from breaking. These rules apply to the main model AND every subagent (coders included).
