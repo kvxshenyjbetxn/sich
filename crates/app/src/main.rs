@@ -10,6 +10,8 @@ mod daemon_client;
 mod daemon_conn;
 mod daemon_kill;
 mod element;
+mod group_dialogs;
+mod groups;
 mod i18n;
 mod input;
 mod links;

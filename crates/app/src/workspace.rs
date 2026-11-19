@@ -206,7 +206,7 @@ mod tests {
     }
 
     fn project(id: u64, worktrees: Vec<WorktreeInfo>) -> ProjectInfo {
-        ProjectInfo { id, name: "p".into(), path: PathBuf::new(), is_git: true, worktrees, error: None }
+        ProjectInfo { id, name: "p".into(), path: PathBuf::new(), is_git: true, worktrees, error: None, group: None }
     }
 
     #[test]

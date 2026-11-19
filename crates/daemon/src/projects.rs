@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use sich_proto::{ProjectId, ProjectInfo, ServerMsg, WorktreeInfo};
+use sich_proto::{GroupId, GroupInfo, ProjectId, ProjectInfo, ServerMsg, WorktreeInfo};
 
 use crate::git;
 use crate::hub::ConnHandle;
@@ -16,11 +16,49 @@ struct Entry {
     id: ProjectId,
     name: String,
     path: PathBuf,
+    #[serde(default)]
+    group: Option<GroupId>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct GroupEntry {
+    id: GroupId,
+    name: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct State {
+    #[serde(default)]
+    groups: Vec<GroupEntry>,
+    #[serde(default)]
+    projects: Vec<Entry>,
+    /// Next group id; ids are never reused within the file.
+    #[serde(default)]
+    next_group_id: GroupId,
+}
+
+/// Old files are a bare array of projects; new ones are an object with groups.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum FileFormat {
+    Legacy(Vec<Entry>),
+    Current(State),
+}
+
+fn parse_state(bytes: &[u8]) -> State {
+    let mut st = match serde_json::from_slice::<FileFormat>(bytes) {
+        Ok(FileFormat::Legacy(projects)) => State { projects, ..State::default() },
+        Ok(FileFormat::Current(st)) => st,
+        Err(_) => State::default(),
+    };
+    let max = st.groups.iter().map(|g| g.id).max().unwrap_or(0);
+    st.next_group_id = st.next_group_id.max(max + 1);
+    st
 }
 
 pub struct Registry {
     file: PathBuf,
-    items: Mutex<Vec<Entry>>,
+    state: Mutex<State>,
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -41,20 +79,17 @@ impl Registry {
     pub fn load() -> Self {
         let file =
             config_dir().unwrap_or_else(|| PathBuf::from(".")).join("sich").join("projects.json");
-        let items = std::fs::read(&file)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Vec<Entry>>(&b).ok())
-            .unwrap_or_default();
-        Self { file, items: Mutex::new(items) }
+        let state = parse_state(&std::fs::read(&file).unwrap_or_default());
+        Self { file, state: Mutex::new(state) }
     }
 
-    fn save(&self, items: &[Entry]) {
+    fn save(&self, state: &State) {
         let result = (|| -> std::io::Result<()> {
             if let Some(dir) = self.file.parent() {
                 std::fs::create_dir_all(dir)?;
             }
             let tmp = self.file.with_extension("json.tmp");
-            std::fs::write(&tmp, serde_json::to_vec_pretty(items)?)?;
+            std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
             std::fs::rename(&tmp, &self.file)
         })();
         if let Err(e) = result {
@@ -63,29 +98,103 @@ impl Registry {
     }
 
     fn entries(&self) -> Vec<Entry> {
-        self.items.lock().clone()
+        self.state.lock().projects.clone()
+    }
+
+    fn groups(&self) -> Vec<GroupInfo> {
+        self.state.lock().groups.iter().map(|g| GroupInfo { id: g.id, name: g.name.clone() }).collect()
     }
 
     fn get(&self, id: ProjectId) -> Option<Entry> {
-        self.items.lock().iter().find(|e| e.id == id).cloned()
+        self.state.lock().projects.iter().find(|e| e.id == id).cloned()
     }
 
-    /// Adds a project unless the path is already present.
-    fn add(&self, name: String, path: PathBuf) {
-        let mut items = self.items.lock();
-        if items.iter().any(|e| git::same_path(&e.path, &path)) {
-            return;
+    /// Adds a project unless the path is already present. Unknown group -> error, no change.
+    fn add(&self, name: String, path: PathBuf, group: Option<GroupId>) -> Result<(), String> {
+        let mut st = self.state.lock();
+        if let Some(g) = group
+            && !st.groups.iter().any(|x| x.id == g)
+        {
+            return Err("Unknown group".into());
         }
-        let id = items.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-        items.push(Entry { id, name, path });
-        self.save(&items);
+        if st.projects.iter().any(|e| git::same_path(&e.path, &path)) {
+            return Ok(());
+        }
+        let id = st.projects.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        st.projects.push(Entry { id, name, path, group });
+        self.save(&st);
+        Ok(())
     }
 
     fn remove(&self, id: ProjectId) {
-        let mut items = self.items.lock();
-        items.retain(|e| e.id != id);
-        self.save(&items);
+        let mut st = self.state.lock();
+        st.projects.retain(|e| e.id != id);
+        self.save(&st);
     }
+
+    fn create_group(&self, name: &str) -> Result<(), String> {
+        let mut st = self.state.lock();
+        let name = valid_group_name(&st.groups, name, None)?;
+        let id = st.next_group_id.max(1);
+        st.next_group_id = id + 1;
+        st.groups.push(GroupEntry { id, name });
+        self.save(&st);
+        Ok(())
+    }
+
+    fn rename_group(&self, id: GroupId, name: &str) -> Result<(), String> {
+        let mut st = self.state.lock();
+        if !st.groups.iter().any(|g| g.id == id) {
+            return Err("Unknown group".into());
+        }
+        let name = valid_group_name(&st.groups, name, Some(id))?;
+        if let Some(g) = st.groups.iter_mut().find(|g| g.id == id) {
+            g.name = name;
+        }
+        self.save(&st);
+        Ok(())
+    }
+
+    fn remove_group(&self, id: GroupId) -> Result<(), String> {
+        let mut st = self.state.lock();
+        if !st.groups.iter().any(|g| g.id == id) {
+            return Err("Unknown group".into());
+        }
+        st.groups.retain(|g| g.id != id);
+        for p in st.projects.iter_mut().filter(|p| p.group == Some(id)) {
+            p.group = None;
+        }
+        self.save(&st);
+        Ok(())
+    }
+
+    fn set_project_group(&self, project_id: ProjectId, group: Option<GroupId>) -> Result<(), String> {
+        let mut st = self.state.lock();
+        if let Some(g) = group
+            && !st.groups.iter().any(|x| x.id == g)
+        {
+            return Err("Unknown group".into());
+        }
+        let Some(p) = st.projects.iter_mut().find(|p| p.id == project_id) else {
+            return Err("Unknown project".into());
+        };
+        p.group = group;
+        self.save(&st);
+        Ok(())
+    }
+}
+
+/// Trims and checks a group name (non-empty, unique case-insensitively except for `own`).
+fn valid_group_name(groups: &[GroupEntry], name: &str, own: Option<GroupId>) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Group name is empty".into());
+    }
+    let lower = name.to_lowercase();
+    if groups.iter().any(|g| Some(g.id) != own && g.name.to_lowercase() == lower) {
+        return Err("A group with this name already exists".into());
+    }
+    Ok(name.to_string())
 }
 
 fn scan_one(e: &Entry) -> ProjectInfo {
@@ -96,6 +205,7 @@ fn scan_one(e: &Entry) -> ProjectInfo {
         is_git: false,
         worktrees: Vec::new(),
         error: None,
+        group: e.group,
     };
     if !e.path.is_dir() {
         info.error = Some("Folder not found".into());
@@ -126,13 +236,13 @@ async fn scan(mgr: &Arc<Manager>) -> Vec<ProjectInfo> {
         .unwrap_or_default()
 }
 
-pub async fn list(mgr: &Arc<Manager>) -> Vec<ProjectInfo> {
-    scan(mgr).await
+pub async fn list(mgr: &Arc<Manager>) -> ServerMsg {
+    ServerMsg::Projects { projects: scan(mgr).await, groups: mgr.projects.groups() }
 }
 
 pub async fn broadcast(mgr: &Arc<Manager>) {
     let list = scan(mgr).await;
-    mgr.hub.broadcast(ServerMsg::Projects(list));
+    mgr.hub.broadcast(ServerMsg::Projects { projects: list, groups: mgr.projects.groups() });
 }
 
 fn fail(conn: &ConnHandle, op: &str, message: impl Into<String>) {
@@ -143,7 +253,7 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
     tokio::task::spawn_blocking(f).await.ok()
 }
 
-pub async fn add_project(mgr: &Arc<Manager>, conn: &ConnHandle, path: PathBuf) {
+pub async fn add_project(mgr: &Arc<Manager>, conn: &ConnHandle, path: PathBuf, group: Option<GroupId>) {
     let found = blocking(move || {
         let canon = dunce::canonicalize(&path).map_err(|_| "Folder not found".to_string())?;
         if !canon.is_dir() {
@@ -158,12 +268,46 @@ pub async fn add_project(mgr: &Arc<Manager>, conn: &ConnHandle, path: PathBuf) {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string_lossy().to_string());
-            mgr.projects.add(name, path);
-            broadcast(mgr).await;
+            match mgr.projects.add(name, path, group) {
+                Ok(()) => broadcast(mgr).await,
+                Err(msg) => fail(conn, "add_project", msg),
+            }
         }
         Some(Err(msg)) => fail(conn, "add_project", msg),
         None => fail(conn, "add_project", "internal error"),
     }
+}
+
+async fn group_result(mgr: &Arc<Manager>, conn: &ConnHandle, op: &str, res: Result<(), String>) {
+    match res {
+        Ok(()) => broadcast(mgr).await,
+        Err(msg) => fail(conn, op, msg),
+    }
+}
+
+pub async fn create_group(mgr: &Arc<Manager>, conn: &ConnHandle, name: String) {
+    let r = mgr.projects.create_group(&name);
+    group_result(mgr, conn, "create_group", r).await;
+}
+
+pub async fn rename_group(mgr: &Arc<Manager>, conn: &ConnHandle, id: GroupId, name: String) {
+    let r = mgr.projects.rename_group(id, &name);
+    group_result(mgr, conn, "rename_group", r).await;
+}
+
+pub async fn remove_group(mgr: &Arc<Manager>, conn: &ConnHandle, id: GroupId) {
+    let r = mgr.projects.remove_group(id);
+    group_result(mgr, conn, "remove_group", r).await;
+}
+
+pub async fn set_project_group(
+    mgr: &Arc<Manager>,
+    conn: &ConnHandle,
+    project_id: ProjectId,
+    group: Option<GroupId>,
+) {
+    let r = mgr.projects.set_project_group(project_id, group);
+    group_result(mgr, conn, "set_project_group", r).await;
 }
 
 pub async fn remove_project(mgr: &Arc<Manager>, id: ProjectId) {
@@ -252,4 +396,46 @@ pub async fn remove_worktree(
         None => fail(conn, OP, "internal error"),
     }
     broadcast(mgr).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loads_legacy_array_file() {
+        let st = parse_state(br#"[{"id":3,"name":"a","path":"/a"},{"id":5,"name":"b","path":"/b"}]"#);
+        assert_eq!(st.projects.len(), 2);
+        assert!(st.projects.iter().all(|p| p.group.is_none()));
+        assert!(st.groups.is_empty());
+        assert_eq!(st.next_group_id, 1);
+    }
+
+    #[test]
+    fn loads_object_without_groups_or_group_field() {
+        let st = parse_state(br#"{"projects":[{"id":1,"name":"a","path":"/a"}]}"#);
+        assert_eq!(st.projects.len(), 1);
+        assert!(st.groups.is_empty());
+    }
+
+    #[test]
+    fn next_group_id_never_below_existing() {
+        let st = parse_state(br#"{"groups":[{"id":4,"name":"x"}],"next_group_id":2}"#);
+        assert_eq!(st.next_group_id, 5);
+    }
+
+    #[test]
+    fn garbage_file_loads_empty() {
+        let st = parse_state(b"not json");
+        assert!(st.projects.is_empty() && st.groups.is_empty());
+    }
+
+    #[test]
+    fn group_name_validation() {
+        let groups = vec![GroupEntry { id: 1, name: "Game".into() }];
+        assert!(valid_group_name(&groups, "  ", None).is_err());
+        assert!(valid_group_name(&groups, "game", None).is_err());
+        assert_eq!(valid_group_name(&groups, " web ", None).unwrap(), "web");
+        assert_eq!(valid_group_name(&groups, "GAME", Some(1)).unwrap(), "GAME");
+    }
 }

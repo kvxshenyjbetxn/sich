@@ -49,6 +49,7 @@ fn project() -> ProjectInfo {
             },
         ],
         error: Some("Folder not found".into()),
+        group: Some(7),
     }
 }
 
@@ -74,7 +75,8 @@ fn client_msgs_round_trip() {
         ClientMsg::KillTerminal { id: 5 },
         ClientMsg::ListProjects,
         ClientMsg::RefreshProjects,
-        ClientMsg::AddProject { path: PathBuf::from("/repo") },
+        ClientMsg::AddProject { path: PathBuf::from("/repo"), group: None },
+        ClientMsg::AddProject { path: PathBuf::from("/repo"), group: Some(2) },
         ClientMsg::RemoveProject { id: 3 },
         ClientMsg::CreateWorktree { project_id: 1, name: "feat".into(), base: Some("main".into()) },
         ClientMsg::CreateWorktree { project_id: 1, name: "feat".into(), base: None },
@@ -92,6 +94,11 @@ fn client_msgs_round_trip() {
         ClientMsg::AgentHook { term_id: 1, agent: AgentKind::Gemini, payload: String::new() },
         ClientMsg::MarkSeen { id: 8 },
         ClientMsg::Shutdown,
+        ClientMsg::CreateGroup { name: "game".into() },
+        ClientMsg::RenameGroup { id: 2, name: "игры".into() },
+        ClientMsg::RemoveGroup { id: 2 },
+        ClientMsg::SetProjectGroup { project_id: 1, group: Some(2) },
+        ClientMsg::SetProjectGroup { project_id: 1, group: None },
     ];
     for m in msgs {
         let bytes = encode(&m).unwrap();
@@ -110,8 +117,11 @@ fn server_msgs_round_trip() {
         ServerMsg::TerminalExited { id: 1, code: None },
         ServerMsg::TerminalRemoved { id: 9 },
         ServerMsg::Output { id: 1, seq: u64::MAX, bytes: b"hello".to_vec() },
-        ServerMsg::Projects(vec![project()]),
-        ServerMsg::Projects(vec![]),
+        ServerMsg::Projects {
+            projects: vec![project()],
+            groups: vec![GroupInfo { id: 7, name: "game".into() }],
+        },
+        ServerMsg::Projects { projects: vec![], groups: vec![] },
         ServerMsg::OpFailed { op: "create_worktree".into(), message: "exists".into() },
         ServerMsg::AgentStatusChanged { id: 2, status: Some(status()) },
         ServerMsg::AgentStatusChanged { id: 2, status: None },
@@ -143,8 +153,8 @@ fn agent_enums_round_trip() {
 }
 
 #[test]
-fn proto_version_is_3() {
-    assert_eq!(PROTO_VERSION, 3);
+fn proto_version_is_4() {
+    assert_eq!(PROTO_VERSION, 4);
 }
 
 #[test]

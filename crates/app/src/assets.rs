@@ -9,6 +9,8 @@ gpui_kit::assets::icon_assets!(ExtraIcons, [
     Settings,
     House,
     Folder,
+    FolderPlus,
+    Layers,
     GitBranch,
     Plus,
     RefreshCw,

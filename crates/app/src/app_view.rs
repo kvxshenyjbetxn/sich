@@ -12,7 +12,7 @@ use gpui_kit::{
     KeyDownEvent, ParentElement as _, Render, Styled as _, Window,
     div, px,
 };
-use sich_proto::{PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
+use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot};
@@ -38,6 +38,9 @@ pub struct AppView {
     /// Saved workspace to restore when the first `Projects` update arrives.
     restore: Option<Option<PathBuf>>,
     pub(crate) projects: Vec<ProjectInfo>,
+    pub(crate) groups: Vec<GroupInfo>,
+    /// Groups whose project list is collapsed (default: expanded).
+    pub(crate) collapsed_groups: HashSet<GroupId>,
     /// Projects whose tree is collapsed (default: expanded).
     pub(crate) collapsed: HashSet<ProjectId>,
     /// Workspaces this window asked a terminal for; the matching new terminal gets activated.
@@ -84,6 +87,8 @@ impl AppView {
             ws: Workspaces::default(),
             restore: Some(settings::get(cx).last_workspace),
             projects: Vec::new(),
+            groups: Vec::new(),
+            collapsed_groups: HashSet::new(),
             collapsed: HashSet::new(),
             pending_creates: VecDeque::new(),
             pending_worktree: None,
@@ -159,13 +164,7 @@ impl AppView {
     fn set_selected(&mut self, key: WorkspaceKey, cx: &mut Context<Self>) {
         if self.ws.selected != key {
             // Make sure the selected worktree is visible: expand its project.
-            if let WorkspaceKey::Worktree(_) = &key {
-                for p in &self.projects {
-                    if p.worktrees.iter().any(|w| WorkspaceKey::Worktree(w.path.clone()) == key) {
-                        self.collapsed.remove(&p.id);
-                    }
-                }
-            }
+            crate::groups::expand_to(&key, &self.projects, &mut self.collapsed, &mut self.collapsed_groups);
             settings::set_last_workspace(key.path().map(PathBuf::from), cx);
             self.ws.selected = key;
         }
@@ -288,10 +287,11 @@ impl AppView {
         self.ws.prune(&ids);
         self.window_active = window.is_window_active();
 
-        let (rev, projects) = self.client.projects_with_rev();
+        let (rev, projects, groups) = self.client.projects_with_rev();
         if rev != self.seen_projects_rev {
             self.seen_projects_rev = rev;
             self.projects = projects;
+            self.groups = groups;
             self.on_projects_changed(cx);
         }
 

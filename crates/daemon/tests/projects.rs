@@ -3,7 +3,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt as _, StreamExt as _};
-use sich_proto::{ClientMsg, PROTO_VERSION, ProjectInfo, ServerMsg, decode, encode, frame_codec};
+use sich_proto::{ClientMsg, GroupInfo, PROTO_VERSION, ProjectInfo, ServerMsg, decode, encode, frame_codec};
 use tokio::time::timeout;
 use tokio_util::codec::Framed;
 
@@ -57,9 +57,13 @@ async fn recv(c: &mut Conn) -> ServerMsg {
 }
 
 async fn expect_projects(c: &mut Conn) -> Vec<ProjectInfo> {
+    expect_state(c).await.0
+}
+
+async fn expect_state(c: &mut Conn) -> (Vec<ProjectInfo>, Vec<GroupInfo>) {
     loop {
         match recv(c).await {
-            ServerMsg::Projects(p) => return p,
+            ServerMsg::Projects { projects, groups } => return (projects, groups),
             ServerMsg::OpFailed { op, message } => panic!("unexpected OpFailed {op}: {message}"),
             _ => {}
         }
@@ -117,7 +121,7 @@ async fn git_project_and_worktree_lifecycle() {
     let mut h = start("git").await;
     let c = &mut h.conn;
 
-    send(c, ClientMsg::AddProject { path: repo.clone() }).await;
+    send(c, ClientMsg::AddProject { path: repo.clone(), group: None }).await;
     let projects = expect_projects(c).await;
     assert_eq!(projects.len(), 1);
     let p = &projects[0];
@@ -129,7 +133,7 @@ async fn git_project_and_worktree_lifecycle() {
     let pid = p.id;
 
     // Adding the same path again does not duplicate.
-    send(c, ClientMsg::AddProject { path: repo.clone() }).await;
+    send(c, ClientMsg::AddProject { path: repo.clone(), group: None }).await;
     assert_eq!(expect_projects(c).await.len(), 1);
 
     send(c, ClientMsg::CreateWorktree { project_id: pid, name: "feat-a".into(), base: None }).await;
@@ -184,7 +188,7 @@ async fn git_project_and_worktree_lifecycle() {
     while !removed || projects.is_none() {
         match recv(c).await {
             ServerMsg::TerminalRemoved { id } if id == term.id => removed = true,
-            ServerMsg::Projects(p) => projects = Some(p),
+            ServerMsg::Projects { projects: p, .. } => projects = Some(p),
             ServerMsg::OpFailed { message, .. } => panic!("remove failed: {message}"),
             _ => {}
         }
@@ -205,7 +209,8 @@ async fn git_project_and_worktree_lifecycle() {
     send(c, ClientMsg::RemoveProject { id: pid }).await;
     assert!(expect_projects(c).await.is_empty());
     let json = std::fs::read_to_string(cfg.join("sich").join("projects.json")).unwrap();
-    assert_eq!(json.trim().replace(char::is_whitespace, ""), "[]");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["projects"], serde_json::json!([]));
     assert!(repo.is_dir(), "RemoveProject must not touch the disk");
 
     h.stop().await;
@@ -231,7 +236,7 @@ async fn non_git_folder_project() {
     let mut h = start("plain").await;
     let c = &mut h.conn;
 
-    send(c, ClientMsg::AddProject { path: folder.clone() }).await;
+    send(c, ClientMsg::AddProject { path: folder.clone(), group: None }).await;
     let projects = expect_projects(c).await;
     assert_eq!(projects.len(), 1);
     let p = &projects[0];
@@ -252,6 +257,192 @@ async fn non_git_folder_project() {
     assert_eq!(projects[0].error.as_deref(), Some("Folder not found"));
     assert!(projects[0].worktrees.is_empty());
 
+    h.stop().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Sets the isolated env for a groups test and returns (tmp, cfg dir).
+fn isolate(tag: &str) -> (PathBuf, PathBuf) {
+    let tmp = temp_dir(tag);
+    let cfg = tmp.join("cfg");
+    // SAFETY: callers hold SERIAL.
+    unsafe {
+        std::env::set_var("SICH_CONFIG_DIR", &cfg);
+        std::env::set_var("SICH_WORKTREE_ROOT", tmp.join("wt"));
+    }
+    (tmp, cfg)
+}
+
+fn folder(tmp: &Path, name: &str) -> PathBuf {
+    let f = tmp.join(name);
+    std::fs::create_dir_all(&f).unwrap();
+    f
+}
+
+fn gid(groups: &[GroupInfo], name: &str) -> u64 {
+    groups.iter().find(|g| g.name == name).unwrap_or_else(|| panic!("no group {name}")).id
+}
+
+fn pgroup(projects: &[ProjectInfo], name: &str) -> Option<u64> {
+    projects.iter().find(|p| p.name == name).unwrap().group
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_lifecycle() {
+    let _guard = SERIAL.lock().await;
+    let (tmp, _cfg) = isolate("groups");
+    let (fa, fb) = (folder(&tmp, "alpha"), folder(&tmp, "beta"));
+    let mut h = start("groups").await;
+    let c = &mut h.conn;
+
+    // Create (name trimmed), order = creation order.
+    send(c, ClientMsg::CreateGroup { name: "  game ".into() }).await;
+    let (_, groups) = expect_state(c).await;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "game");
+    send(c, ClientMsg::CreateGroup { name: "web".into() }).await;
+    let (_, groups) = expect_state(c).await;
+    assert_eq!(groups.iter().map(|g| g.name.as_str()).collect::<Vec<_>>(), ["game", "web"]);
+    let (game, web) = (gid(&groups, "game"), gid(&groups, "web"));
+
+    // Add into a group / ungrouped.
+    send(c, ClientMsg::AddProject { path: fa.clone(), group: Some(game) }).await;
+    let (projects, _) = expect_state(c).await;
+    assert_eq!(pgroup(&projects, "alpha"), Some(game));
+    send(c, ClientMsg::AddProject { path: fb.clone(), group: None }).await;
+    let (projects, _) = expect_state(c).await;
+    assert_eq!(projects.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["alpha", "beta"]);
+    assert_eq!(pgroup(&projects, "beta"), None);
+    let (alpha, beta) = (projects[0].id, projects[1].id);
+
+    // Move between groups and to None.
+    send(c, ClientMsg::SetProjectGroup { project_id: alpha, group: Some(web) }).await;
+    assert_eq!(pgroup(&expect_projects(c).await, "alpha"), Some(web));
+    send(c, ClientMsg::SetProjectGroup { project_id: beta, group: Some(web) }).await;
+    assert_eq!(pgroup(&expect_projects(c).await, "beta"), Some(web));
+    send(c, ClientMsg::SetProjectGroup { project_id: alpha, group: None }).await;
+    assert_eq!(pgroup(&expect_projects(c).await, "alpha"), None);
+
+    // ListProjects replies with groups too.
+    send(c, ClientMsg::ListProjects).await;
+    let (_, groups) = expect_state(c).await;
+    assert_eq!(groups.len(), 2);
+
+    // Rename: new name, same name of itself with another case; to a taken name fails.
+    send(c, ClientMsg::RenameGroup { id: web, name: "frontend".into() }).await;
+    let (_, groups) = expect_state(c).await;
+    assert_eq!(gid(&groups, "frontend"), web);
+    send(c, ClientMsg::RenameGroup { id: web, name: "FRONTEND".into() }).await;
+    let (_, groups) = expect_state(c).await;
+    assert_eq!(gid(&groups, "FRONTEND"), web);
+    send(c, ClientMsg::RenameGroup { id: web, name: "Game".into() }).await;
+    expect_failed(c).await;
+    send(c, ClientMsg::RenameGroup { id: web, name: "   ".into() }).await;
+    expect_failed(c).await;
+
+    // Remove group: projects stay, ungrouped; ids are not reused.
+    send(c, ClientMsg::RemoveGroup { id: web }).await;
+    let (projects, groups) = expect_state(c).await;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(projects.len(), 2);
+    assert_eq!(pgroup(&projects, "beta"), None);
+    send(c, ClientMsg::CreateGroup { name: "again".into() }).await;
+    let (_, groups) = expect_state(c).await;
+    assert!(gid(&groups, "again") > web);
+
+    h.stop().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_errors_change_nothing() {
+    let _guard = SERIAL.lock().await;
+    let (tmp, _cfg) = isolate("grouperr");
+    let fa = folder(&tmp, "alpha");
+    let mut h = start("grouperr").await;
+    let c = &mut h.conn;
+
+    send(c, ClientMsg::CreateGroup { name: "".into() }).await;
+    expect_failed(c).await;
+    send(c, ClientMsg::CreateGroup { name: "  ".into() }).await;
+    expect_failed(c).await;
+    send(c, ClientMsg::CreateGroup { name: "Game".into() }).await;
+    let (_, groups) = expect_state(c).await;
+    let game = gid(&groups, "Game");
+    send(c, ClientMsg::CreateGroup { name: "gAME".into() }).await;
+    expect_failed(c).await;
+
+    // Unknown group on AddProject: fails and the project is not added.
+    send(c, ClientMsg::AddProject { path: fa.clone(), group: Some(999) }).await;
+    expect_failed(c).await;
+    send(c, ClientMsg::ListProjects).await;
+    let (projects, groups) = expect_state(c).await;
+    assert!(projects.is_empty());
+    assert_eq!(groups.len(), 1);
+
+    send(c, ClientMsg::AddProject { path: fa.clone(), group: Some(game) }).await;
+    let (projects, _) = expect_state(c).await;
+    let alpha = projects[0].id;
+
+    send(c, ClientMsg::SetProjectGroup { project_id: alpha, group: Some(999) }).await;
+    expect_failed(c).await;
+    send(c, ClientMsg::SetProjectGroup { project_id: 999, group: Some(game) }).await;
+    expect_failed(c).await;
+    send(c, ClientMsg::RenameGroup { id: 999, name: "x".into() }).await;
+    expect_failed(c).await;
+    send(c, ClientMsg::RemoveGroup { id: 999 }).await;
+    expect_failed(c).await;
+
+    send(c, ClientMsg::ListProjects).await;
+    let (projects, groups) = expect_state(c).await;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(pgroup(&projects, "alpha"), Some(game));
+
+    h.stop().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn groups_persist_across_restart() {
+    let _guard = SERIAL.lock().await;
+    let (tmp, _cfg) = isolate("grouppersist");
+    let fa = folder(&tmp, "alpha");
+    let mut h = start("grouppersist1").await;
+    let c = &mut h.conn;
+    send(c, ClientMsg::CreateGroup { name: "game".into() }).await;
+    let (_, groups) = expect_state(c).await;
+    let game = gid(&groups, "game");
+    send(c, ClientMsg::AddProject { path: fa.clone(), group: Some(game) }).await;
+    expect_projects(c).await;
+    h.stop().await;
+
+    let mut h = start("grouppersist2").await;
+    let c = &mut h.conn;
+    send(c, ClientMsg::ListProjects).await;
+    let (projects, groups) = expect_state(c).await;
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].id, game);
+    assert_eq!(pgroup(&projects, "alpha"), Some(game));
+    h.stop().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn legacy_projects_file_loads() {
+    let _guard = SERIAL.lock().await;
+    let (tmp, cfg) = isolate("grouplegacy");
+    let fa = folder(&tmp, "alpha");
+    std::fs::create_dir_all(cfg.join("sich")).unwrap();
+    let legacy = serde_json::json!([{ "id": 4, "name": "alpha", "path": fa }]);
+    std::fs::write(cfg.join("sich").join("projects.json"), legacy.to_string()).unwrap();
+    let mut h = start("grouplegacy").await;
+    let c = &mut h.conn;
+    send(c, ClientMsg::ListProjects).await;
+    let (projects, groups) = expect_state(c).await;
+    assert!(groups.is_empty());
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].id, 4);
+    assert_eq!(projects[0].group, None);
     h.stop().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }

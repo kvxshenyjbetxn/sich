@@ -157,10 +157,16 @@ async fn handle_msg(msg: ClientMsg, mgr: &Arc<Manager>, conn: &ConnHandle) {
             mgr.kill(id);
         }
         ClientMsg::ListProjects => {
-            conn.send(ServerMsg::Projects(projects::list(mgr).await));
+            conn.send(projects::list(mgr).await);
         }
         ClientMsg::RefreshProjects => projects::broadcast(mgr).await,
-        ClientMsg::AddProject { path } => projects::add_project(mgr, conn, path).await,
+        ClientMsg::AddProject { path, group } => projects::add_project(mgr, conn, path, group).await,
+        ClientMsg::CreateGroup { name } => projects::create_group(mgr, conn, name).await,
+        ClientMsg::RenameGroup { id, name } => projects::rename_group(mgr, conn, id, name).await,
+        ClientMsg::RemoveGroup { id } => projects::remove_group(mgr, conn, id).await,
+        ClientMsg::SetProjectGroup { project_id, group } => {
+            projects::set_project_group(mgr, conn, project_id, group).await
+        }
         ClientMsg::RemoveProject { id } => projects::remove_project(mgr, id).await,
         ClientMsg::CreateWorktree { project_id, name, base } => {
             projects::create_worktree(mgr, conn, project_id, name, base).await;

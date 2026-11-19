@@ -12,11 +12,13 @@ use gpui_kit::{
     IntoElement, MouseButton, ParentElement as _, PathPromptOptions, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use sich_proto::{ProjectId, ProjectInfo, TermId, TerminalInfo, WorktreeInfo};
+use sich_proto::{GroupId, GroupInfo, ProjectId, ProjectInfo, TermId, TerminalInfo, WorktreeInfo};
 
 use crate::agent_badge::{Badge, badge_element, badge_for, rollup};
 use crate::app_view::AppView;
 use crate::daemon_client::Snapshot;
+use crate::group_dialogs;
+use crate::groups::{group_badge, group_projects};
 use crate::i18n::{Language, Tr, tr};
 use crate::os;
 use crate::tab_bar::{entry_title, tab_label};
@@ -81,11 +83,12 @@ struct ProjectRef {
     name: String,
     path: PathBuf,
     is_git: bool,
+    group: Option<GroupId>,
 }
 
 impl ProjectRef {
     fn of(p: &ProjectInfo) -> Self {
-        Self { id: p.id, name: p.name.clone(), path: p.path.clone(), is_git: p.is_git }
+        Self { id: p.id, name: p.name.clone(), path: p.path.clone(), is_git: p.is_git, group: p.group }
     }
 }
 
@@ -93,7 +96,20 @@ fn copy_path(path: PathBuf) -> impl Fn(&ClickEvent, &mut gpui_kit::Window, &mut 
     move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()))
 }
 
-fn project_menu(menu: PopupMenu, app: &Entity<AppView>, p: &ProjectRef, lang: Language) -> PopupMenu {
+/// Groups a project can be moved to: every group except its current one.
+pub fn move_targets(groups: &[GroupInfo], current: Option<GroupId>) -> Vec<&GroupInfo> {
+    groups.iter().filter(|g| Some(g.id) != current).collect()
+}
+
+fn project_menu(
+    menu: PopupMenu,
+    app: &Entity<AppView>,
+    p: &ProjectRef,
+    groups: &[GroupInfo],
+    lang: Language,
+    window: &mut gpui_kit::Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
     let mut menu = menu;
     if p.is_git {
         let (app, p) = (app.clone(), p.clone());
@@ -101,6 +117,26 @@ fn project_menu(menu: PopupMenu, app: &Entity<AppView>, p: &ProjectRef, lang: La
             move |_, window, cx| {
                 worktree_dialogs::open_new_worktree(app.clone(), p.id, p.name.clone(), window, cx)
             },
+        ));
+    }
+    let targets: Vec<GroupInfo> = move_targets(groups, p.group).into_iter().cloned().collect();
+    if !targets.is_empty() {
+        let (app, pid) = (app.clone(), p.id);
+        menu = menu.submenu(tr(lang, Tr::MoveToGroup), window, cx, move |m, _w, _cx| {
+            let mut m = m;
+            for g in &targets {
+                let (app, gid) = (app.clone(), g.id);
+                m = m.item(PopupMenuItem::new(format!("\u{2192} {}", g.name)).on_click(
+                    move |_, _, cx| app.read(cx).client.set_project_group(pid, Some(gid)),
+                ));
+            }
+            m
+        });
+    }
+    if p.group.is_some() {
+        let (app, pid) = (app.clone(), p.id);
+        menu = menu.item(PopupMenuItem::new(tr(lang, Tr::RemoveFromGroup)).on_click(
+            move |_, _, cx| app.read(cx).client.set_project_group(pid, None),
         ));
     }
     let refresh = app.clone();
@@ -116,6 +152,21 @@ fn project_menu(menu: PopupMenu, app: &Entity<AppView>, p: &ProjectRef, lang: La
     .separator()
     .item(PopupMenuItem::new(tr(lang, Tr::RemoveProject)).on_click(move |_, window, cx| {
         worktree_dialogs::open_remove_project(remove.0.clone(), remove.1.id, remove.1.name.clone(), window, cx)
+    }))
+}
+
+fn group_menu(menu: PopupMenu, app: &Entity<AppView>, g: &GroupInfo, lang: Language) -> PopupMenu {
+    let (add, rename, delete) = (app.clone(), app.clone(), app.clone());
+    let (gid, rename_name, delete_name) = (g.id, g.name.clone(), g.name.clone());
+    menu.item(PopupMenuItem::new(tr(lang, Tr::AddProject)).on_click(move |_, _, cx| {
+        add.update(cx, |this, cx| this.pick_project(Some(gid), cx))
+    }))
+    .item(PopupMenuItem::new(tr(lang, Tr::RenameGroup)).on_click(move |_, window, cx| {
+        group_dialogs::open_rename_group(rename.clone(), gid, rename_name.clone(), window, cx)
+    }))
+    .separator()
+    .item(PopupMenuItem::new(tr(lang, Tr::DeleteGroup)).on_click(move |_, window, cx| {
+        group_dialogs::open_delete_group(delete.clone(), gid, delete_name.clone(), window, cx)
     }))
 }
 
@@ -174,8 +225,8 @@ fn row_base(
 }
 
 impl AppView {
-    /// Opens the native folder picker and adds the chosen folder as a project.
-    pub(crate) fn pick_project(&mut self, cx: &mut Context<Self>) {
+    /// Opens the native folder picker and adds the chosen folder as a project (into `group`).
+    pub(crate) fn pick_project(&mut self, group: Option<GroupId>, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
@@ -185,7 +236,7 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(path) = paths.into_iter().next() {
-                    let _ = this.update(cx, |this, _| this.client.add_project(path));
+                    let _ = this.update(cx, |this, _| this.client.add_project(path, group));
                 }
             }
         })
@@ -217,13 +268,24 @@ impl AppView {
                     .text_color(muted)
                     .child(tr(lang, Tr::Projects).to_uppercase()),
             )
+            .child({
+                let app = app.clone();
+                Button::new("new-group")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(Ic::FolderPlus))
+                    .tooltip(tr(lang, Tr::NewGroup))
+                    .on_click(move |_, window, cx| {
+                        group_dialogs::open_create_group(app.clone(), window, cx)
+                    })
+            })
             .child(
                 Button::new("add-project")
                     .ghost()
                     .xsmall()
                     .icon(Icon::new(Ic::Plus))
                     .tooltip(tr(lang, Tr::AddProject))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| this.pick_project(cx))),
+                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| this.pick_project(None, cx))),
             )
             .child(
                 Button::new("refresh-projects")
@@ -258,7 +320,7 @@ impl AppView {
 
         let mut body = v_flex().id("sidebar-body").flex_1().min_h_0().overflow_y_scroll().child(home);
 
-        if self.projects.is_empty() {
+        if self.projects.is_empty() && self.groups.is_empty() {
             body = body.child(
                 v_flex()
                     .px_3()
@@ -270,13 +332,17 @@ impl AppView {
                         Button::new("add-project-empty")
                             .small()
                             .label(tr(lang, Tr::AddProject))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| this.pick_project(cx))),
+                            .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| this.pick_project(None, cx))),
                     ),
             );
         }
 
-        for project in &self.projects {
-            body = body.child(self.render_project(project, snap, infos, lang, &app, cx));
+        let (grouped, ungrouped) = group_projects(&self.projects, &self.groups);
+        for (group, projects) in &grouped {
+            body = body.child(self.render_group(group, projects, snap, infos, lang, &app, cx));
+        }
+        for project in ungrouped {
+            body = body.child(self.render_project(project, 0., snap, infos, lang, &app, cx));
         }
 
         v_flex()
@@ -292,9 +358,90 @@ impl AppView {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn render_group(
+        &self,
+        group: &GroupInfo,
+        projects: &[&ProjectInfo],
+        snap: &Snapshot,
+        infos: &[TerminalInfo],
+        lang: Language,
+        app: &Entity<AppView>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let gid = group.id;
+        let expanded = !self.collapsed_groups.contains(&gid);
+        let hover_group = SharedString::from(format!("group-{gid}"));
+
+        let (add_app, menu_app, ctx_app) = (app.clone(), app.clone(), app.clone());
+        let (menu_g, ctx_g) = (group.clone(), group.clone());
+        let actions = h_flex()
+            .gap_0p5()
+            .invisible()
+            .group_hover(hover_group.clone(), |s| s.visible())
+            .child(
+                Button::new(("group-add", gid))
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(Ic::Plus))
+                    .tooltip(tr(lang, Tr::AddProjectToGroup))
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        add_app.update(cx, |this, cx| this.pick_project(Some(gid), cx))
+                    }),
+            )
+            .child(
+                Button::new(("group-more", gid))
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(Ic::Ellipsis))
+                    .tooltip(tr(lang, Tr::MoreActions))
+                    .dropdown_menu(move |menu, _w, _cx| group_menu(menu, &menu_app, &menu_g, lang)),
+            );
+
+        let badge = if expanded { None } else { group_badge(projects, infos) };
+        let row = row_base(("group", gid), false, 0., &theme)
+            .group(hover_group)
+            .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
+                if !this.collapsed_groups.remove(&gid) {
+                    this.collapsed_groups.insert(gid);
+                }
+                cx.notify();
+            }))
+            .child(
+                Icon::new(if expanded { Ic::ChevronDown } else { Ic::ChevronRight })
+                    .small()
+                    .text_color(muted),
+            )
+            .child(Icon::new(Ic::Layers).small().text_color(muted))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .child(group.name.clone()),
+            )
+            .children(badge.map(|b| badge_element(&b, lang, ("group-agent", gid), cx)))
+            .child(actions)
+            .context_menu(move |menu, _w, _cx| group_menu(menu, &ctx_app, &ctx_g, lang));
+
+        let mut col = v_flex().child(row);
+        if expanded {
+            for p in projects {
+                col = col.child(self.render_project(p, INDENT, snap, infos, lang, app, cx));
+            }
+        }
+        col
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_project(
         &self,
         project: &ProjectInfo,
+        base: f32,
         snap: &Snapshot,
         infos: &[TerminalInfo],
         lang: Language,
@@ -323,19 +470,21 @@ impl AppView {
                     }),
             );
         }
-        let (menu_app, menu_p) = (app.clone(), pref.clone());
+        let (menu_app, menu_p, menu_groups) = (app.clone(), pref.clone(), self.groups.clone());
         actions = actions.child(
             Button::new(("proj-more", pid))
                 .ghost()
                 .xsmall()
                 .icon(Icon::new(Ic::Ellipsis))
                 .tooltip(tr(lang, Tr::MoreActions))
-                .dropdown_menu(move |menu, _w, _cx| project_menu(menu, &menu_app, &menu_p, lang)),
+                .dropdown_menu(move |menu, w, cx| {
+                    project_menu(menu, &menu_app, &menu_p, &menu_groups, lang, w, cx)
+                }),
         );
 
         let collapsed_badge = if expanded { None } else { project_badge(project, infos) };
-        let (ctx_app, ctx_p) = (app.clone(), pref.clone());
-        let row = row_base(("proj", pid), false, 0., &theme)
+        let (ctx_app, ctx_p, ctx_groups) = (app.clone(), pref.clone(), self.groups.clone());
+        let row = row_base(("proj", pid), false, base, &theme)
             .group(group)
             .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
                 if !this.collapsed.remove(&pid) {
@@ -360,13 +509,15 @@ impl AppView {
             )
             .children(collapsed_badge.map(|b| badge_element(&b, lang, ("proj-agent", pid), cx)))
             .child(actions)
-            .context_menu(move |menu, _w, _cx| project_menu(menu, &ctx_app, &ctx_p, lang));
+            .context_menu(move |menu, w, cx| {
+                project_menu(menu, &ctx_app, &ctx_p, &ctx_groups, lang, w, cx)
+            });
 
         let mut col = v_flex().child(row);
         if let Some(err) = &project.error {
             col = col.child(
                 div()
-                    .pl(px(8. + INDENT + 4.))
+                    .pl(px(8. + base + INDENT + 4.))
                     .pr_2()
                     .pb_1()
                     .text_size(px(12.))
@@ -375,7 +526,7 @@ impl AppView {
             );
         } else if expanded {
             for w in &project.worktrees {
-                col = col.child(self.render_worktree(pid, w, snap, infos, lang, app, cx));
+                col = col.child(self.render_worktree(pid, w, base, snap, infos, lang, app, cx));
             }
         }
         col
@@ -386,6 +537,7 @@ impl AppView {
         &self,
         project_id: ProjectId,
         w: &WorktreeInfo,
+        base: f32,
         snap: &Snapshot,
         infos: &[TerminalInfo],
         lang: Language,
@@ -409,7 +561,7 @@ impl AppView {
         };
         let uid = SharedString::from(crate::workspace::normalize_path(&w.path));
 
-        let mut row = row_base(SharedString::from(format!("wt:{uid}")), selected, INDENT, &theme)
+        let mut row = row_base(SharedString::from(format!("wt:{uid}")), selected, base + INDENT, &theme)
             .group(group.clone())
             .on_click({
                 let key = key.clone();
@@ -453,7 +605,7 @@ impl AppView {
         }
         let (ctx_app, is_main) = (app.clone(), w.is_main);
         let row = row.context_menu(move |menu, _w, _cx| worktree_menu(menu, &ctx_app, &wref, is_main, lang));
-        v_flex().child(row).children(self.render_term_rows(&key, &sub, INDENT * 2., snap, lang, cx))
+        v_flex().child(row).children(self.render_term_rows(&key, &sub, base + INDENT * 2., snap, lang, cx))
     }
 
     /// Nested terminal rows under a workspace row (empty `ids` renders nothing).
@@ -634,6 +786,20 @@ mod tests {
     }
 
     #[test]
+    fn move_targets_exclude_current_group() {
+        let groups = vec![
+            GroupInfo { id: 1, name: "a".into() },
+            GroupInfo { id: 2, name: "b".into() },
+        ];
+        assert_eq!(move_targets(&groups, None).len(), 2);
+        let t = move_targets(&groups, Some(1));
+        assert_eq!(t.iter().map(|g| g.id).collect::<Vec<_>>(), [2]);
+        assert!(move_targets(&groups[..1], Some(1)).is_empty());
+        // An unknown current group excludes nothing.
+        assert_eq!(move_targets(&groups, Some(9)).len(), 2);
+    }
+
+    #[test]
     fn project_badge_covers_all_its_worktrees() {
         let project = ProjectInfo {
             id: 1,
@@ -642,6 +808,7 @@ mod tests {
             is_git: true,
             worktrees: vec![wt("/w/a", None), wt("/w/a-x", None)],
             error: None,
+            group: None,
         };
         let infos = vec![
             term(1, Some("/w/a"), Some((AgentState::Done, true))),

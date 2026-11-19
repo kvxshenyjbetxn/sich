@@ -144,7 +144,13 @@ async fn session(
                         worktree,
                     },
                     Cmd::RefreshProjects => ClientMsg::RefreshProjects,
-                    Cmd::AddProject(path) => ClientMsg::AddProject { path },
+                    Cmd::AddProject { path, group } => ClientMsg::AddProject { path, group },
+                    Cmd::CreateGroup(name) => ClientMsg::CreateGroup { name },
+                    Cmd::RenameGroup(id, name) => ClientMsg::RenameGroup { id, name },
+                    Cmd::RemoveGroup(id) => ClientMsg::RemoveGroup { id },
+                    Cmd::SetProjectGroup { project_id, group } => {
+                        ClientMsg::SetProjectGroup { project_id, group }
+                    }
                     Cmd::RemoveProject(id) => ClientMsg::RemoveProject { id },
                     Cmd::CreateWorktree { project_id, name, base } => {
                         ClientMsg::CreateWorktree { project_id, name, base }
@@ -243,9 +249,10 @@ impl Conn {
                 }
                 return Ok(out);
             }
-            ServerMsg::Projects(list) => {
+            ServerMsg::Projects { projects, groups } => {
                 let mut st = self.state.lock();
-                st.projects = list;
+                st.projects = projects;
+                st.groups = groups;
                 st.projects_rev += 1;
             }
             ServerMsg::OpFailed { op, message } => {

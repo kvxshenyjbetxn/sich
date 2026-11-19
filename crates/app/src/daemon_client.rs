@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::Mutex;
-use sich_proto::{ProjectId, ProjectInfo, TermId, TerminalInfo};
+use sich_proto::{GroupId, GroupInfo, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use sich_term::TermSession;
 use tokio::runtime::Handle;
@@ -44,6 +44,7 @@ pub(crate) struct ClientState {
     pub synced: bool,
     pub daemon_pid: Option<u32>,
     pub projects: Vec<ProjectInfo>,
+    pub groups: Vec<GroupInfo>,
     /// Incremented on every `Projects` message (0 = none received yet).
     pub projects_rev: u64,
     /// Last `OpFailed` from the daemon: (op, message, when).
@@ -56,7 +57,11 @@ pub(crate) enum Cmd {
     Reconnect,
     Create { cols: u16, rows: u16, worktree: Option<PathBuf> },
     RefreshProjects,
-    AddProject(PathBuf),
+    AddProject { path: PathBuf, group: Option<GroupId> },
+    CreateGroup(String),
+    RenameGroup(GroupId, String),
+    RemoveGroup(GroupId),
+    SetProjectGroup { project_id: ProjectId, group: Option<GroupId> },
     RemoveProject(ProjectId),
     CreateWorktree { project_id: ProjectId, name: String, base: Option<String> },
     RemoveWorktree { project_id: ProjectId, path: PathBuf, force: bool, delete_branch: bool },
@@ -90,6 +95,7 @@ impl DaemonClient {
             synced: false,
             daemon_pid: None,
             projects: Vec::new(),
+            groups: Vec::new(),
             projects_rev: 0,
             last_error: None,
         }));
@@ -115,9 +121,9 @@ impl DaemonClient {
     }
 
     /// Projects plus the revision counter (changes on every `Projects` message).
-    pub fn projects_with_rev(&self) -> (u64, Vec<ProjectInfo>) {
+    pub fn projects_with_rev(&self) -> (u64, Vec<ProjectInfo>, Vec<GroupInfo>) {
         let st = self.state.lock();
-        (st.projects_rev, st.projects.clone())
+        (st.projects_rev, st.projects.clone(), st.groups.clone())
     }
 
     /// Kills the incompatible daemon (by `pid`, else by scanning processes), starts a new one
@@ -146,8 +152,24 @@ impl DaemonClient {
         let _ = self.cmd_tx.send(Cmd::RefreshProjects);
     }
 
-    pub fn add_project(&self, path: PathBuf) {
-        let _ = self.cmd_tx.send(Cmd::AddProject(path));
+    pub fn add_project(&self, path: PathBuf, group: Option<GroupId>) {
+        let _ = self.cmd_tx.send(Cmd::AddProject { path, group });
+    }
+
+    pub fn create_group(&self, name: String) {
+        let _ = self.cmd_tx.send(Cmd::CreateGroup(name));
+    }
+
+    pub fn rename_group(&self, id: GroupId, name: String) {
+        let _ = self.cmd_tx.send(Cmd::RenameGroup(id, name));
+    }
+
+    pub fn remove_group(&self, id: GroupId) {
+        let _ = self.cmd_tx.send(Cmd::RemoveGroup(id));
+    }
+
+    pub fn set_project_group(&self, project_id: ProjectId, group: Option<GroupId>) {
+        let _ = self.cmd_tx.send(Cmd::SetProjectGroup { project_id, group });
     }
 
     pub fn remove_project(&self, id: ProjectId) {

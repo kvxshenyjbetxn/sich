@@ -5,7 +5,7 @@ mod msg;
 
 pub use codec::{CodecError, MAX_FRAME_LEN, decode, encode, frame_codec};
 pub use msg::{
-    AgentKind, AgentState, AgentStatus, ClientMsg, MAX_OUTPUT_CHUNK, PROTO_VERSION, ProjectId, ProjectInfo, ServerMsg, TermId,
+    AgentKind, AgentState, AgentStatus, ClientMsg, GroupId, GroupInfo, MAX_OUTPUT_CHUNK, PROTO_VERSION, ProjectId, ProjectInfo, ServerMsg, TermId,
     TerminalInfo, WorktreeInfo,
 };
 

@@ -2,13 +2,14 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTO_VERSION: u32 = 3;
+pub const PROTO_VERSION: u32 = 4;
 
 /// Maximum payload of a single `ServerMsg::Output` frame.
 pub const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
 
 pub type TermId = u64;
 pub type ProjectId = u64;
+pub type GroupId = u64;
 
 // Version handshake rule (forever): `ClientMsg::Hello` and `ServerMsg::Welcome` must stay the
 // FIRST variants of their enums with unchanged fields, so any version can decode them, and
@@ -35,7 +36,7 @@ pub enum ClientMsg {
     KillTerminal { id: TermId },
     ListProjects,
     RefreshProjects,
-    AddProject { path: PathBuf },
+    AddProject { path: PathBuf, group: Option<GroupId> },
     RemoveProject { id: ProjectId },
     CreateWorktree { project_id: ProjectId, name: String, base: Option<String> },
     RemoveWorktree { project_id: ProjectId, path: PathBuf, force: bool, delete_branch: bool },
@@ -44,6 +45,11 @@ pub enum ClientMsg {
     /// The user has looked at the terminal: clears `unread` (Done becomes Idle).
     MarkSeen { id: TermId },
     Shutdown,
+    CreateGroup { name: String },
+    RenameGroup { id: GroupId, name: String },
+    /// Projects inside become ungrouped.
+    RemoveGroup { id: GroupId },
+    SetProjectGroup { project_id: ProjectId, group: Option<GroupId> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +66,7 @@ pub enum ServerMsg {
     /// `seq` is the byte offset of the first byte of the chunk.
     Output { id: TermId, seq: u64, bytes: Vec<u8> },
     /// Reply to `ListProjects`; also broadcast to all clients after any project change/refresh.
-    Projects(Vec<ProjectInfo>),
+    Projects { projects: Vec<ProjectInfo>, groups: Vec<GroupInfo> },
     /// User-facing failure of an operation; sent only to the requesting connection.
     OpFailed { op: String, message: String },
     /// Broadcast to all clients; `None` = no agent in the terminal (any more).
@@ -124,6 +130,13 @@ pub struct ProjectInfo {
     pub worktrees: Vec<WorktreeInfo>,
     /// E.g. "Folder not found".
     pub error: Option<String>,
+    pub group: Option<GroupId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupInfo {
+    pub id: GroupId,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

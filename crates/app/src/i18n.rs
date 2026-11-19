@@ -86,6 +86,15 @@ pub enum Tr {
     TrackClaudeHooks,
     HooksNotInstalled,
     HooksWorking,
+    NewGroup,
+    GroupName,
+    RenameGroup,
+    Rename,
+    DeleteGroup,
+    DeleteGroupConfirm,
+    AddProjectToGroup,
+    MoveToGroup,
+    RemoveFromGroup,
 }
 
 impl Tr {
@@ -136,6 +145,15 @@ impl Tr {
         Tr::TrackClaudeHooks,
         Tr::HooksNotInstalled,
         Tr::HooksWorking,
+        Tr::NewGroup,
+        Tr::GroupName,
+        Tr::RenameGroup,
+        Tr::Rename,
+        Tr::DeleteGroup,
+        Tr::DeleteGroupConfirm,
+        Tr::AddProjectToGroup,
+        Tr::MoveToGroup,
+        Tr::RemoveFromGroup,
     ];
 }
 
@@ -362,6 +380,51 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "Обновление\u{2026}",
             En => "Updating\u{2026}",
         },
+        Tr::NewGroup => match lang {
+            Uk => "Нова група",
+            Ru => "Новая группа",
+            En => "New group",
+        },
+        Tr::GroupName => match lang {
+            Uk => "Назва групи",
+            Ru => "Название группы",
+            En => "Group name",
+        },
+        Tr::RenameGroup => match lang {
+            Uk => "Перейменувати групу",
+            Ru => "Переименовать группу",
+            En => "Rename group",
+        },
+        Tr::Rename => match lang {
+            Uk => "Перейменувати",
+            Ru => "Переименовать",
+            En => "Rename",
+        },
+        Tr::DeleteGroup => match lang {
+            Uk => "Видалити групу",
+            Ru => "Удалить группу",
+            En => "Delete group",
+        },
+        Tr::DeleteGroupConfirm => match lang {
+            Uk => "Проєкти залишаться, вони лише вийдуть із групи.",
+            Ru => "Проекты останутся, они лишь выйдут из группы.",
+            En => "Projects stay, they just leave the group.",
+        },
+        Tr::AddProjectToGroup => match lang {
+            Uk => "Додати проєкт до групи",
+            Ru => "Добавить проект в группу",
+            En => "Add project to group",
+        },
+        Tr::MoveToGroup => match lang {
+            Uk => "Перемістити до групи",
+            Ru => "Переместить в группу",
+            En => "Move to group",
+        },
+        Tr::RemoveFromGroup => match lang {
+            Uk => "Прибрати з групи",
+            Ru => "Убрать из группы",
+            En => "Remove from group",
+        },
     }
 }
 
@@ -419,6 +482,15 @@ pub fn also_delete_branch(lang: Language, name: &str) -> String {
         Language::Uk => format!("Також видалити гілку \u{ab}{name}\u{bb}"),
         Language::Ru => format!("Также удалить ветку \u{ab}{name}\u{bb}"),
         Language::En => format!("Also delete branch \u{ab}{name}\u{bb}"),
+    }
+}
+
+pub fn delete_group_text(lang: Language, name: &str) -> String {
+    let note = tr(lang, Tr::DeleteGroupConfirm);
+    match lang {
+        Language::Uk => format!("Видалити групу \u{ab}{name}\u{bb}? {note}"),
+        Language::Ru => format!("Удалить группу \u{ab}{name}\u{bb}? {note}"),
+        Language::En => format!("Delete group \u{ab}{name}\u{bb}? {note}"),
     }
 }
 
@@ -487,6 +559,7 @@ mod tests {
             assert!(remove_worktree_text(lang, "feat").contains("feat"));
             assert!(also_delete_branch(lang, "feat").contains("feat"));
             assert!(remove_project_text(lang, "proj").contains("proj"));
+            assert!(delete_group_text(lang, "grp").contains("grp"));
             assert!(new_worktree_title(lang, "proj").contains("proj"));
             assert!(daemon_incompatible(lang, Some(1), 2).contains("v1"));
             assert!(daemon_incompatible(lang, None, 2).contains("v2"));
