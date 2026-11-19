@@ -31,12 +31,12 @@ pub const SIDEBAR_W: f32 = 300.;
 const ROW_H: f32 = 28.;
 /// Height of a terminal row that shows an agent (title line + preview line).
 const AGENT_ROW_H: f32 = 44.;
-const BADGE_SLOT_W: f32 = 14.;
-const GLYPH_SLOT_W: f32 = 12.;
+/// Leading slot of an agent row: the status badge, or the agent glyph when there is no badge.
+const LEAD_SLOT_W: f32 = 14.;
 const ROW_GAP: f32 = 6.;
-/// Preview line indent: under the title (badge slot + glyph slot + two gaps).
-const PREVIEW_INDENT: f32 = BADGE_SLOT_W + GLYPH_SLOT_W + ROW_GAP * 2.;
-const INDENT: f32 = 20.;
+/// Preview line indent: under the title (lead slot + gap).
+const PREVIEW_INDENT: f32 = LEAD_SLOT_W + ROW_GAP;
+const INDENT: f32 = 14.;
 
 /// Branch name, or the folder name when detached / not a git project.
 pub fn worktree_label(w: &WorktreeInfo) -> String {
@@ -693,15 +693,15 @@ impl AppView {
                     .w_full()
                     .items_center()
                     .gap(px(ROW_GAP))
-                    .child(div().flex_shrink_0().w(px(BADGE_SLOT_W)).children(badge))
-                    .child(
-                        div()
+                    .child(match badge {
+                        Some(b) => div().flex_shrink_0().w(px(LEAD_SLOT_W)).child(b),
+                        None => div()
                             .flex_shrink_0()
-                            .w(px(GLYPH_SLOT_W))
+                            .w(px(LEAD_SLOT_W))
                             .text_size(px(13.))
                             .text_color(glyph_color)
                             .child(glyph),
-                    )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -727,17 +727,21 @@ impl AppView {
                             .child(relative_time(lang, now_unix_ms(), status.since_unix_ms)),
                     )
                     .child(close);
-                let line2 = div()
-                    .w_full()
-                    .pl(px(PREVIEW_INDENT))
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(11.5))
-                    .text_color(muted)
-                    .children(agent_preview(status));
+                // No preview -> keep the plain single-line height.
+                let line2 = agent_preview(status).map(|text| {
+                    div()
+                        .w_full()
+                        .pl(px(PREVIEW_INDENT))
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.5))
+                        .text_color(muted)
+                        .child(text)
+                });
+                let height = if line2.is_some() { AGENT_ROW_H } else { ROW_H };
                 Some(
-                    row.h(px(AGENT_ROW_H))
-                        .child(v_flex().flex_1().min_w_0().gap(px(2.)).child(line1).child(line2)),
+                    row.h(px(height))
+                        .child(v_flex().flex_1().min_w_0().gap(px(2.)).child(line1).children(line2)),
                 )
             })
             .collect()
