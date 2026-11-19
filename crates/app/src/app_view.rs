@@ -1,4 +1,4 @@
-//! Main window: sidebar (projects/worktrees), tab bar, active terminal, status line.
+//! Main window: projects, terminal tabs, right panel, and status line.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -6,23 +6,26 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use gpui_kit::assets::IconName as Ic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
-    CursorStyle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render, Styled as _, Window, WindowBounds,
+    CursorStyle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render,
+    StatefulInteractiveElement as _, Styled as _, Window, WindowBounds,
     div, px,
 };
 use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot};
+use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, MIN_RIGHT_W, clamp_right_w};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
 use crate::sidebar::{DEFAULT_SIDEBAR_W, clamp_sidebar_w};
-use crate::session::{self, SavedWindow, Session, SessionInput};
+use crate::session::{self, RightPanelState, RightTab, SavedWindow, Session, SessionInput};
 use crate::settings;
 use crate::settings_dialog;
 use crate::tray::{self, Tray, UiEvent};
@@ -103,6 +106,10 @@ pub struct AppView {
     pub(crate) sidebar_w: f32,
     /// The sidebar handle is being dragged.
     sidebar_dragging: bool,
+    git_panel: Entity<GitPanel>,
+    pub(crate) right_panel: RightPanelState,
+    right_dragging: bool,
+    hidden_to_tray: bool,
 }
 
 impl AppView {
@@ -117,6 +124,9 @@ impl AppView {
             .as_ref()
             .and_then(|s| s.sidebar_w)
             .map_or(DEFAULT_SIDEBAR_W, |w| clamp_sidebar_w(w, f32::INFINITY));
+        let mut right_panel = saved.as_ref().map_or_else(RightPanelState::default, |s| s.right_panel);
+        right_panel.width = right_panel.width.map(|width| clamp_right_w(width, f32::INFINITY, 0.));
+        let git_panel = cx.new(|_| GitPanel::new(right_panel.history_collapsed));
         let suppress_auto_create = saved.as_ref().is_some_and(Session::has_terminals);
         // Coalescing wake path: bounded(1), try_send never blocks.
         let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
@@ -193,6 +203,10 @@ impl AppView {
             save_scheduled: false,
             sidebar_w,
             sidebar_dragging: false,
+            git_panel,
+            right_panel,
+            right_dragging: false,
+            hidden_to_tray: false,
         }
     }
 
@@ -212,6 +226,13 @@ impl AppView {
     /// the native handle (taskbar flash, hide to tray), close interception, the tray icon and
     /// window-bounds tracking for the session.
     pub fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.observe(&self.git_panel, |this, panel, cx| {
+            let collapsed = panel.read(cx).history_collapsed();
+            if this.right_panel.history_collapsed != collapsed {
+                this.right_panel.history_collapsed = collapsed;
+                this.sidebar_changed(cx);
+            }
+        }).detach();
         self.window_active = window.is_window_active();
         self.hwnd = win_flash::hwnd_of(window);
         self.window_state = saved_window_of(window);
@@ -255,7 +276,11 @@ impl AppView {
             .detach();
         }
         cx.observe_window_activation(window, |this, window, cx| {
-            this.window_active = window.is_window_active();
+            let active = window.is_window_active();
+            if active {
+                this.git_panel.update(cx, GitPanel::refresh);
+            }
+            this.window_active = active;
             let snap = this.client.snapshot();
             this.track_agents(&snap);
             cx.notify();
@@ -309,6 +334,8 @@ impl AppView {
         if let Some(hwnd) = self.hwnd {
             win_show::show(hwnd);
         }
+        self.hidden_to_tray = false;
+        self.sync_right_worktree(cx);
         cx.activate(true);
         cx.notify();
     }
@@ -316,7 +343,11 @@ impl AppView {
     /// The window's close button / Alt+F4: hide to the tray, or quit.
     fn on_close_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.hwnd {
-            Some(hwnd) if self.tray.is_some() && settings::get(cx).close_to_tray => win_show::hide(hwnd),
+            Some(hwnd) if self.tray.is_some() && settings::get(cx).close_to_tray => {
+                self.hidden_to_tray = true;
+                self.sync_right_worktree(cx);
+                win_show::hide(hwnd);
+            }
             _ => self.request_quit(window, cx),
         }
     }
@@ -384,6 +415,7 @@ impl AppView {
             collapsed_groups: &self.collapsed_groups,
             window: self.window_state,
             sidebar_w: Some(self.sidebar_w),
+            right_panel: self.right_panel,
         })
     }
 
@@ -493,6 +525,7 @@ impl AppView {
             crate::groups::expand_to(&key, &self.projects, &mut self.collapsed, &mut self.collapsed_groups);
             settings::set_last_workspace(key.path().map(PathBuf::from), cx);
             self.ws.selected = key;
+            self.sync_right_worktree(cx);
         }
         cx.notify();
     }
@@ -580,6 +613,7 @@ impl AppView {
         }
         match ks.key.as_str() {
             "t" if m.shift => self.new_terminal_here(cx),
+            "g" if m.shift => self.toggle_right_panel(window, cx),
             "," if !m.shift => settings_dialog::open(window, cx),
             "tab" => self.cycle(if m.shift { -1 } else { 1 }, window, cx),
             _ => return,
@@ -697,6 +731,39 @@ impl AppView {
         v_flex().flex_1().min_w_0().h_full().child(tab_bar).child(content)
     }
 
+    fn render_right_panel(&self, width: f32, lang: i18n::Language, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let pane = match self.right_panel.tab {
+            RightTab::Git => self.git_panel.clone().into_any_element(),
+        };
+        let tabs = RightTab::ALL.iter().map(|&tab| {
+            let (id, icon, label) = match tab {
+                RightTab::Git => ("right-tab-git", Ic::GitBranch, Tr::Git),
+            };
+            let active = self.right_panel.tab == tab;
+            h_flex().id(id).h_full().px_3().gap_1().cursor_pointer().border_b_2()
+                .border_color(if active { theme.primary } else { theme.primary.opacity(0.) })
+                .bg(if active { theme.sidebar } else { theme.tab_bar })
+                .text_size(px(12.5))
+                .child(Icon::new(icon).size(px(14.)))
+                .child(tr(lang, label))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.right_panel.tab != tab {
+                        this.right_panel.tab = tab;
+                        this.sync_right_worktree(cx);
+                        this.sidebar_changed(cx);
+                    }
+                }))
+        });
+        v_flex().w(px(width)).h_full().flex_shrink_0().min_h_0().overflow_hidden()
+            .border_l_1().border_color(theme.border).bg(theme.sidebar)
+            .child(
+                h_flex().h(px(32.)).flex_shrink_0().bg(theme.tab_bar).border_b_1().border_color(theme.border)
+                    .children(tabs),
+            )
+            .child(div().flex_1().min_h_0().w_full().child(pane))
+    }
+
     fn render_status_bar(
         &self,
         status: ConnStatus,
@@ -782,13 +849,63 @@ impl AppView {
             return;
         }
         let window_w = f32::from(window.viewport_size().width);
-        self.sidebar_w = clamp_sidebar_w(f32::from(ev.position.x), window_w);
+        self.sidebar_w = clamp_sidebar_w(f32::from(ev.position.x), self.available_left_width(window_w));
         cx.notify();
     }
 
     fn on_sidebar_drag_end(&mut self, _: &MouseUpEvent, _w: &mut Window, cx: &mut Context<Self>) {
         if self.sidebar_dragging {
             self.sidebar_dragging = false;
+            self.sidebar_changed(cx);
+        }
+    }
+
+    fn sync_right_worktree(&self, cx: &mut Context<Self>) {
+        let visible = self.right_panel.open && self.right_panel.tab == RightTab::Git && !self.hidden_to_tray;
+        let path = if visible { self.ws.selected.path() } else { None };
+        self.git_panel.update(cx, |panel, cx| panel.select(path, cx));
+    }
+
+    pub(crate) fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.right_panel.open = !self.right_panel.open;
+        self.right_dragging = false;
+        self.sync_right_worktree(cx);
+        if !self.right_panel.open {
+            if let Some(view) = self.focused.and_then(|id| self.views.get(&id)) {
+                view.update(cx, |view, cx| view.focus(window, cx));
+            }
+        }
+        self.sidebar_changed(cx);
+    }
+
+    fn available_left_width(&self, window_w: f32) -> f32 {
+        if self.right_panel.open { window_w - MIN_RIGHT_W } else { window_w }
+    }
+
+    fn on_right_handle_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if event.click_count >= 2 {
+            self.right_dragging = false;
+            self.right_panel.width = Some(DEFAULT_RIGHT_W);
+            self.sidebar_changed(cx);
+        } else {
+            self.right_dragging = true;
+            cx.notify();
+        }
+    }
+
+    fn on_right_drag_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.right_dragging {
+            let width = f32::from(window.viewport_size().width);
+            let left = clamp_sidebar_w(self.sidebar_w, self.available_left_width(width));
+            self.right_panel.width = Some(clamp_right_w(width - f32::from(event.position.x), width, left).max(MIN_RIGHT_W));
+            cx.notify();
+        }
+    }
+
+    fn on_right_drag_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.right_dragging {
+            self.right_dragging = false;
             self.sidebar_changed(cx);
         }
     }
@@ -815,7 +932,8 @@ impl Render for AppView {
         }
 
         let window_w = f32::from(window.viewport_size().width);
-        let sidebar_w = clamp_sidebar_w(self.sidebar_w, window_w);
+        let sidebar_w = clamp_sidebar_w(self.sidebar_w, self.available_left_width(window_w));
+        let right_w = clamp_right_w(self.right_panel.width.unwrap_or(DEFAULT_RIGHT_W), window_w, sidebar_w);
         let sidebar = self.render_sidebar(&snap, &infos, lang, sidebar_w, cx);
         let main = self.render_main(&snap, &infos, lang, cx);
         let status_bar = self.render_status_bar(snap.status, lang, cx);
@@ -841,12 +959,33 @@ impl Render for AppView {
                     .group_hover("sidebar-resize", |s| s.bg(theme.primary.opacity(0.6))),
             );
 
+        let right_handle = self.right_panel.open.then(|| {
+            div()
+                .id("right-panel-resize")
+                .group("right-panel-resize")
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right(px(right_w - SIDEBAR_HANDLE_W / 2.))
+                .w(px(SIDEBAR_HANDLE_W))
+                .cursor(CursorStyle::ResizeLeftRight)
+                .on_mouse_down(MouseButton::Left, cx.listener(Self::on_right_handle_down))
+                .child(
+                    div().absolute().top_0().bottom_0().left(px(SIDEBAR_HANDLE_W / 2. - 1.))
+                        .w(px(2.)).group_hover("right-panel-resize", |s| s.bg(theme.primary.opacity(0.6))),
+                )
+        });
+        let right = self.right_panel.open.then(|| self.render_right_panel(right_w, lang, cx));
+
         let mut root = v_flex()
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .capture_key_down(cx.listener(Self::on_key_capture))
-            .child(h_flex().relative().flex_1().min_h_0().child(sidebar).child(main).child(handle))
+            .child(
+                h_flex().relative().flex_1().min_h_0().child(sidebar).child(main)
+                    .children(right).child(handle).children(right_handle),
+            )
             .child(status_bar);
         if self.sidebar_dragging {
             // Covers the window while dragging so terminals never see the mouse.
@@ -858,6 +997,17 @@ impl Render for AppView {
                     .on_mouse_move(cx.listener(Self::on_sidebar_drag_move))
                     .on_mouse_up(MouseButton::Left, cx.listener(Self::on_sidebar_drag_end))
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_sidebar_drag_end)),
+            );
+        }
+        if self.right_dragging {
+            root = root.child(
+                div()
+                    .absolute()
+                    .size_full()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_move(cx.listener(Self::on_right_drag_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_right_drag_end))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_right_drag_end)),
             );
         }
         root

@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
 use gpui_kit::{
     ClickEvent, Context, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
@@ -168,6 +168,15 @@ impl AppView {
                     .text_size(px(11.))
                     .text_color(theme.muted_foreground)
                     .child(path_text),
+            )
+            .child(
+                div().px_1().flex_shrink_0().child(
+                    Button::new("toggle-git-panel").ghost().xsmall()
+                        .icon(Icon::new(gpui_kit::assets::IconName::PanelRight))
+                        .selected(self.right_panel.open)
+                        .tooltip(tr(lang, Tr::GitPanel))
+                        .on_click(cx.listener(|this, _, window, cx| this.toggle_right_panel(window, cx))),
+                ),
             )
     }
 }

@@ -107,6 +107,38 @@ pub enum Tr {
     Quit,
     TrayWaiting,
     TrayWorking,
+    Git,
+    GitPanel,
+    GitSelectProject,
+    GitNotRepo,
+    GitMissing,
+    GitLoading,
+    GitDetached,
+    GitFetch,
+    GitPull,
+    GitPush,
+    GitDismiss,
+    GitCommitMessage,
+    GitCommit,
+    GitCommitAll,
+    GitConflicts,
+    GitStaged,
+    GitChanges,
+    GitStage,
+    GitUnstage,
+    GitStageAll,
+    GitUnstageAll,
+    GitDiscard,
+    GitDiscardAll,
+    GitDiscardWarning,
+    GitDiscardAllWarning,
+    GitNoChanges,
+    GitTruncated,
+    GitNoDiff,
+    GitDiffTruncated,
+    GitCommits,
+    GitNoCommits,
+    GitLoadMore,
 }
 
 impl Tr {
@@ -178,12 +210,204 @@ impl Tr {
         Tr::Quit,
         Tr::TrayWaiting,
         Tr::TrayWorking,
+        Tr::Git,
+        Tr::GitPanel,
+        Tr::GitSelectProject,
+        Tr::GitNotRepo,
+        Tr::GitMissing,
+        Tr::GitLoading,
+        Tr::GitDetached,
+        Tr::GitFetch,
+        Tr::GitPull,
+        Tr::GitPush,
+        Tr::GitDismiss,
+        Tr::GitCommitMessage,
+        Tr::GitCommit,
+        Tr::GitCommitAll,
+        Tr::GitConflicts,
+        Tr::GitStaged,
+        Tr::GitChanges,
+        Tr::GitStage,
+        Tr::GitUnstage,
+        Tr::GitStageAll,
+        Tr::GitUnstageAll,
+        Tr::GitDiscard,
+        Tr::GitDiscardAll,
+        Tr::GitDiscardWarning,
+        Tr::GitDiscardAllWarning,
+        Tr::GitNoChanges,
+        Tr::GitTruncated,
+        Tr::GitNoDiff,
+        Tr::GitDiffTruncated,
+        Tr::GitCommits,
+        Tr::GitNoCommits,
+        Tr::GitLoadMore,
     ];
 }
 
 pub fn tr(lang: Language, key: Tr) -> &'static str {
     use Language::*;
     match key {
+        Tr::Git => match lang {
+            Uk => "Git",
+            Ru => "Git",
+            En => "Git",
+        },
+        Tr::GitPanel => match lang {
+            Uk => "Панель Git",
+            Ru => "Панель Git",
+            En => "Git panel",
+        },
+        Tr::GitSelectProject => match lang {
+            Uk => "Виберіть проєкт",
+            Ru => "Выберите проект",
+            En => "Select a project",
+        },
+        Tr::GitNotRepo => match lang {
+            Uk => "Це не репозиторій Git",
+            Ru => "Это не репозиторий Git",
+            En => "Not a Git repository",
+        },
+        Tr::GitMissing => match lang {
+            Uk => "Git не встановлено",
+            Ru => "Git не установлен",
+            En => "Git is not installed",
+        },
+        Tr::GitLoading => match lang {
+            Uk => "Завантаження…",
+            Ru => "Загрузка…",
+            En => "Loading…",
+        },
+        Tr::GitDetached => match lang {
+            Uk => "від’єднано",
+            Ru => "отсоединён",
+            En => "detached",
+        },
+        Tr::GitFetch => match lang {
+            Uk => "Отримати зміни (fetch)",
+            Ru => "Получить изменения (fetch)",
+            En => "Fetch",
+        },
+        Tr::GitPull => match lang {
+            Uk => "Завантажити зміни (pull)",
+            Ru => "Загрузить изменения (pull)",
+            En => "Pull",
+        },
+        Tr::GitPush => match lang {
+            Uk => "Надіслати зміни (push)",
+            Ru => "Отправить изменения (push)",
+            En => "Push",
+        },
+        Tr::GitDismiss => match lang {
+            Uk => "Закрити повідомлення",
+            Ru => "Закрыть сообщение",
+            En => "Dismiss",
+        },
+        Tr::GitCommitMessage => match lang {
+            Uk => "Повідомлення коміту (Ctrl+Enter)",
+            Ru => "Сообщение коммита (Ctrl+Enter)",
+            En => "Commit message (Ctrl+Enter)",
+        },
+        Tr::GitCommit => match lang {
+            Uk => "Створити коміт",
+            Ru => "Создать коммит",
+            En => "Commit",
+        },
+        Tr::GitCommitAll => match lang {
+            Uk => "Закомітити все",
+            Ru => "Закоммитить всё",
+            En => "Commit all",
+        },
+        Tr::GitConflicts => match lang {
+            Uk => "Конфлікти злиття",
+            Ru => "Конфликты слияния",
+            En => "Merge conflicts",
+        },
+        Tr::GitStaged => match lang {
+            Uk => "Підготовлені",
+            Ru => "Подготовленные",
+            En => "Staged",
+        },
+        Tr::GitChanges => match lang {
+            Uk => "Зміни",
+            Ru => "Изменения",
+            En => "Changes",
+        },
+        Tr::GitStage => match lang {
+            Uk => "Додати до індексу",
+            Ru => "Добавить в индекс",
+            En => "Stage",
+        },
+        Tr::GitUnstage => match lang {
+            Uk => "Прибрати з індексу",
+            Ru => "Убрать из индекса",
+            En => "Unstage",
+        },
+        Tr::GitStageAll => match lang {
+            Uk => "Додати все до індексу",
+            Ru => "Добавить всё в индекс",
+            En => "Stage all",
+        },
+        Tr::GitUnstageAll => match lang {
+            Uk => "Прибрати все з індексу",
+            Ru => "Убрать всё из индекса",
+            En => "Unstage all",
+        },
+        Tr::GitDiscard => match lang {
+            Uk => "Відкинути зміни",
+            Ru => "Отменить изменения",
+            En => "Discard changes",
+        },
+        Tr::GitDiscardAll => match lang {
+            Uk => "Відкинути всі зміни",
+            Ru => "Отменить все изменения",
+            En => "Discard all",
+        },
+        Tr::GitDiscardWarning => match lang {
+            Uk => "Непідготовлені зміни у файлі буде втрачено. Файл поза індексом буде видалено.",
+            Ru => "Неподготовленные изменения в файле будут потеряны. Неотслеживаемый файл будет удалён.",
+            En => "Unstaged edits in this file will be lost. Untracked files will be deleted.",
+        },
+        Tr::GitDiscardAllWarning => match lang {
+            Uk => "Усі непідготовлені зміни буде втрачено. Файли поза індексом буде видалено.",
+            Ru => "Все неподготовленные изменения будут потеряны. Неотслеживаемые файлы будут удалены.",
+            En => "All unstaged edits will be lost. Untracked files will be deleted.",
+        },
+        Tr::GitNoChanges => match lang {
+            Uk => "Немає змін",
+            Ru => "Нет изменений",
+            En => "No changes",
+        },
+        Tr::GitTruncated => match lang {
+            Uk => "Забагато змін, показано перші",
+            Ru => "Слишком много изменений, показаны первые",
+            En => "Too many changes, showing the first",
+        },
+        Tr::GitNoDiff => match lang {
+            Uk => "Немає різниці",
+            Ru => "Нет различий",
+            En => "No diff",
+        },
+        Tr::GitDiffTruncated => match lang {
+            Uk => "… різницю скорочено",
+            Ru => "… разница сокращена",
+            En => "… diff truncated",
+        },
+        Tr::GitCommits => match lang {
+            Uk => "Коміти",
+            Ru => "Коммиты",
+            En => "Commits",
+        },
+        Tr::GitNoCommits => match lang {
+            Uk => "Немає комітів",
+            Ru => "Нет коммитов",
+            En => "No commits",
+        },
+        Tr::GitLoadMore => match lang {
+            Uk => "Завантажити ще",
+            Ru => "Загрузить ещё",
+            En => "Load more",
+        },
         Tr::NewTerminal => match lang {
             Uk => "Новий термінал",
             Ru => "Новый терминал",
@@ -520,6 +744,16 @@ pub fn agent_tooltip(label: &str, detail: Option<&str>) -> String {
     }
 }
 
+pub fn git_more_lines(lang: Language, count: usize, truncated: bool) -> String {
+    let plus = if truncated { "+" } else { "" };
+    match lang {
+        Language::Uk => format!("… ще {count}{plus} ряд."),
+        Language::Ru => format!("… ещё {count}{plus} стр."),
+        Language::En if count == 1 && !truncated => "… 1 more line".to_owned(),
+        Language::En => format!("… {count}{plus} more lines"),
+    }
+}
+
 /// Compact age of `since_ms` at `now_ms`: "now", "5m", "2h", "3d" (translated). A `since` in
 /// the future (clock skew) counts as "now".
 pub fn relative_time(lang: Language, now_ms: u64, since_ms: u64) -> String {
@@ -717,6 +951,15 @@ mod tests {
             assert!(!hooks_installed(lang, None, None).contains('('));
             assert!(codex_hooks_installed(lang, Some(8), Some("0.170.0")).contains("Codex v0.170.0"));
             assert!(!codex_hooks_installed(lang, None, None).contains('('));
+        }
+    }
+
+    #[test]
+    fn diff_omission_text_marks_partial_counts() {
+        assert_eq!(git_more_lines(Language::En, 1, false), "… 1 more line");
+        for lang in Language::ALL {
+            assert!(git_more_lines(lang, 42, true).contains("42+"));
+            assert!(!git_more_lines(lang, 42, false).contains('+'));
         }
     }
 

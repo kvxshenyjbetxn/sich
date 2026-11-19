@@ -12,6 +12,7 @@ sich-proto.workspace = true
 sich-daemon.workspace = true
 sich-term.workspace = true
 sich-hooks.workspace = true
+sich-git.workspace = true
 gpui-kit.workspace = true
 alacritty_terminal.workspace = true
 tokio.workspace = true
@@ -27,6 +28,7 @@ regex = "1"
 serde.workspace = true
 serde_json = "1"
 dirs.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 sys-locale = "0.3"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 

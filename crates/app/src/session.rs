@@ -26,12 +26,54 @@ pub struct Session {
     /// Sidebar width in logical pixels; `None` = default. Garbage reads as `None`.
     #[serde(deserialize_with = "lenient_width")]
     pub sidebar_w: Option<f32>,
+    pub right_panel: RightPanelState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RightTab {
+    #[default]
+    Git,
+}
+
+impl RightTab {
+    pub const ALL: &'static [Self] = &[Self::Git];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "serde_json::Value")]
+pub struct RightPanelState {
+    pub width: Option<f32>,
+    pub open: bool,
+    pub tab: RightTab,
+    pub history_collapsed: bool,
+}
+
+impl Default for RightPanelState {
+    fn default() -> Self {
+        Self { width: None, open: true, tab: RightTab::default(), history_collapsed: false }
+    }
+}
+
+impl From<serde_json::Value> for RightPanelState {
+    fn from(value: serde_json::Value) -> Self {
+        let default = Self::default();
+        Self {
+            width: width_value(&value["width"]),
+            open: value["open"].as_bool().unwrap_or(default.open),
+            tab: serde_json::from_value(value["tab"].clone()).unwrap_or_default(),
+            history_collapsed: value["history_collapsed"].as_bool().unwrap_or(default.history_collapsed),
+        }
+    }
 }
 
 /// A positive finite number, anything else (wrong type, negative, zero, huge) is `None`.
 fn lenient_width<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<f32>, D::Error> {
-    let v = serde_json::Value::deserialize(d)?;
-    Ok(v.as_f64().filter(|w| w.is_finite() && *w > 0. && *w <= f32::MAX as f64).map(|w| w as f32))
+    Ok(width_value(&serde_json::Value::deserialize(d)?))
+}
+
+fn width_value(value: &serde_json::Value) -> Option<f32> {
+    value.as_f64().filter(|w| w.is_finite() && *w > 0. && *w <= f32::MAX as f64).map(|w| w as f32)
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -131,6 +173,7 @@ pub struct SessionInput<'a> {
     pub collapsed_groups: &'a HashSet<GroupId>,
     pub window: Option<SavedWindow>,
     pub sidebar_w: Option<f32>,
+    pub right_panel: RightPanelState,
 }
 
 /// Builds the session to save. Workspaces come in a stable order (Home, then worktrees in
@@ -180,6 +223,7 @@ pub fn build_session(input: &SessionInput) -> Session {
             .collect(),
         window: input.window,
         sidebar_w: input.sidebar_w,
+        right_panel: input.right_panel,
     }
 }
 
@@ -349,6 +393,20 @@ mod tests {
     }
 
     #[test]
+    fn right_panel_preferences_are_lenient_and_round_trip() {
+        let old = Session::parse(r#"{"selected":null}"#).unwrap();
+        assert_eq!(old.right_panel, RightPanelState::default());
+        for right_panel in [r#""bad""#, r#"null"#, r#"{"open":"yes","width":-1,"tab":"future"}"#] {
+            let session = Session::parse(&format!(r#"{{"right_panel":{right_panel}}}"#)).unwrap();
+            assert_eq!(session.right_panel, RightPanelState::default());
+        }
+        let prefs = RightPanelState { width: Some(520.), open: false, tab: RightTab::Git, history_collapsed: true };
+        let session = Session { right_panel: prefs, ..Default::default() };
+        let json = serde_json::to_string(&session).unwrap();
+        assert_eq!(Session::parse(&json).unwrap().right_panel, prefs);
+    }
+
+    #[test]
     fn sidebar_width_missing_or_garbage_is_default() {
         assert_eq!(Session::parse("{}").unwrap().sidebar_w, None);
         assert_eq!(Session::parse(r#"{"sidebar_w":null}"#).unwrap().sidebar_w, None);
@@ -388,6 +446,7 @@ mod tests {
             collapsed_groups: vec!["game".into()],
             window: Some(SavedWindow { x: 10., y: 20., width: 900., height: 700., maximized: true }),
             sidebar_w: Some(345.5),
+            right_panel: RightPanelState::default(),
         };
         s.save_to(&path).unwrap();
         assert!(!path.with_extension("json.tmp").exists());
@@ -431,6 +490,7 @@ mod tests {
             collapsed_groups: &cg,
             window: None,
             sidebar_w: None,
+            right_panel: RightPanelState::default(),
         });
         assert_eq!(s.selected, Some(PathBuf::from("/w/a-x")));
         assert_eq!(s.workspaces.len(), 3);
@@ -461,6 +521,7 @@ mod tests {
             collapsed_groups: &cg,
             window: Some(SavedWindow { x: 1., y: 2., width: 800., height: 600., maximized: false }),
             sidebar_w: Some(250.),
+            right_panel: RightPanelState::default(),
         });
         assert_eq!(s.sidebar_w, Some(250.));
         assert_eq!(s.selected, None);
@@ -483,6 +544,7 @@ mod tests {
             collapsed_groups: &g,
             window: None,
             sidebar_w: None,
+            right_panel: RightPanelState::default(),
         });
         assert_eq!(s, Session::default());
     }

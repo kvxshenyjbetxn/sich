@@ -13,6 +13,7 @@ sich/
     daemon/  (sich-daemon)   lib: PTY-менеджер, ring buffer, IPC-сервер
     term/    (sich-term)     клієнтська модель терміналу: alacritty_terminal + keys/mouse (з ssh.client)
     hooks/   (sich-hooks)    `sich hook <agent>` (хук-CLI) + інсталятор хуків у settings.json Claude
+    git/     (sich-git)      Git CLI, статус, історія, diff, операції та спостереження за worktree
     app/     (sich-app)      bin `sich`: GPUI UI + підкоманди `sich daemon`, `sich hook`
 ```
 
@@ -30,6 +31,7 @@ sich/
 - `portable-pty`: PTY (ConPTY на Windows)
 - `serde` + `postcard`: серіалізація
 - `async-channel`: пробудження UI
+- `notify` 8.x: нативні сповіщення про зміни у Git worktree
 - `tracing` + `tracing-subscriber` + `tracing-appender`: логи
 - `dirs`: шляхи
 - `anyhow` / `thiserror`
@@ -109,9 +111,18 @@ struct TerminalInfo { id: TermId, title: String, cwd: PathBuf, cols: u16, rows: 
   - UI будиться через `async_channel::bounded(1)`, як у ssh.client.
 - Макет:
   - **Ліва панель (240 px):** список терміналів (назва з OSC title, інакше shell + cwd; позначка «exited»), кнопка `+ New terminal`, на кожному рядку кнопка закриття (`KillTerminal`).
-  - **Права частина:** активний термінал (`TerminalElement`/`TerminalView` з ssh.client). `prepaint` → resize → `ClientMsg::Resize`.
+  - **Центральна частина:** активний термінал (`TerminalElement`/`TerminalView` з ssh.client). `prepaint` → resize → `ClientMsg::Resize`.
+  - **Права панель (340 px):** вкладка Git вибраного робочого дерева. Ширина змінюється перетягуванням лівої межі, подвійний клік повертає 340 px. Звичайні межі — 260–700 px, у вузькому вікні панель поступається місцем терміналу.
   - Внизу статус-рядок: «connected to daemon (pid N)» / «reconnecting…».
 - Гарячі клавіші: `Ctrl+Shift+T` — новий термінал, `Ctrl+Tab` / `Ctrl+Shift+Tab` — перемикання між терміналами.
+
+## Git у правій панелі
+
+- `sich-git` не залежить від GPUI. Блокувальний `git -C` повертає сирий stdout і помилки stderr. Читання вимикає необов’язкові блокування Git. Якщо читання впало через `index.lock`, крейт чекає на його зняття кроками по 50 мс, до 1 с, і повторює команду один раз. На Windows кожна команда Git запускається з `CREATE_NO_WINDOW`.
+- Статус читається з `porcelain=v2 -z` і доповнюється лічильниками `--numstat -z` та підрахунком рядків у малих текстових файлах поза індексом. Статус обмежений 2000 записами, diff — 5000 рядками та 1 МіБ. Історія завантажується по 50 комітів, а файли та diff коміту — при розгортанні. Для merge-комітів порівняння йде з першим батьком.
+- `git_panel.rs` запускає Git на фоновому виконавці GPUI та приймає результати для поточного покоління вибору. Вкладка показує гілку, staged/unstaged зміни й конфлікти, вбудований diff і історію. Доступні stage/unstage, відкидання з підтвердженням, commit, fetch, pull з `--ff-only` і push. Чернетки комітів зберігаються для кожного worktree до виходу з програми. Панель відкривається типово та перемикається кнопкою в рядку вкладок або `Ctrl+Shift+G`.
+- `notify` рекурсивно спостерігає за вибраним worktree, поки панель відкрита. Для linked worktree також спостерігає за Git-теками та їхніми refs. Фільтр відкидає тимчасові блокування, об’єкти Git, більшість reflog і типові каталоги збірки. Зміни HEAD/refs/packed-refs/logs/HEAD також оновлюють історію. Зміна вибору або закриття панелі знімає спостереження з попереднього worktree.
+- Планувальник запускає одне оновлення за раз, через 80 мс після останньої події, або через 300 мс від першої при безперервному потоці. Між стартами є щонайменше 150 мс. Події під час читання об’єднуються в одне наступне оновлення. Раз на 10 с є контрольне читання. Відкриття панелі, зміна вибору, повернення фокусу та завершення операції запитують негайне оновлення.
 
 ## Статус агентів
 Стан AI-агентів у терміналах (Claude Code; Gemini — лише за заголовком) живе в **демоні**, щоб його бачили всі клієнти (і майбутній телефон). Типи: `AgentKind`, `AgentState`, `AgentStatus` у `sich-proto`; `TerminalInfo.agent` і `ServerMsg::AgentStatusChanged` / `TerminalTitle` розсилаються всім клієнтам.
@@ -150,7 +161,7 @@ struct TerminalInfo { id: TermId, title: String, cwd: PathBuf, cols: u16, rows: 
 - **Закриття вікна.** `window.on_window_should_close` завжди повертає `false` і віддає рішення `AppView`: при `close_to_tray` (налаштування, типово `true`) і наявному трею вікно ховається через `ShowWindow(SW_HIDE)` (`win_show.rs`); демон і термінали живуть далі. Показ: `SW_SHOW`/`SW_RESTORE` + `SetForegroundWindow`. Без трею або при `close_to_tray = false` закриття = вихід.
 - **Вихід** (пункт трею або закриття без трею): якщо є термінал з агентом у стані Working/Waiting (`needs_quit_confirm`), вікно показується і з'являється підтвердження; далі синхронно зберігається сесія, демону йде `Shutdown` (як `sich daemon stop`), `cx.quit()`.
 - **Один екземпляр (`single_instance.rs`).** Local socket `<SICH_SOCKET>-ui` (`sich-daemon-ui` за замовчуванням). Старт: спроба підключитись і записати рядок `show` → вихід з кодом 0; інакше слухаємо, кожен `show` перетворюється на `UiEvent::Show`. Другий процес перед підключенням викликає `AllowSetForegroundWindow`.
-- **Сесія (`session.rs`, `<config>/sich/session.json`, `SICH_CONFIG_DIR` враховується).** `Session { selected, workspaces[{worktree, terminals[{cwd}], active}], collapsed_projects (за шляхом), collapsed_groups (за назвою), window{x,y,width,height,maximized} }`, усюди `serde(default)`; пошкоджений файл = немає сесії (warn), без падіння. Скролбек не зберігається. Живі (не exited) термінали, воркспейси: Home, далі worktree у порядку проєктів.
+- **Сесія (`session.rs`, `<config>/sich/session.json`, `SICH_CONFIG_DIR` враховується).** `Session { selected, workspaces[{worktree, terminals[{cwd}], active}], collapsed_projects (за шляхом), collapsed_groups (за назвою), window{x,y,width,height,maximized}, right_panel{width,open,tab,history_collapsed} }`, усюди `serde(default)`; пошкоджений файл = немає сесії (warn), без падіння. Скролбек не зберігається. Живі (не exited) термінали, воркспейси: Home, далі worktree у порядку проєктів.
 - **Збереження.** `AppView::touch_session` (з `on_wake`, `sync`, зміни меж вікна) будує `Session` чистою `build_session` і, якщо вона змінилась, планує запис через 500 мс (атомарно tmp + rename). Перед виходом — синхронний запис. Поки відновлення не завершене (`session_ready`), файл не перезаписується.
 - **Відновлення.** Вікно відкривається з збережених меж (`window_placement`: мінімальний розмір 640×400, позиція поза екранами → центр). Згортання проєктів/груп та вибір застосовуються при першому `Projects` (шлях/назва → id); `session.selected` має пріоритет над `settings.last_workspace`. Термінали: після першого списку термінальів і проєктів, **лише якщо демон стартував порожнім** (`ClientState::first_list_count == 0`), `restore_plan` дає по воркспейсу список cwd (відсутній cwd → тека worktree або домівка; відсутні worktree відкидаються; Home лишається), UI надсилає `CreateTerminal { cwd, worktree }`, а після появи всіх терміналів воркспейсу активує збережену вкладку. Одноразово за запуск. Поки сесія має термінали, клієнт не створює автоматично «порожній» термінал Home (`auto_create = false`); якщо відновити нічого — створюється один Home, як раніше. Якщо в демоні вже є термінали — відновлюються лише згортання/вибір/вікно.
 
