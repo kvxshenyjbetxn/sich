@@ -57,7 +57,7 @@ fn dev_hooks_env() -> bool {
     std::env::var(ENV_DEV_HOOKS).is_ok_and(|v| v == "1")
 }
 
-fn auto_install_here(enabled: bool) -> bool {
+pub(crate) fn auto_install_here(enabled: bool) -> bool {
     auto_install_allowed(enabled, env_flag(ENV_NO_INSTALL), cfg!(debug_assertions), dev_hooks_env())
 }
 

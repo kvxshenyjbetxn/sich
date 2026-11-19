@@ -114,17 +114,18 @@ fn file_name_of(path: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name.to_string()) }
 }
 
-/// `Bash: <command>` for Bash, `<Tool>: <file name>` for file tools, `None` otherwise.
+/// `<Tool>: <command>` for any tool whose input has a string `command` (Bash, PowerShell, …),
+/// `<Tool>: <file name>` for file tools, `None` otherwise.
 pub fn tool_label(tool: &str, input: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
     let input = input?;
     let text = |k: &str| input.get(k).and_then(|x| x.as_str());
     match tool {
-        "Bash" => Some(format!("{tool}: {}", normalize_text(text("command")?, false)?)),
         "Edit" | "MultiEdit" | "Write" | "Read" => {
             Some(format!("{tool}: {}", file_name_of(text("file_path")?)?))
         }
         "NotebookEdit" => Some(format!("{tool}: {}", file_name_of(text("notebook_path")?)?)),
-        _ => None,
+        // Bash, PowerShell, Codex shell tools: anything with a string `command`.
+        _ => Some(format!("{tool}: {}", normalize_text(text("command")?, false)?)),
     }
 }
 
@@ -153,8 +154,79 @@ pub fn parse_claude_payload(json: &str) -> Option<ClaudeHook> {
     })
 }
 
+/// Hook events of the OpenAI Codex CLI that change (or end) the state.
+const KNOWN_CODEX_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "Stop",
+    "Interrupt",
+];
+
+/// The fields we use from a Codex hook payload (documented hook input fields only).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexHook {
+    pub event: String,
+    pub tool_name: Option<String>,
+    /// `<tool>: <command>` when `tool_input.command` exists (string, or array joined by spaces),
+    /// else the Claude-style file label.
+    pub tool_label: Option<String>,
+    /// `PermissionRequest` `tool_input.description`, normalized.
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub prompt: Option<String>,
+    pub last_assistant_message: Option<String>,
+}
+
+impl CodexHook {
+    pub fn is_known(&self) -> bool {
+        KNOWN_CODEX_EVENTS.contains(&self.event.as_str())
+    }
+}
+
+fn codex_tool_label(tool: &str, input: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
+    let input = input?;
+    let command = match input.get("command") {
+        Some(serde_json::Value::String(s)) => Some(s.clone()),
+        Some(serde_json::Value::Array(a)) => {
+            let parts: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+            Some(parts.join(" "))
+        }
+        _ => None,
+    };
+    if let Some(cmd) = command.and_then(|c| normalize_text(&c, false)) {
+        return Some(format!("{tool}: {cmd}"));
+    }
+    tool_label(tool, Some(input))
+}
+
+/// Parses the Codex hook stdin JSON. `None` if it is not a JSON object with `hook_event_name`.
+pub fn parse_codex_payload(json: &str) -> Option<CodexHook> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let obj = v.as_object()?;
+    let get = |k: &str| obj.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let tool_name = get("tool_name");
+    let input = obj.get("tool_input").and_then(|x| x.as_object());
+    let tool_label = tool_name.as_deref().and_then(|t| codex_tool_label(t, input));
+    let description =
+        input.and_then(|i| i.get("description")).and_then(|x| x.as_str()).and_then(|s| normalize_text(s, false));
+    Some(CodexHook {
+        event: get("hook_event_name")?,
+        tool_name,
+        tool_label,
+        description,
+        model: get("model").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        prompt: get("prompt").and_then(|s| normalize_text(&s, true)),
+        last_assistant_message: get("last_assistant_message").and_then(|s| normalize_text(&s, false)),
+    })
+}
+
 pub enum AgentInput<'a> {
     Claude(&'a ClaudeHook),
+    Codex(&'a CodexHook),
     /// A new terminal title. `hooks_seen`: this terminal already got hook events in the current
     /// agent session, so the title must not override them.
     Title { title: &'a str, hooks_seen: bool },
@@ -204,18 +276,16 @@ pub fn apply(prev: Option<AgentStatus>, input: AgentInput<'_>, now: u64) -> Opti
         AgentInput::ProcessExit => None,
         AgentInput::MarkSeen => match prev {
             Some(mut p) => {
-                if p.unread {
-                    p.unread = false;
-                }
-                if p.state == AgentState::Done {
-                    p.state = AgentState::Idle;
-                    p.since_unix_ms = now;
-                }
+                // Seen only clears `unread`: a finished agent stays Done (the UI shows a quiet
+                // "finished" dot) and keeps its finish time.
+                let _ = now;
+                p.unread = false;
                 Some(p)
             }
             None => None,
         },
         AgentInput::Claude(h) => apply_claude(prev, h, now),
+        AgentInput::Codex(h) => apply_codex(prev, h, now),
         AgentInput::Title { title, hooks_seen } => {
             if hooks_seen {
                 prev
@@ -286,6 +356,51 @@ fn apply_claude(prev: Option<AgentStatus>, h: &ClaudeHook, now: u64) -> Option<A
             s.message = None;
         }
         "Stop" | "StopFailure" => {
+            if h.last_assistant_message.is_some() {
+                s.message = h.last_assistant_message.clone();
+            }
+        }
+        _ => {}
+    }
+    Some(s)
+}
+
+fn apply_codex(prev: Option<AgentStatus>, h: &CodexHook, now: u64) -> Option<AgentStatus> {
+    let kind = AgentKind::Codex;
+    let tool = h.tool_label.as_ref().or(h.tool_name.as_ref()).map(|t| clip(t)).filter(|t| !t.is_empty());
+    let (state, unread, detail) = match h.event.as_str() {
+        "SessionEnd" => return None,
+        "SessionStart" => (AgentState::Idle, false, None),
+        "UserPromptSubmit" => (AgentState::Working, false, None),
+        "PreToolUse" => (AgentState::Working, false, tool),
+        "PostToolUse" => {
+            let straggler = prev.as_ref().is_some_and(|p| {
+                matches!(p.state, AgentState::Done | AgentState::Failed)
+                    && now.saturating_sub(p.since_unix_ms) < STRAY_POST_TOOL_MS
+            });
+            if straggler {
+                return prev;
+            }
+            (AgentState::Working, false, tool)
+        }
+        "PermissionRequest" => (AgentState::Waiting, false, non_empty(&h.description).or(tool)),
+        "Stop" => (AgentState::Done, true, None),
+        // The turn was cancelled: nothing to read, back to idle (prompt/model stay).
+        "Interrupt" => (AgentState::Idle, false, None),
+        _ => return prev,
+    };
+    let mut s = settle(prev, kind, state, unread, detail, now)?;
+    if let Some(m) = &h.model {
+        s.model = Some(m.clone());
+    }
+    match h.event.as_str() {
+        "UserPromptSubmit" => {
+            if h.prompt.is_some() {
+                s.prompt = h.prompt.clone();
+            }
+            s.message = None;
+        }
+        "Stop" => {
             if h.last_assistant_message.is_some() {
                 s.message = h.last_assistant_message.clone();
             }
@@ -378,6 +493,15 @@ impl AgentTracker {
         }
         self.hooks_seen = h.event != "SessionEnd";
         self.update(|prev| apply(prev, AgentInput::Claude(h), now))
+    }
+
+    /// Returns true if the status changed.
+    pub fn on_codex_hook(&mut self, h: &CodexHook, now: u64) -> bool {
+        if !h.is_known() {
+            return false;
+        }
+        self.hooks_seen = h.event != "SessionEnd";
+        self.update(|prev| apply(prev, AgentInput::Codex(h), now))
     }
 
     pub fn on_title(&mut self, title: &str, now: u64) -> bool {
@@ -759,12 +883,12 @@ mod tests {
     }
 
     #[test]
-    fn mark_seen_done_becomes_idle_read() {
+    fn mark_seen_done_stays_done_but_read() {
         let done = run(st(AgentState::Working), "Stop", "", T0 + 100);
         let s = apply(done, AgentInput::MarkSeen, T0 + 900).unwrap();
-        assert_eq!(s.state, AgentState::Idle);
+        assert_eq!(s.state, AgentState::Done);
         assert!(!s.unread);
-        assert_eq!(s.since_unix_ms, T0 + 900);
+        assert_eq!(s.since_unix_ms, T0 + 100, "keeps the finish time");
     }
 
     #[test]
@@ -915,8 +1039,138 @@ mod tests {
         assert_eq!((s.state, s.unread), (AgentState::Done, true));
         assert!(t.mark_seen(T0 + 3));
         let s = t.status().unwrap();
-        assert_eq!((s.state, s.unread), (AgentState::Idle, false));
+        assert_eq!((s.state, s.unread), (AgentState::Done, false));
         assert!(!t.mark_seen(T0 + 4));
+    }
+
+    #[test]
+    fn powershell_and_generic_command_tools_are_labelled() {
+        let s = run(None, "PreToolUse", r#","tool_name":"PowerShell","tool_input":{"command":"Get-ChildItem  -Recurse\n"}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("PowerShell: Get-ChildItem -Recurse"));
+        let s = run(None, "PreToolUse", r#","tool_name":"Shell","tool_input":{"command":"ls"}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("Shell: ls"));
+        // No command -> tool name.
+        let s = run(None, "PreToolUse", r#","tool_name":"PowerShell","tool_input":{}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("PowerShell"));
+        // A non-string command is not a label.
+        let s = run(None, "PreToolUse", r#","tool_name":"Foo","tool_input":{"command":5}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("Foo"));
+    }
+
+    // ---- Codex ----
+
+    fn chook(event: &str, extra: &str) -> CodexHook {
+        parse_codex_payload(&format!(
+            r#"{{"session_id":"s1","transcript_path":"C:\\x\\r.jsonl","cwd":"C:\\dev\\p","hook_event_name":"{event}"{extra}}}"#
+        ))
+        .expect("valid codex payload")
+    }
+
+    fn crun(prev: Option<AgentStatus>, event: &str, extra: &str, now: u64) -> Option<AgentStatus> {
+        apply(prev, AgentInput::Codex(&chook(event, extra)), now)
+    }
+
+    #[test]
+    fn codex_session_start_is_idle_with_model() {
+        let s = crun(None, "SessionStart", r#","source":"startup","model":"gpt-5-codex""#, T0).unwrap();
+        assert_eq!((s.kind, s.state, s.unread), (AgentKind::Codex, AgentState::Idle, false));
+        assert_eq!(s.model.as_deref(), Some("gpt-5-codex"));
+    }
+
+    #[test]
+    fn codex_prompt_working_clears_message() {
+        let prev = crun(crun(None, "UserPromptSubmit", r#","prompt":"one""#, T0), "Stop", r#","last_assistant_message":"done  it""#, T0 + 5);
+        assert_eq!(prev.as_ref().unwrap().message.as_deref(), Some("done it"));
+        let s = crun(prev, "UserPromptSubmit", r#","prompt":"two\nlines""#, T0 + 10).unwrap();
+        assert_eq!(s.state, AgentState::Working);
+        assert_eq!(s.prompt.as_deref(), Some("two lines"));
+        assert_eq!(s.message, None);
+    }
+
+    #[test]
+    fn codex_tool_events_are_working_with_label() {
+        for ev in ["PreToolUse", "PostToolUse"] {
+            let s = crun(None, ev, r#","tool_name":"Bash","tool_input":{"command":"cargo  test"}"#, T0).unwrap();
+            assert_eq!(s.state, AgentState::Working, "{ev}");
+            assert_eq!(s.detail.as_deref(), Some("Bash: cargo test"));
+        }
+        let s = crun(None, "PreToolUse", r#","tool_name":"apply_patch","tool_input":{"input":"x"}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("apply_patch"));
+    }
+
+    #[test]
+    fn codex_array_command_is_joined() {
+        let s = crun(None, "PreToolUse", r#","tool_name":"shell","tool_input":{"command":["bash","-lc","ls -la"]}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("shell: bash -lc ls -la"));
+        let s = crun(None, "PreToolUse", r#","tool_name":"shell","tool_input":{"command":[]}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("shell"));
+    }
+
+    #[test]
+    fn codex_permission_request_is_waiting() {
+        let s = crun(None, "PermissionRequest", r#","tool_name":"Bash","tool_input":{"command":"rm x"}"#, T0).unwrap();
+        assert_eq!(s.state, AgentState::Waiting);
+        assert_eq!(s.detail.as_deref(), Some("Bash: rm x"));
+        let s = crun(None, "PermissionRequest", r#","tool_name":"Bash","tool_input":{"command":"rm x","description":"Delete  x"}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("Delete x"));
+    }
+
+    #[test]
+    fn codex_stop_is_done_unread_with_message() {
+        let s = crun(None, "UserPromptSubmit", "", T0);
+        let s = crun(s, "Stop", r#","last_assistant_message":"all\ndone""#, T0 + 3).unwrap();
+        assert_eq!((s.state, s.unread), (AgentState::Done, true));
+        assert_eq!(s.message.as_deref(), Some("all done"));
+    }
+
+    #[test]
+    fn codex_interrupt_is_idle_read_and_keeps_prompt_and_model() {
+        let s = crun(None, "SessionStart", r#","model":"m1""#, T0);
+        let s = crun(s, "UserPromptSubmit", r#","prompt":"p""#, T0 + 1);
+        let s = crun(s, "Interrupt", r#","turn_id":"t1""#, T0 + 2).unwrap();
+        assert_eq!((s.state, s.unread), (AgentState::Idle, false));
+        assert_eq!(s.prompt.as_deref(), Some("p"));
+        assert_eq!(s.model.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn codex_session_end_clears_and_unknown_is_ignored() {
+        assert_eq!(crun(crun(None, "SessionStart", "", T0), "SessionEnd", "", T0 + 1), None);
+        let prev = crun(None, "UserPromptSubmit", "", T0);
+        assert_eq!(crun(prev.clone(), "PreCompact", "", T0 + 1), prev);
+        assert!(!chook("PreCompact", "").is_known());
+        assert!(chook("Interrupt", "").is_known());
+    }
+
+    #[test]
+    fn codex_model_is_sticky_and_updated_on_every_event() {
+        let s = crun(None, "SessionStart", r#","model":"m1""#, T0);
+        let s = crun(s, "UserPromptSubmit", r#","prompt":"p""#, T0 + 1);
+        assert_eq!(s.as_ref().unwrap().model.as_deref(), Some("m1"));
+        let s = crun(s, "PreToolUse", r#","model":"m2","tool_name":"Bash""#, T0 + 2).unwrap();
+        assert_eq!(s.model.as_deref(), Some("m2"));
+        let s = crun(Some(s), "Stop", "", T0 + 3).unwrap();
+        assert_eq!(s.model.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn codex_stray_post_tool_use_after_stop_is_ignored() {
+        let done = crun(crun(None, "UserPromptSubmit", "", T0), "Stop", "", T0 + 100);
+        assert_eq!(crun(done.clone(), "PostToolUse", r#","tool_name":"Bash""#, T0 + 500), done);
+        assert_eq!(crun(done, "PostToolUse", r#","tool_name":"Bash""#, T0 + 1200).unwrap().state, AgentState::Working);
+    }
+
+    #[test]
+    fn codex_parse_rejects_garbage_and_tracker_works() {
+        assert!(parse_codex_payload("nope").is_none());
+        assert!(parse_codex_payload(r#"{"x":1}"#).is_none());
+        let mut t = AgentTracker::default();
+        assert!(t.on_codex_hook(&chook("UserPromptSubmit", ""), T0));
+        assert!(!t.on_codex_hook(&chook("Whatever", ""), T0 + 1));
+        // Hooks seen: titles ignored; SessionEnd re-enables them.
+        assert!(!t.on_title("\u{2733} x", T0 + 2));
+        assert!(t.on_codex_hook(&chook("SessionEnd", ""), T0 + 3));
+        assert!(t.status().is_none());
     }
 
     #[test]

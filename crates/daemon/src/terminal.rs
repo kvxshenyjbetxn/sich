@@ -188,15 +188,25 @@ impl Terminal {
 
     /// Applies a hook payload sent by `sich hook` and broadcasts the status if it changed.
     pub fn agent_hook(&self, kind: AgentKind, payload: &str) {
-        if kind != AgentKind::Claude {
-            return; // Other agents have no hook integration yet.
-        }
-        let Some(hook) = agent::parse_claude_payload(payload) else {
-            tracing::debug!(id = self.shared.id, "ignoring unparsable hook payload");
-            return;
-        };
         let now = now_ms();
-        self.shared.update_agent(|a| a.on_claude_hook(&hook, now));
+        match kind {
+            AgentKind::Claude => {
+                let Some(hook) = agent::parse_claude_payload(payload) else {
+                    tracing::debug!(id = self.shared.id, "ignoring unparsable hook payload");
+                    return;
+                };
+                self.shared.update_agent(|a| a.on_claude_hook(&hook, now));
+            }
+            AgentKind::Codex => {
+                let Some(hook) = agent::parse_codex_payload(payload) else {
+                    tracing::debug!(id = self.shared.id, "ignoring unparsable codex hook payload");
+                    return;
+                };
+                self.shared.update_agent(|a| a.on_codex_hook(&hook, now));
+            }
+            // Other agents have no hook integration yet.
+            _ => {}
+        }
     }
 
     /// The user looked at the terminal.

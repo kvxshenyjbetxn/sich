@@ -86,6 +86,10 @@ pub enum Tr {
     TrackClaudeHooks,
     HooksNotInstalled,
     HooksWorking,
+    TrackCodexHooks,
+    CodexNotFound,
+    CodexTooOld,
+    CodexApproveHint,
     NewGroup,
     GroupName,
     RenameGroup,
@@ -153,6 +157,10 @@ impl Tr {
         Tr::TrackClaudeHooks,
         Tr::HooksNotInstalled,
         Tr::HooksWorking,
+        Tr::TrackCodexHooks,
+        Tr::CodexNotFound,
+        Tr::CodexTooOld,
+        Tr::CodexApproveHint,
         Tr::NewGroup,
         Tr::GroupName,
         Tr::RenameGroup,
@@ -396,6 +404,26 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "Обновление\u{2026}",
             En => "Updating\u{2026}",
         },
+        Tr::TrackCodexHooks => match lang {
+            Uk => "Відстежувати стан Codex (додає хуки в ~/.codex/hooks.json)",
+            Ru => "Отслеживать состояние Codex (добавляет хуки в ~/.codex/hooks.json)",
+            En => "Track Codex status (installs hooks into ~/.codex/hooks.json)",
+        },
+        Tr::CodexNotFound => match lang {
+            Uk => "Codex не знайдено",
+            Ru => "Codex не найден",
+            En => "Codex not found",
+        },
+        Tr::CodexTooOld => match lang {
+            Uk => "Codex застарий (потрібна версія 0.129 або новіша)",
+            Ru => "Codex устарел (нужна версия 0.129 или новее)",
+            En => "Codex is too old (0.129 or newer required)",
+        },
+        Tr::CodexApproveHint => match lang {
+            Uk => "Підтвердіть один раз у Codex: виконайте /hooks",
+            Ru => "Подтвердите один раз в Codex: выполните /hooks",
+            En => "Approve once in Codex: run /hooks",
+        },
         Tr::NewGroup => match lang {
             Uk => "Нова група",
             Ru => "Новая группа",
@@ -546,6 +574,27 @@ pub fn hooks_installed(lang: Language, events: Option<usize>, claude_version: Op
     if parts.is_empty() { head.to_string() } else { format!("{head} ({})", parts.join(", ")) }
 }
 
+/// Status line under the Codex hooks switch when hooks are installed.
+pub fn codex_hooks_installed(lang: Language, events: Option<usize>, codex_version: Option<&str>) -> String {
+    let head = match lang {
+        Language::Uk => "Хуки встановлено",
+        Language::Ru => "Хуки установлены",
+        Language::En => "Hooks installed",
+    };
+    let mut parts = Vec::new();
+    if let Some(n) = events {
+        parts.push(match lang {
+            Language::Uk => format!("подій: {n}"),
+            Language::Ru => format!("событий: {n}"),
+            Language::En => format!("{n} events"),
+        });
+    }
+    if let Some(v) = codex_version {
+        parts.push(format!("Codex v{v}"));
+    }
+    if parts.is_empty() { head.to_string() } else { format!("{head} ({})", parts.join(", ")) }
+}
+
 pub fn connected(lang: Language, pid: u32) -> String {
     match lang {
         Language::Uk => format!("Підключено до демона (pid {pid})"),
@@ -656,6 +705,8 @@ mod tests {
             assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains('9'));
             assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains("v2.1.3"));
             assert!(!hooks_installed(lang, None, None).contains('('));
+            assert!(codex_hooks_installed(lang, Some(8), Some("0.170.0")).contains("Codex v0.170.0"));
+            assert!(!codex_hooks_installed(lang, None, None).contains('('));
         }
     }
 

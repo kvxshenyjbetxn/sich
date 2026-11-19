@@ -5,6 +5,7 @@ mod agent_hooks;
 mod app_view;
 mod assets;
 mod cli;
+mod codex_hooks;
 mod colors;
 mod daemon_client;
 mod daemon_conn;
@@ -103,6 +104,7 @@ fn run_ui(socket: String) -> anyhow::Result<()> {
         settings::init(cx);
         theme::apply(cx);
         agent_hooks::startup(cx);
+        codex_hooks::startup(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

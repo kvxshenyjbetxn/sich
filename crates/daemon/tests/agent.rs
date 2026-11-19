@@ -169,7 +169,7 @@ async fn hooks_drive_status_and_all_clients_are_notified() {
     send(&mut b, ClientMsg::MarkSeen { id }).await;
     for c in [&mut a, &mut b] {
         let s = next_status(c, id).await.unwrap();
-        assert_eq!((s.state, s.unread), (AgentState::Idle, false));
+        assert_eq!((s.state, s.unread), (AgentState::Done, false));
     }
 
     // Garbage payloads, unknown terminals and non-Claude agents change nothing and do not crash.

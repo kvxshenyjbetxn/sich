@@ -127,6 +127,15 @@ struct TerminalInfo { id: TermId, title: String, cwd: PathBuf, cols: u16, rows: 
 - Завершення процесу або видалення терміналу скидає статус у `None`.
 - **Інсталятор** (`sich-hooks::claude_install`): додає наші записи (`{"type":"command","command":"\"<exe>\" hook claude","timeout":5}`) у `~/.claude/settings.json` (або `CLAUDE_CONFIG_DIR`). Лише події, відомі встановленій версії Claude (`claude --version`; невідома версія → стабільний набір). Користувацькі хуки та порядок ключів зберігаються, перед першою зміною створюється `settings.json.sich-backup`, запис атомарний, некоректний JSON не чіпається. Наші записи впізнаються за командою `…/sich[.exe] hook claude`, тож перевстановлення замінює старий шлях.
 
+### Codex hooks
+
+Статус OpenAI Codex CLI відстежується офіційними хуками `hooks.json` (docs: learn.chatgpt.com/docs/hooks); `crates/hooks/src/codex_install.rs`, UI-стан у `crates/app/src/codex_hooks.rs`, перемикач у налаштуваннях (`codex_hooks`, за замовчуванням true; `SICH_NO_HOOK_INSTALL` вимикає автоінсталяцію).
+
+- Розташування: `$CODEX_HOME/hooks.json`, за замовчуванням `~/.codex/hooks.json`. Команда: `<sich.exe> hook codex` (шлях з `/`, у лапках лише якщо є пробіли). Наші записи впізнаються за формою команди; чужі хуки й порядок ключів не чіпаємо; бекап `hooks.json.sich-backup` перед першою зміною; зіпсований файл не змінюємо.
+- Події: SessionStart, UserPromptSubmit, PreToolUse, PermissionRequest, PostToolUse, Stop (таймаут 5 с), Interrupt і SessionEnd (3 с). Версія з `codex --version`: нижче 0.129 або невідома → нічого не ставимо; Interrupt і SessionEnd лише з 0.150 (мінімальну версію SessionEnd з документації підтвердити не вдалося, тому гейт як у Interrupt).
+- Довіра: Codex пропускає нові/змінені хуки, поки користувач не схвалить їх раз через `/hooks`. Ключ довіри — `<path>:<event>:<group_index>:<handler_index>`, тому нашу групу завжди ДОДАЄМО В КІНЕЦЬ масиву події (індекси користувача не зсуваються), а наявний запис замінюємо на місці. Команда й таймаут стабільні → схвалення зберігається. Ми НЕ пишемо `[hooks.state]`/`trusted_hash` у config.toml і не використовуємо `--dangerously-bypass-hook-trust`.
+- Демон: `agent::parse_codex_payload` + `apply_codex` (SessionStart→Idle, UserPromptSubmit→Working, Pre/PostToolUse→Working з міткою інструмента, PermissionRequest→Waiting, Stop→Done+unread, Interrupt→Idle без unread, SessionEnd→очищення; `model` оновлюється на кожній події).
+
 ## Групи проєктів (протокол v4)
 - `GroupId = u64`, `GroupInfo { id, name }`, `ProjectInfo.group: Option<GroupId>`. `ServerMsg::Projects { projects, groups }` (відповідь на `ListProjects` і розсилка всім клієнтам після будь-якої зміни). `ClientMsg::AddProject { path, group }`; нові команди в кінці enum-а: `CreateGroup`, `RenameGroup`, `RemoveGroup`, `SetProjectGroup`.
 - Демон зберігає групи в `projects.json` (`SICH_CONFIG_DIR`): об'єкт `{ groups, projects, next_group_id }`. Старий формат (голий масив проєктів, без `group`) читається як є. Id груп зростають і не перевикористовуються в межах файлу.

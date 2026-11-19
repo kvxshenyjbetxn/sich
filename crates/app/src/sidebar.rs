@@ -31,8 +31,17 @@ pub const SIDEBAR_W: f32 = 300.;
 const ROW_H: f32 = 28.;
 /// Height of a terminal row that shows an agent (title line + preview line).
 const AGENT_ROW_H: f32 = 44.;
-/// Leading slot of an agent row: the status badge, or the agent glyph when there is no badge.
+/// Leading slot of an agent row: always the agent glyph (the status badge sits to its left).
 const LEAD_SLOT_W: f32 = 14.;
+/// Status badge box of an agent row and its gap to the glyph slot.
+const BADGE_W: f32 = 14.;
+const BADGE_GAP: f32 = 4.;
+
+/// Top offset of the absolutely positioned badge so it is centered on line 1 of the row.
+fn badge_top(has_preview: bool) -> f32 {
+    // Single line: centered in ROW_H. Two lines: line 1 is centered about 8px above the middle.
+    if has_preview { 6. } else { (ROW_H - BADGE_W) / 2. }
+}
 const ROW_GAP: f32 = 6.;
 /// Preview line indent: under the title (lead slot + gap).
 const PREVIEW_INDENT: f32 = LEAD_SLOT_W + ROW_GAP;
@@ -75,10 +84,16 @@ pub fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// `(highlighted, shows_rollup_badge)` of a workspace row. With a sub-list the active child
-/// carries the highlight and the per-terminal badges, so the parent shows neither.
-pub fn parent_row_state(workspace_selected: bool, has_sub_list: bool) -> (bool, bool) {
-    (workspace_selected && !has_sub_list, !has_sub_list)
+/// Whether a workspace row is highlighted. With a sub-list the active child carries the
+/// highlight, so the parent does not. (The roll-up badge is shown either way, on the left.)
+pub fn parent_row_state(workspace_selected: bool, has_sub_list: bool) -> bool {
+    workspace_selected && !has_sub_list
+}
+
+/// Left offset of a status badge placed in the row's left padding (8 + indent), left of the
+/// leading icon / glyph. Negative = does not fit (the caller skips the badge).
+pub fn left_badge_x(indent: f32) -> f32 {
+    8. + indent - BADGE_W - BADGE_GAP
 }
 
 /// Roll-up badge of every worktree of a project (shown when the project row is collapsed).
@@ -323,20 +338,15 @@ impl AppView {
 
         let home_key = WorkspaceKey::Home;
         let home_sub = sub_list_ids(&home_key, infos);
-        let (home_highlight, home_rollup) =
-            parent_row_state(self.ws.selected == home_key, !home_sub.is_empty());
+        let home_highlight = parent_row_state(self.ws.selected == home_key, !home_sub.is_empty());
         let home_row = row_base("ws-home", home_highlight, 0., &theme)
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.select_workspace(WorkspaceKey::Home, window, cx)
             }))
             .child(Icon::new(Ic::House).small().text_color(muted))
-            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(tr(lang, Tr::Home)))
-            .children(
-                home_rollup
-                    .then(|| workspace_badge(&home_key, infos))
-                    .flatten()
-                    .map(|b| badge_element(&b, lang, "home-agent", cx)),
-            );
+            .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(tr(lang, Tr::Home)));
+        // Home has only 8px of left padding: the left roll-up badge does not fit, so it is skipped
+        // (the terminal rows below carry their own badges).
         let home = v_flex()
             .child(home_row)
             .children(self.render_term_rows(&home_key, &home_sub, INDENT, snap, lang, cx));
@@ -563,8 +573,8 @@ impl AppView {
         let muted = theme.muted_foreground;
         let key = WorkspaceKey::Worktree(w.path.clone());
         let sub = sub_list_ids(&key, infos);
-        let (selected, show_rollup) = parent_row_state(self.ws.selected == key, !sub.is_empty());
-        let agent = if show_rollup { workspace_badge(&key, infos) } else { None };
+        let selected = parent_row_state(self.ws.selected == key, !sub.is_empty());
+        let agent = workspace_badge(&key, infos);
         let label = worktree_label(w);
         let group = SharedString::from(format!("wt-{}", crate::workspace::normalize_path(&w.path)));
         let wref = WorktreeRef {
@@ -599,8 +609,12 @@ impl AppView {
                     .tooltip(move |window, cx| Tooltip::new(text).build(window, cx)),
             );
         }
-        if let Some(b) = agent {
-            row = row.child(badge_element(&b, lang, SharedString::from(format!("wt-agent:{uid}")), cx));
+        let badge_x = left_badge_x(base + INDENT);
+        if let Some(b) = agent.filter(|_| badge_x >= 0.) {
+            let el = badge_element(&b, lang, SharedString::from(format!("wt-agent:{uid}")), cx);
+            row = row.relative().child(
+                div().absolute().left(px(badge_x)).top(px((ROW_H - BADGE_W) / 2.)).child(el),
+            );
         }
         if !w.is_main {
             let (app, wref) = (app.clone(), wref.clone());
@@ -690,15 +704,14 @@ impl AppView {
                     .w_full()
                     .items_center()
                     .gap(px(ROW_GAP))
-                    .child(match badge {
-                        Some(b) => div().flex_shrink_0().w(px(LEAD_SLOT_W)).child(b),
-                        None => div()
+                    .child(
+                        div()
                             .flex_shrink_0()
                             .w(px(LEAD_SLOT_W))
                             .text_size(px(13.))
                             .text_color(glyph_color)
                             .child(glyph),
-                    })
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -736,8 +749,14 @@ impl AppView {
                         .child(text)
                 });
                 let height = if line2.is_some() { AGENT_ROW_H } else { ROW_H };
+                // The badge sits left of the glyph, in the row's left padding (8 + indent).
+                let badge_left = left_badge_x(indent);
+                let badge_top = badge_top(line2.is_some());
+                let badge = badge.map(|b| div().absolute().left(px(badge_left)).top(px(badge_top)).child(b));
                 Some(
-                    row.h(px(height))
+                    row.relative()
+                        .h(px(height))
+                        .children(badge)
                         .child(v_flex().flex_1().min_w_0().gap(px(2.)).child(line1).children(line2)),
                 )
             })
@@ -877,10 +896,18 @@ mod tests {
 
     #[test]
     fn parent_row_state_covers_all_combinations() {
-        assert_eq!(parent_row_state(false, false), (false, true));
-        assert_eq!(parent_row_state(true, false), (true, true));
-        assert_eq!(parent_row_state(false, true), (false, false));
-        assert_eq!(parent_row_state(true, true), (false, false));
+        assert!(!parent_row_state(false, false));
+        assert!(parent_row_state(true, false));
+        assert!(!parent_row_state(false, true));
+        assert!(!parent_row_state(true, true));
+    }
+
+    #[test]
+    fn left_badge_fits_in_padding() {
+        assert_eq!(left_badge_x(INDENT), 4.);
+        assert_eq!(left_badge_x(INDENT * 2.), 18.);
+        assert!(left_badge_x(0.) < 0.);
+        assert!(badge_top(true) >= 0. && badge_top(false) == (ROW_H - BADGE_W) / 2.);
     }
 
     #[test]

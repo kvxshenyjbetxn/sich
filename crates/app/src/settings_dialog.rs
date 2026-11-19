@@ -9,6 +9,7 @@ use gpui_kit::{
 };
 
 use crate::agent_hooks;
+use crate::codex_hooks::{self, CodexStatus};
 use crate::i18n::{Language, Tr, tr};
 use crate::settings;
 use crate::theme::{self, ThemeKind};
@@ -56,6 +57,14 @@ fn agents_section(lang: Language, cx: &App) -> impl IntoElement {
     } else {
         agent_hooks::status_text(lang, &hooks.status)
     };
+    let codex_enabled = settings::get(cx).codex_hooks;
+    let codex = codex_hooks::state(cx);
+    let (codex_status, codex_error) = if codex.busy {
+        (tr(lang, Tr::HooksWorking).to_string(), false)
+    } else {
+        codex_hooks::status_text(lang, &codex.status)
+    };
+    let codex_installed = !codex.busy && matches!(codex.status, CodexStatus::Installed { .. });
     v_flex()
         .gap_1p5()
         .child(
@@ -74,6 +83,25 @@ fn agents_section(lang: Language, cx: &App) -> impl IntoElement {
                 .text_color(if is_error { theme.danger } else { theme.muted_foreground })
                 .child(status),
         )
+        .child(
+            Switch::new("codex-hooks")
+                .checked(codex_enabled)
+                .disabled(codex.busy)
+                .label(tr(lang, Tr::TrackCodexHooks))
+                .on_click(|checked, window, cx| {
+                    settings::set_codex_hooks(*checked, cx);
+                    codex_hooks::apply(*checked, Some(window), cx);
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(if codex_error { theme.danger } else { theme.muted_foreground })
+                .child(codex_status),
+        )
+        .children(codex_installed.then(|| {
+            div().text_xs().text_color(theme.muted_foreground).child(tr(lang, Tr::CodexApproveHint))
+        }))
 }
 
 fn language_picker(current: Language, cx: &App) -> impl IntoElement {

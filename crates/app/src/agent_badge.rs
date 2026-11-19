@@ -19,6 +19,8 @@ use crate::theme;
 
 /// Badge size in pixels.
 const BADGE_SIZE: f32 = 14.;
+/// Diameter of the "finished and seen" dot.
+const SEEN_DOT_SIZE: f32 = 7.;
 /// One full turn of the spinner.
 const SPIN_PERIOD: Duration = Duration::from_millis(1000);
 
@@ -29,6 +31,8 @@ pub enum BadgeKind {
     Working,
     Failed,
     Done,
+    /// Finished and already seen: a small persistent green dot (lowest priority).
+    SeenDone,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,19 +42,20 @@ pub struct Badge {
     pub detail: Option<String>,
 }
 
-/// The badge of one terminal; `None` = nothing to show (Idle, or Done/Failed already seen).
+/// The badge of one terminal; `None` = nothing to show (Idle, or Failed already seen).
 pub fn badge_for(status: &AgentStatus) -> Option<Badge> {
     let kind = match status.state {
         AgentState::Working => BadgeKind::Working,
         AgentState::Waiting => BadgeKind::Waiting,
         AgentState::Done if status.unread => BadgeKind::Done,
+        AgentState::Done => BadgeKind::SeenDone,
         AgentState::Failed if status.unread => BadgeKind::Failed,
-        AgentState::Done | AgentState::Failed | AgentState::Idle => return None,
+        AgentState::Failed | AgentState::Idle => return None,
     };
     Some(Badge { kind, detail: status.detail.clone() })
 }
 
-/// The most important badge of a group: Waiting > Working > Failed > Done > none. Ties keep the
+/// The most important badge of a group: Waiting > Working > Failed > Done > SeenDone > none. Ties keep the
 /// first one.
 pub fn rollup<'a>(statuses: impl IntoIterator<Item = &'a AgentStatus>) -> Option<Badge> {
     let mut best: Option<Badge> = None;
@@ -73,7 +78,8 @@ pub fn agent_glyph(kind: AgentKind) -> (&'static str, Option<u32>) {
         // U+273B has no emoji presentation (U+2733 renders as a green emoji on Windows).
         AgentKind::Claude => ("\u{273B}", Some(0xD97757)),
         AgentKind::Gemini => ("\u{2726}", Some(0x4796E3)),
-        AgentKind::Codex | AgentKind::Other => ("\u{2022}", None),
+        AgentKind::Codex => ("\u{25CE}", Some(0x10A37F)),
+        AgentKind::Other => ("\u{2022}", None),
     }
 }
 
@@ -130,7 +136,7 @@ fn badge_color(kind: BadgeKind, cx: &App) -> Hsla {
     match kind {
         BadgeKind::Working => cx.theme().primary,
         BadgeKind::Waiting => rgb(p.agent_waiting).into(),
-        BadgeKind::Done => rgb(p.agent_done).into(),
+        BadgeKind::Done | BadgeKind::SeenDone => rgb(p.agent_done).into(),
         BadgeKind::Failed => rgb(p.agent_failed).into(),
     }
 }
@@ -141,12 +147,13 @@ fn tooltip_text(lang: Language, badge: &Badge) -> String {
         match badge.kind {
             BadgeKind::Working => Tr::AgentWorking,
             BadgeKind::Waiting => Tr::AgentWaiting,
-            BadgeKind::Done => Tr::AgentDone,
+            BadgeKind::Done | BadgeKind::SeenDone => Tr::AgentDone,
             BadgeKind::Failed => Tr::AgentFailed,
         },
     );
     // "Finished" has nothing useful to add.
-    let detail = if badge.kind == BadgeKind::Done { None } else { badge.detail.as_deref() };
+    let detail =
+        if matches!(badge.kind, BadgeKind::Done | BadgeKind::SeenDone) { None } else { badge.detail.as_deref() };
     i18n::agent_tooltip(label, detail)
 }
 
@@ -174,6 +181,13 @@ pub fn badge_element(
         BadgeKind::Waiting => Icon::new(Ic::CircleAlert).with_size(size).text_color(color).into_any_element(),
         BadgeKind::Done => Icon::new(Ic::CircleCheck).with_size(size).text_color(color).into_any_element(),
         BadgeKind::Failed => Icon::new(Ic::CircleX).with_size(size).text_color(color).into_any_element(),
+        BadgeKind::SeenDone => div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(div().size(px(SEEN_DOT_SIZE)).rounded_full().bg(color))
+            .into_any_element(),
     };
     div()
         .id(id)
@@ -247,7 +261,7 @@ mod tests {
     fn glyph_per_agent_kind() {
         assert_eq!(agent_glyph(AgentKind::Claude), ("\u{273B}", Some(0xD97757)));
         assert_eq!(agent_glyph(AgentKind::Gemini), ("\u{2726}", Some(0x4796E3)));
-        assert_eq!(agent_glyph(AgentKind::Codex).1, None);
+        assert_eq!(agent_glyph(AgentKind::Codex), ("\u{25CE}", Some(0x10A37F)));
         assert_eq!(agent_glyph(AgentKind::Other).1, None);
     }
 
@@ -267,8 +281,42 @@ mod tests {
     fn read_or_idle_has_no_badge() {
         assert_eq!(kind(&st(AgentState::Idle, false, None)), None);
         assert_eq!(kind(&st(AgentState::Idle, true, None)), None);
-        assert_eq!(kind(&st(AgentState::Done, false, None)), None);
         assert_eq!(kind(&st(AgentState::Failed, false, None)), None);
+    }
+
+    #[test]
+    fn seen_done_is_a_dot() {
+        assert_eq!(kind(&st(AgentState::Done, false, None)), Some(BadgeKind::SeenDone));
+        assert_eq!(kind(&st(AgentState::Done, true, None)), Some(BadgeKind::Done));
+    }
+
+    #[test]
+    fn badge_for_every_state_and_unread() {
+        use AgentState::*;
+        let expect = |s, u| kind(&st(s, u, None));
+        assert_eq!(expect(Working, false), Some(BadgeKind::Working));
+        assert_eq!(expect(Working, true), Some(BadgeKind::Working));
+        assert_eq!(expect(Waiting, false), Some(BadgeKind::Waiting));
+        assert_eq!(expect(Waiting, true), Some(BadgeKind::Waiting));
+        assert_eq!(expect(Idle, false), None);
+        assert_eq!(expect(Idle, true), None);
+        assert_eq!(expect(Done, false), Some(BadgeKind::SeenDone));
+        assert_eq!(expect(Done, true), Some(BadgeKind::Done));
+        assert_eq!(expect(Failed, false), None);
+        assert_eq!(expect(Failed, true), Some(BadgeKind::Failed));
+    }
+
+    #[test]
+    fn seen_done_is_lowest_in_rollup_and_never_flashes() {
+        let seen = st(AgentState::Done, false, None);
+        let unread = st(AgentState::Done, true, None);
+        let idle = st(AgentState::Idle, false, None);
+        let k = |v: Vec<&AgentStatus>| rollup(v).map(|b| b.kind);
+        assert_eq!(k(vec![&idle, &seen]), Some(BadgeKind::SeenDone));
+        assert_eq!(k(vec![&seen, &unread]), Some(BadgeKind::Done));
+        assert!(BadgeKind::Done < BadgeKind::SeenDone);
+        assert!(!should_flash(Some(BadgeKind::Done), Some(BadgeKind::SeenDone)));
+        assert!(!should_flash(None, Some(BadgeKind::SeenDone)));
     }
 
     #[test]
@@ -296,8 +344,8 @@ mod tests {
     #[test]
     fn rollup_ignores_read_results() {
         let read_failed = st(AgentState::Failed, false, None);
-        let read_done = st(AgentState::Done, false, None);
-        assert_eq!(rollup([&read_failed, &read_done]), None);
+        let idle = st(AgentState::Idle, false, None);
+        assert_eq!(rollup([&read_failed, &idle]), None);
     }
 
     #[test]
@@ -339,7 +387,8 @@ mod tests {
     fn kind_of_matches_badge() {
         assert_eq!(kind_of(None), None);
         assert_eq!(kind_of(Some(&st(AgentState::Done, true, None))), Some(BadgeKind::Done));
-        assert_eq!(kind_of(Some(&st(AgentState::Done, false, None))), None);
+        assert_eq!(kind_of(Some(&st(AgentState::Done, false, None))), Some(BadgeKind::SeenDone));
+        assert_eq!(kind_of(Some(&st(AgentState::Idle, false, None))), None);
     }
 
     #[test]

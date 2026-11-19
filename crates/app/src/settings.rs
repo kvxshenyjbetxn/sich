@@ -17,6 +17,8 @@ pub struct AppSettings {
     pub last_workspace: Option<PathBuf>,
     /// Track Claude Code status through hooks in `~/.claude/settings.json`.
     pub agent_hooks: bool,
+    /// Track Codex status through hooks in `~/.codex/hooks.json`.
+    pub codex_hooks: bool,
     /// Closing the window hides it to the system tray instead of quitting.
     pub close_to_tray: bool,
 }
@@ -28,6 +30,7 @@ impl Default for AppSettings {
             theme: ThemeKind::Gray,
             last_workspace: None,
             agent_hooks: true,
+            codex_hooks: true,
             close_to_tray: true,
         }
     }
@@ -122,6 +125,15 @@ pub fn set_agent_hooks(enabled: bool, cx: &mut App) {
     store(s, cx);
 }
 
+pub fn set_codex_hooks(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.codex_hooks == enabled {
+        return;
+    }
+    s.codex_hooks = enabled;
+    store(s, cx);
+}
+
 pub fn set_close_to_tray(enabled: bool, cx: &mut App) {
     let mut s = get(cx);
     if s.close_to_tray == enabled {
@@ -184,6 +196,16 @@ mod tests {
         assert!(!back.agent_hooks);
         let parsed: AppSettings = serde_json::from_str(r#"{"agent_hooks":false}"#).unwrap();
         assert!(!parsed.agent_hooks);
+    }
+
+    #[test]
+    fn codex_hooks_defaults_to_true_and_round_trips() {
+        let s: AppSettings = serde_json::from_str(r#"{"agent_hooks":false}"#).unwrap();
+        assert!(s.codex_hooks);
+        assert!(AppSettings::default().codex_hooks);
+        let s = AppSettings { codex_hooks: false, ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!back.codex_hooks);
     }
 
     #[test]
