@@ -1006,7 +1006,7 @@ impl AppView {
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let old_build = matches!(snap.status, ConnStatus::Connected { .. })
-            && snap.daemon_build.as_deref().is_some_and(|id| id != sich_app::build_id());
+            && snap.daemon_build.as_deref().is_some_and(|id| id != sich_app::daemon_build_id());
         let text = if self.restarting_daemon {
             tr(lang, Tr::DaemonRestarting).to_string()
         } else {

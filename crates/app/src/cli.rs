@@ -21,7 +21,7 @@ pub fn run_daemon(socket: &str) -> anyhow::Result<()> {
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     crate::daemon_host::prune_old_hosts();
-    let res = rt.block_on(sich_daemon::run_with_build(socket, sich_app::build_id()));
+    let res = rt.block_on(sich_daemon::run_with_build(socket, sich_app::daemon_build_id()));
     if let Err(e) = &res {
         tracing::error!("daemon failed: {e:#}");
     }

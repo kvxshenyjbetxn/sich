@@ -1,6 +1,9 @@
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[path = "build_hash.rs"]
+mod build_hash;
+
 fn main() {
     for path in ["src", "Cargo.toml", "../../Cargo.lock", "../../Cargo.toml"] {
         println!("cargo:rerun-if-changed={path}");
@@ -9,6 +12,8 @@ fn main() {
         println!("cargo:rerun-if-changed=../{member}/src");
         println!("cargo:rerun-if-changed=../{member}/Cargo.toml");
     }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    println!("cargo:rustc-env=SICH_DAEMON_BUILD_ID={}", build_hash::daemon_build_id(&root));
     let mut git = Command::new("git");
     git.args(["rev-parse", "--short", "HEAD"]);
     #[cfg(windows)]
