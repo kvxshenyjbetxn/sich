@@ -67,8 +67,10 @@ impl Terminal {
         let mut cmd = CommandBuilder::new(&shell);
         cmd.args(&req.args);
         cmd.cwd(&cwd);
-        cmd.env("TERM", "xterm-256color");
-        cmd.env("COLORTERM", "truecolor");
+        cmd.env_clear();
+        for (k, v) in crate::env::terminal_env() {
+            cmd.env(k, v);
+        }
         let mut child =
             pair.slave.spawn_command(cmd).with_context(|| format!("spawn `{shell}`"))?;
         drop(pair.slave);

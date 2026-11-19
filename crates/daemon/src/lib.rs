@@ -1,5 +1,6 @@
 //! Sich daemon: owns the PTYs and serves clients over a local socket.
 
+mod env;
 mod git;
 mod hub;
 mod ipc;
