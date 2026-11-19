@@ -38,10 +38,6 @@ const BADGE_W: f32 = 14.;
 const BADGE_GAP: f32 = 4.;
 
 /// Top offset of the absolutely positioned badge so it is centered on line 1 of the row.
-fn badge_top(has_preview: bool) -> f32 {
-    // Single line: centered in ROW_H. Two lines: line 1 is centered about 8px above the middle.
-    if has_preview { 6. } else { (ROW_H - BADGE_W) / 2. }
-}
 const ROW_GAP: f32 = 6.;
 /// Preview line indent: under the title (lead slot + gap).
 const PREVIEW_INDENT: f32 = LEAD_SLOT_W + ROW_GAP;
@@ -699,16 +695,23 @@ impl AppView {
                 let icon = agent_icon_element(status.kind, LEAD_SLOT_W, theme.foreground, muted);
                 let title = status.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or(label);
                 let model = status.model.as_deref().map(shorten_model).filter(|m| !m.is_empty());
+                // The status badge hangs left of the agent icon, inside the row's left padding.
+                // Anchored to the icon slot so both share the same vertical center.
+                let badge = badge.map(|b| {
+                    div().absolute().top(px((LEAD_SLOT_W - BADGE_W) / 2.)).left(px(-(BADGE_W + BADGE_GAP))).child(b)
+                });
                 let line1 = h_flex()
                     .w_full()
                     .items_center()
                     .gap(px(ROW_GAP))
                     .child(
                         div()
+                            .relative()
                             .flex_shrink_0()
                             .w(px(LEAD_SLOT_W))
                             .h(px(LEAD_SLOT_W))
-                            .child(icon),
+                            .child(icon)
+                            .children(badge),
                     )
                     .child(
                         div()
@@ -747,14 +750,8 @@ impl AppView {
                         .child(text)
                 });
                 let height = if line2.is_some() { AGENT_ROW_H } else { ROW_H };
-                // The badge sits left of the glyph, in the row's left padding (8 + indent).
-                let badge_left = left_badge_x(indent);
-                let badge_top = badge_top(line2.is_some());
-                let badge = badge.map(|b| div().absolute().left(px(badge_left)).top(px(badge_top)).child(b));
                 Some(
-                    row.relative()
-                        .h(px(height))
-                        .children(badge)
+                    row.h(px(height))
                         .child(v_flex().flex_1().min_w_0().gap(px(2.)).child(line1).children(line2)),
                 )
             })
@@ -905,7 +902,6 @@ mod tests {
         assert_eq!(left_badge_x(INDENT), 4.);
         assert_eq!(left_badge_x(INDENT * 2.), 18.);
         assert!(left_badge_x(0.) < 0.);
-        assert!(badge_top(true) >= 0. && badge_top(false) == (ROW_H - BADGE_W) / 2.);
     }
 
     #[test]
