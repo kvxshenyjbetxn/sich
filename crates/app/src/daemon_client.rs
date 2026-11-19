@@ -2,10 +2,12 @@
 //!
 //! The connection itself lives in `daemon_conn` (a tokio task with auto-reconnect).
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
-use sich_proto::{TermId, TerminalInfo};
+use sich_proto::{ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use sich_term::TermSession;
 use tokio::runtime::Handle;
@@ -38,11 +40,20 @@ pub(crate) struct ClientState {
     /// Set once the first terminal list arrived (used for the "create one if empty" rule).
     pub synced: bool,
     pub daemon_pid: Option<u32>,
+    pub projects: Vec<ProjectInfo>,
+    /// Last `OpFailed` from the daemon: (op, message, when).
+    pub last_error: Option<(String, String, Instant)>,
 }
 
 /// Commands from the UI to the connection task.
+#[allow(dead_code)] // project variants are used by the upcoming UI
 pub(crate) enum Cmd {
-    Create { cols: u16, rows: u16 },
+    Create { cols: u16, rows: u16, worktree: Option<PathBuf> },
+    RefreshProjects,
+    AddProject(PathBuf),
+    RemoveProject(ProjectId),
+    CreateWorktree { project_id: ProjectId, name: String, base: Option<String> },
+    RemoveWorktree { project_id: ProjectId, path: PathBuf, force: bool, delete_branch: bool },
     Kill(TermId),
     Input(TermId, Vec<u8>),
     Resize(TermId, u16, u16),
@@ -59,6 +70,7 @@ pub struct DaemonClient {
     state: Arc<Mutex<ClientState>>,
 }
 
+#[allow(dead_code)] // project API is used by the upcoming UI
 impl DaemonClient {
     /// Starts the connection task on `rt`.
     pub fn start(rt: &Handle, socket: String, wake: Wake) -> DaemonClient {
@@ -68,6 +80,8 @@ impl DaemonClient {
             terminals: Vec::new(),
             synced: false,
             daemon_pid: None,
+            projects: Vec::new(),
+            last_error: None,
         }));
         let conn = daemon_conn::Conn {
             socket,
@@ -86,7 +100,46 @@ impl DaemonClient {
     }
 
     pub fn create_terminal(&self, cols: u16, rows: u16) {
-        let _ = self.cmd_tx.send(Cmd::Create { cols, rows });
+        self.create_terminal_in(cols, rows, None);
+    }
+
+    /// Creates a terminal whose cwd is `worktree` (when given).
+    pub fn create_terminal_in(&self, cols: u16, rows: u16, worktree: Option<PathBuf>) {
+        let _ = self.cmd_tx.send(Cmd::Create { cols, rows, worktree });
+    }
+
+    pub fn projects(&self) -> Vec<ProjectInfo> {
+        self.state.lock().projects.clone()
+    }
+
+    pub fn last_error(&self) -> Option<(String, String, Instant)> {
+        self.state.lock().last_error.clone()
+    }
+
+    pub fn refresh_projects(&self) {
+        let _ = self.cmd_tx.send(Cmd::RefreshProjects);
+    }
+
+    pub fn add_project(&self, path: PathBuf) {
+        let _ = self.cmd_tx.send(Cmd::AddProject(path));
+    }
+
+    pub fn remove_project(&self, id: ProjectId) {
+        let _ = self.cmd_tx.send(Cmd::RemoveProject(id));
+    }
+
+    pub fn create_worktree(&self, project_id: ProjectId, name: String, base: Option<String>) {
+        let _ = self.cmd_tx.send(Cmd::CreateWorktree { project_id, name, base });
+    }
+
+    pub fn remove_worktree(
+        &self,
+        project_id: ProjectId,
+        path: PathBuf,
+        force: bool,
+        delete_branch: bool,
+    ) {
+        let _ = self.cmd_tx.send(Cmd::RemoveWorktree { project_id, path, force, delete_branch });
     }
 
     pub fn kill_terminal(&self, id: TermId) {

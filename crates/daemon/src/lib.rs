@@ -1,8 +1,10 @@
 //! Sich daemon: owns the PTYs and serves clients over a local socket.
 
+mod git;
 mod hub;
 mod ipc;
 mod manager;
+mod projects;
 mod ring;
 mod server;
 mod shell;

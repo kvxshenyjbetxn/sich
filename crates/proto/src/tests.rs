@@ -11,6 +11,33 @@ fn info() -> TerminalInfo {
         rows: 32,
         exited: Some(Some(-1)),
         created_unix_ms: 1_700_000_000_000,
+        worktree: Some(PathBuf::from("/wt/a")),
+    }
+}
+
+fn project() -> ProjectInfo {
+    ProjectInfo {
+        id: 2,
+        name: "repo".into(),
+        path: PathBuf::from("/repo"),
+        is_git: true,
+        worktrees: vec![
+            WorktreeInfo {
+                path: PathBuf::from("/repo"),
+                branch: Some("main".into()),
+                head: "abc1234".into(),
+                is_main: true,
+                dirty: false,
+            },
+            WorktreeInfo {
+                path: PathBuf::from("/wt/a"),
+                branch: None,
+                head: "def5678".into(),
+                is_main: false,
+                dirty: true,
+            },
+        ],
+        error: Some("Folder not found".into()),
     }
 }
 
@@ -25,14 +52,27 @@ fn client_msgs_round_trip() {
             args: vec!["/c".into(), "echo".into()],
             cols: 80,
             rows: 24,
+            worktree: Some(PathBuf::from("/wt")),
         },
-        ClientMsg::CreateTerminal { cwd: None, shell: None, args: vec![], cols: 1, rows: 1 },
+        ClientMsg::CreateTerminal { cwd: None, shell: None, args: vec![], cols: 1, rows: 1, worktree: None },
         ClientMsg::Subscribe { id: 1, resume_from_seq: Some(42) },
         ClientMsg::Subscribe { id: 1, resume_from_seq: None },
         ClientMsg::Unsubscribe { id: 2 },
         ClientMsg::Input { id: 3, bytes: vec![0, 1, 255] },
         ClientMsg::Resize { id: 4, cols: 100, rows: 50 },
         ClientMsg::KillTerminal { id: 5 },
+        ClientMsg::ListProjects,
+        ClientMsg::RefreshProjects,
+        ClientMsg::AddProject { path: PathBuf::from("/repo") },
+        ClientMsg::RemoveProject { id: 3 },
+        ClientMsg::CreateWorktree { project_id: 1, name: "feat".into(), base: Some("main".into()) },
+        ClientMsg::CreateWorktree { project_id: 1, name: "feat".into(), base: None },
+        ClientMsg::RemoveWorktree {
+            project_id: 1,
+            path: PathBuf::from("/wt/feat"),
+            force: true,
+            delete_branch: false,
+        },
         ClientMsg::Shutdown,
     ];
     for m in msgs {
@@ -52,6 +92,9 @@ fn server_msgs_round_trip() {
         ServerMsg::TerminalExited { id: 1, code: None },
         ServerMsg::TerminalRemoved { id: 9 },
         ServerMsg::Output { id: 1, seq: u64::MAX, bytes: b"hello".to_vec() },
+        ServerMsg::Projects(vec![project()]),
+        ServerMsg::Projects(vec![]),
+        ServerMsg::OpFailed { op: "create_worktree".into(), message: "exists".into() },
         ServerMsg::Error { message: "boom".into() },
     ];
     for m in msgs {

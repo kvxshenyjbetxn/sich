@@ -2,7 +2,7 @@
 //! reconnects forever with backoff.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
@@ -95,13 +95,23 @@ async fn session(
             cmd = cmd_rx.recv() => {
                 let Some(cmd) = cmd else { return Ok(()) };
                 let msg = match cmd {
-                    Cmd::Create { cols, rows } => ClientMsg::CreateTerminal {
+                    Cmd::Create { cols, rows, worktree } => ClientMsg::CreateTerminal {
                         cwd: None,
                         shell: None,
                         args: Vec::new(),
                         cols,
                         rows,
+                        worktree,
                     },
+                    Cmd::RefreshProjects => ClientMsg::RefreshProjects,
+                    Cmd::AddProject(path) => ClientMsg::AddProject { path },
+                    Cmd::RemoveProject(id) => ClientMsg::RemoveProject { id },
+                    Cmd::CreateWorktree { project_id, name, base } => {
+                        ClientMsg::CreateWorktree { project_id, name, base }
+                    }
+                    Cmd::RemoveWorktree { project_id, path, force, delete_branch } => {
+                        ClientMsg::RemoveWorktree { project_id, path, force, delete_branch }
+                    }
                     Cmd::Kill(id) => ClientMsg::KillTerminal { id },
                     Cmd::Input(id, bytes) => ClientMsg::Input { id, bytes },
                     Cmd::Resize(id, cols, rows) => ClientMsg::Resize { id, cols, rows },
@@ -153,6 +163,7 @@ impl Conn {
                     st.status = ConnStatus::Connected { pid: daemon_pid };
                 }
                 out.push(ClientMsg::ListTerminals);
+                out.push(ClientMsg::ListProjects);
             }
             ServerMsg::Terminals(list) => self.reconcile(list, &mut out),
             ServerMsg::TerminalCreated(info) => {
@@ -178,6 +189,11 @@ impl Conn {
                     s.feed(seq, &bytes);
                 }
                 return Ok(out);
+            }
+            ServerMsg::Projects(list) => self.state.lock().projects = list,
+            ServerMsg::OpFailed { op, message } => {
+                tracing::warn!("daemon op `{op}` failed: {message}");
+                self.state.lock().last_error = Some((op, message, Instant::now()));
             }
             ServerMsg::Error { message } => tracing::warn!("daemon error: {message}"),
         }
@@ -225,6 +241,7 @@ impl Conn {
                 args: Vec::new(),
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
+                worktree: None,
             });
         }
         st.synced = true;

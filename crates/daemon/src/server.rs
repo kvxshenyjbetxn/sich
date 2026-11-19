@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::hub::ConnHandle;
 use crate::manager::Manager;
+use crate::projects;
 use crate::terminal::SpawnRequest;
 
 const WRITE_QUEUE: usize = 1024;
@@ -113,8 +114,9 @@ async fn handle_msg(msg: ClientMsg, mgr: &Arc<Manager>, conn: &ConnHandle) {
         ClientMsg::ListTerminals => {
             conn.send(ServerMsg::Terminals(mgr.list()));
         }
-        ClientMsg::CreateTerminal { cwd, shell, args, cols, rows } => {
-            let req = SpawnRequest { cwd, shell, args, cols, rows };
+        ClientMsg::CreateTerminal { cwd, shell, args, cols, rows, worktree } => {
+            let cwd = cwd.or_else(|| worktree.clone());
+            let req = SpawnRequest { cwd, shell, args, cols, rows, worktree };
             if let Err(e) = mgr.create(req).await {
                 tracing::warn!("create terminal failed: {e:#}");
                 conn.send(ServerMsg::Error { message: format!("create terminal failed: {e:#}") });
@@ -143,6 +145,18 @@ async fn handle_msg(msg: ClientMsg, mgr: &Arc<Manager>, conn: &ConnHandle) {
         }
         ClientMsg::KillTerminal { id } => {
             mgr.kill(id);
+        }
+        ClientMsg::ListProjects => {
+            conn.send(ServerMsg::Projects(projects::list(mgr).await));
+        }
+        ClientMsg::RefreshProjects => projects::broadcast(mgr).await,
+        ClientMsg::AddProject { path } => projects::add_project(mgr, conn, path).await,
+        ClientMsg::RemoveProject { id } => projects::remove_project(mgr, id).await,
+        ClientMsg::CreateWorktree { project_id, name, base } => {
+            projects::create_worktree(mgr, conn, project_id, name, base).await;
+        }
+        ClientMsg::RemoveWorktree { project_id, path, force, delete_branch } => {
+            projects::remove_worktree(mgr, conn, project_id, path, force, delete_branch).await;
         }
         ClientMsg::Shutdown => {
             tracing::info!(conn = conn.id, "shutdown requested");
