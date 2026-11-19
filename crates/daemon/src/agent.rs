@@ -5,7 +5,9 @@
 //! - terminal title glyphs (Claude's spinner, Gemini's markers), used only while the terminal
 //!   has not received any hook event during the current agent session.
 
-use sich_proto::{AgentKind, AgentState, AgentStatus};
+use std::collections::VecDeque;
+
+use sich_proto::{AgentKind, AgentState, AgentStatus, SubagentStatus};
 
 /// `AgentStatus::detail` is cut to this many characters.
 pub const MAX_DETAIL_CHARS: usize = 120;
@@ -31,6 +33,18 @@ const KNOWN_CLAUDE_EVENTS: &[&str] = &[
     "PostModelSwitch",
 ];
 
+/// At most this many subagents are tracked per terminal.
+pub const MAX_SUBAGENTS: usize = 16;
+
+/// At most this many spawn requests (main-agent `Agent`/`Task` tool calls) wait for their start.
+pub const MAX_PENDING_SPAWNS: usize = 16;
+
+/// `agent_id` prefix of agent-type hook runs: they never get `SubagentStop`, so they are ignored.
+const HOOK_AGENT_PREFIX: &str = "hook-agent-";
+
+/// `agent_id` is cut to this many characters.
+const MAX_AGENT_ID_CHARS: usize = 64;
+
 /// Prompt / assistant message / session title are cut to this many characters.
 pub const MAX_TEXT_CHARS: usize = 400;
 
@@ -54,6 +68,74 @@ pub struct ClaudeHook {
     pub prompt: Option<String>,
     /// `Stop` / `SubagentStop` / `StopFailure` `last_assistant_message`, normalized.
     pub last_assistant_message: Option<String>,
+    /// Set when the event happened inside a subagent (`agent_id`, trimmed, <= 64 chars).
+    pub agent_id: Option<String>,
+    /// Subagent type, e.g. "Explore" (trimmed).
+    pub agent_type: Option<String>,
+    /// Main-agent `PreToolUse` of the `Agent`/`Task` tool: a subagent is about to start.
+    pub spawn: Option<SubagentSpawn>,
+    /// `tool_input.subagent_type` of a main-agent `Agent`/`Task` tool event (any event).
+    pub spawn_tool_type: Option<String>,
+    /// `Stop` / `SubagentStop` inventory: `None` when absent or not an array.
+    pub background_tasks: Option<Vec<BgAgentTask>>,
+}
+
+/// A queued request to start a subagent (from the main agent's `Agent`/`Task` tool call).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentSpawn {
+    pub agent_type: String,
+    pub description: Option<String>,
+}
+
+/// One agent entry of `background_tasks`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BgAgentTask {
+    pub id: String,
+    pub agent_type: Option<String>,
+    pub description: Option<String>,
+    pub running: bool,
+}
+
+const BG_AGENT_TYPES: &[&str] = &["local_agent", "local_subagent", "subagent"];
+
+const BG_TERMINAL_STATUSES: &[&str] = &[
+    "idle", "done", "success", "succeeded", "complete", "completed", "finished", "failed", "error",
+    "terminated", "exited", "aborted", "expired", "skipped", "crashed", "killed", "cancelled",
+    "canceled", "timed_out",
+];
+
+fn parse_background_tasks(v: Option<&serde_json::Value>) -> Option<Vec<BgAgentTask>> {
+    let arr = v?.as_array()?;
+    let mut out = Vec::new();
+    for item in arr {
+        let Some(o) = item.as_object() else { continue };
+        let text = |k: &str| o.get(k).and_then(|x| x.as_str());
+        if !text("type").is_some_and(|t| BG_AGENT_TYPES.contains(&t)) {
+            continue;
+        }
+        let Some(id) = text("id").map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        let running = match text("status") {
+            Some(st) => !BG_TERMINAL_STATUSES.contains(&st.trim().to_lowercase().as_str()),
+            None => true,
+        };
+        out.push(BgAgentTask {
+            id: id.chars().take(MAX_AGENT_ID_CHARS).collect(),
+            agent_type: text("agent_type").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            description: text("description").and_then(|s| normalize_text(s, false)),
+            running,
+        });
+    }
+    Some(out)
+}
+
+/// "unknown", "untitled", "task", "subagent" carry no information.
+pub fn is_placeholder_label(s: &str) -> bool {
+    let l = s.trim().to_lowercase();
+    ["unknown", "untitled", "task", "subagent"].contains(&l.as_str())
+}
+
+fn real_label(s: &Option<String>) -> Option<String> {
+    s.clone().filter(|s| !is_placeholder_label(s))
 }
 
 impl ClaudeHook {
@@ -139,8 +221,36 @@ pub fn parse_claude_payload(json: &str) -> Option<ClaudeHook> {
     let tool_label = tool_name
         .as_deref()
         .and_then(|t| tool_label(t, obj.get("tool_input").and_then(|x| x.as_object())));
+    let event = get("hook_event_name")?;
+    let agent_id = nonempty("agent_id").map(|s| s.chars().take(MAX_AGENT_ID_CHARS).collect::<String>());
+    let is_spawn_tool = agent_id.is_none() && matches!(tool_name.as_deref(), Some("Agent" | "Task"));
+    let spawn_input = obj.get("tool_input").and_then(|x| x.as_object());
+    let spawn_tool_type = is_spawn_tool.then(|| {
+        spawn_input
+            .and_then(|i| i.get("subagent_type"))
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("general-purpose")
+            .to_string()
+    });
+    let spawn = match (&spawn_tool_type, event == "PreToolUse") {
+        (Some(t), true) => Some(SubagentSpawn {
+            agent_type: t.clone(),
+            description: spawn_input
+                .and_then(|i| i.get("description"))
+                .and_then(|x| x.as_str())
+                .and_then(|s| normalize_text(s, false)),
+        }),
+        _ => None,
+    };
     Some(ClaudeHook {
-        event: get("hook_event_name")?,
+        event,
+        agent_id,
+        agent_type: nonempty("agent_type"),
+        spawn,
+        spawn_tool_type,
+        background_tasks: parse_background_tasks(obj.get("background_tasks")),
         tool_name,
         tool_label,
         notification_type: get("notification_type"),
@@ -267,11 +377,25 @@ fn settle(
         Some(p) if p.kind == kind => (p.model.clone(), p.title.clone(), p.prompt.clone(), p.message.clone()),
         _ => (None, None, None, None),
     };
-    Some(AgentStatus { kind, state, unread, since_unix_ms: since, detail, model, title, prompt, message })
+    let subagents = match &prev {
+        Some(p) if p.kind == kind => p.subagents.clone(),
+        _ => Vec::new(),
+    };
+    Some(AgentStatus { kind, state, unread, since_unix_ms: since, detail, model, title, prompt, message, subagents })
 }
 
 /// All transitions. Returns the new status; equal to `prev` when nothing changed.
 pub fn apply(prev: Option<AgentStatus>, input: AgentInput<'_>, now: u64) -> Option<AgentStatus> {
+    apply_with(prev, input, now, &mut VecDeque::new())
+}
+
+/// Like [`apply`], with the terminal's queue of pending subagent spawns.
+pub fn apply_with(
+    prev: Option<AgentStatus>,
+    input: AgentInput<'_>,
+    now: u64,
+    pending: &mut VecDeque<SubagentSpawn>,
+) -> Option<AgentStatus> {
     match input {
         AgentInput::ProcessExit => None,
         AgentInput::MarkSeen => match prev {
@@ -284,7 +408,7 @@ pub fn apply(prev: Option<AgentStatus>, input: AgentInput<'_>, now: u64) -> Opti
             }
             None => None,
         },
-        AgentInput::Claude(h) => apply_claude(prev, h, now),
+        AgentInput::Claude(h) => apply_claude(prev, h, now, pending),
         AgentInput::Codex(h) => apply_codex(prev, h, now),
         AgentInput::Title { title, hooks_seen } => {
             if hooks_seen {
@@ -296,9 +420,119 @@ pub fn apply(prev: Option<AgentStatus>, input: AgentInput<'_>, now: u64) -> Opti
     }
 }
 
-fn apply_claude(prev: Option<AgentStatus>, h: &ClaudeHook, now: u64) -> Option<AgentStatus> {
+/// Finds or creates a subagent entry (`None` when the roster is full and the id is new).
+fn upsert_sub<'a>(list: &'a mut Vec<SubagentStatus>, id: &str, now: u64) -> Option<&'a mut SubagentStatus> {
+    if let Some(i) = list.iter().position(|s| s.id == id) {
+        return Some(&mut list[i]);
+    }
+    if list.len() >= MAX_SUBAGENTS {
+        return None;
+    }
+    list.push(SubagentStatus {
+        id: id.to_string(),
+        agent_type: None,
+        description: None,
+        state: AgentState::Working,
+        detail: None,
+        since_unix_ms: now,
+    });
+    list.last_mut()
+}
+
+/// Syncs the roster with the `background_tasks` inventory (`None` = keep the roster).
+fn reconcile(list: &mut Vec<SubagentStatus>, bg: &Option<Vec<BgAgentTask>>, now: u64) {
+    let Some(bg) = bg else { return };
+    list.retain(|s| bg.iter().any(|t| t.running && t.id == s.id));
+    for t in bg {
+        if let Some(s) = list.iter_mut().find(|s| s.id == t.id) {
+            if let Some(a) = real_label(&t.agent_type) {
+                s.agent_type = Some(a);
+            }
+            if let Some(d) = real_label(&t.description) {
+                s.description = Some(d);
+            }
+        } else if t.running && list.len() < MAX_SUBAGENTS {
+            list.push(SubagentStatus {
+                id: t.id.clone(),
+                agent_type: real_label(&t.agent_type),
+                description: real_label(&t.description),
+                state: AgentState::Working,
+                detail: None,
+                since_unix_ms: now,
+            });
+        }
+    }
+}
+
+fn apply_claude(
+    prev: Option<AgentStatus>,
+    h: &ClaudeHook,
+    now: u64,
+    pending: &mut VecDeque<SubagentSpawn>,
+) -> Option<AgentStatus> {
     let kind = AgentKind::Claude;
     let tool = h.tool_label.as_ref().or(h.tool_name.as_ref()).map(|t| clip(t)).filter(|t| !t.is_empty());
+    if h.agent_id.as_deref().is_some_and(|id| id.starts_with(HOOK_AGENT_PREFIX)) {
+        return prev;
+    }
+    if let Some(sp) = &h.spawn {
+        if pending.len() >= MAX_PENDING_SPAWNS {
+            pending.pop_front();
+        }
+        pending.push_back(sp.clone());
+    }
+    if matches!(h.event.as_str(), "PostToolUse" | "PostToolUseFailure") {
+        if let Some(t) = &h.spawn_tool_type {
+            // The spawn call finished without its subagent ever starting.
+            if let Some(i) = pending.iter().position(|p| p.agent_type.eq_ignore_ascii_case(t)) {
+                pending.remove(i);
+            }
+        }
+    }
+    if matches!(h.event.as_str(), "SessionStart" | "SessionEnd" | "Stop" | "StopFailure") && h.agent_id.is_none() {
+        pending.clear();
+    }
+    if let Some(id) = h.agent_id.as_deref() {
+        // Events from inside a subagent never change the main status.
+        let waiting_detail = match h.event.as_str() {
+            "PreToolUse" if h.tool_name.as_deref() == Some("AskUserQuestion") => Some(tool.clone()),
+            "PermissionRequest" => Some(tool.clone()),
+            "Notification" if h.notification_type.as_deref() != Some("idle_prompt") => Some(non_empty(&h.message)),
+            "Elicitation" => Some(non_empty(&h.message)),
+            _ => None,
+        };
+        match h.event.as_str() {
+            "SubagentStart" | "SubagentStop" => {}
+            "Notification" if h.notification_type.as_deref() == Some("idle_prompt") => return prev,
+            "StopFailure" => {
+                let mut p = prev?;
+                p.subagents.retain(|s| s.id != id);
+                return Some(p);
+            }
+            "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PermissionRequest" | "Notification"
+            | "Elicitation" => {
+                let mut p = prev?;
+                if let Some(sub) = upsert_sub(&mut p.subagents, id, now) {
+                    if let Some(a) = real_label(&h.agent_type) {
+                        sub.agent_type = Some(a);
+                    }
+                    match waiting_detail {
+                        Some(d) => {
+                            sub.state = AgentState::Waiting;
+                            sub.detail = d;
+                        }
+                        None if h.event == "Notification" => {}
+                        None => {
+                            sub.state = AgentState::Working;
+                            sub.detail = tool;
+                        }
+                    }
+                }
+                return Some(p);
+            }
+            _ => return prev,
+        }
+    }
     match h.event.as_str() {
         // Only record the model / the subagent's final message; the state does not change.
         "PostModelSwitch" | "SubagentStop" => {
@@ -306,8 +540,14 @@ fn apply_claude(prev: Option<AgentStatus>, h: &ClaudeHook, now: u64) -> Option<A
             if let Some(m) = &h.to_model {
                 p.model = Some(m.clone());
             }
-            if h.event == "SubagentStop" && h.last_assistant_message.is_some() {
-                p.message = h.last_assistant_message.clone();
+            if h.event == "SubagentStop" {
+                if h.last_assistant_message.is_some() {
+                    p.message = h.last_assistant_message.clone();
+                }
+                if let Some(id) = h.agent_id.as_deref() {
+                    p.subagents.retain(|s| s.id != id);
+                }
+                reconcile(&mut p.subagents, &h.background_tasks, now);
             }
             return Some(p);
         }
@@ -342,6 +582,37 @@ fn apply_claude(prev: Option<AgentStatus>, h: &ClaudeHook, now: u64) -> Option<A
         _ => return prev,
     };
     let mut s = settle(prev, kind, state, unread, detail, now)?;
+    if h.event == "SessionStart" {
+        s.subagents.clear();
+    }
+    if h.event == "Stop" || h.event == "StopFailure" {
+        reconcile(&mut s.subagents, &h.background_tasks, now);
+    }
+    if h.event == "SubagentStart" {
+        if let Some(id) = h.agent_id.as_deref() {
+            let is_new = !s.subagents.iter().any(|x| x.id == id);
+            let desc = if is_new && s.subagents.len() < MAX_SUBAGENTS {
+                let want = h.agent_type.as_deref().unwrap_or("");
+                pending
+                    .iter()
+                    .position(|p| p.agent_type.eq_ignore_ascii_case(want))
+                    .and_then(|i| pending.remove(i))
+                    .and_then(|p| real_label(&p.description))
+            } else {
+                None
+            };
+            if let Some(sub) = upsert_sub(&mut s.subagents, id, now) {
+                if let Some(a) = real_label(&h.agent_type) {
+                    sub.agent_type = Some(a);
+                }
+                sub.state = AgentState::Working;
+                sub.detail = None;
+                if desc.is_some() {
+                    sub.description = desc;
+                }
+            }
+        }
+    }
     if let Some(m) = &h.model {
         s.model = Some(m.clone());
     }
@@ -473,11 +744,18 @@ fn apply_title(prev: Option<AgentStatus>, title: &str, now: u64) -> Option<Agent
 pub struct AgentTracker {
     status: Option<AgentStatus>,
     hooks_seen: bool,
+    /// Main-agent `Agent`/`Task` calls whose subagent has not started yet (oldest first).
+    pending_spawns: VecDeque<SubagentSpawn>,
 }
 
 impl AgentTracker {
     pub fn status(&self) -> Option<&AgentStatus> {
         self.status.as_ref()
+    }
+
+    #[cfg(test)]
+    fn pending_spawns(&self) -> &VecDeque<SubagentSpawn> {
+        &self.pending_spawns
     }
 
     fn update(&mut self, f: impl FnOnce(Option<AgentStatus>) -> Option<AgentStatus>) -> bool {
@@ -492,7 +770,9 @@ impl AgentTracker {
             return false;
         }
         self.hooks_seen = h.event != "SessionEnd";
-        self.update(|prev| apply(prev, AgentInput::Claude(h), now))
+        let old = self.status.clone();
+        self.status = apply_with(self.status.take(), AgentInput::Claude(h), now, &mut self.pending_spawns);
+        self.status != old
     }
 
     /// Returns true if the status changed.
@@ -511,6 +791,7 @@ impl AgentTracker {
 
     pub fn on_exit(&mut self) -> bool {
         self.hooks_seen = false;
+        self.pending_spawns.clear();
         self.update(|prev| apply(prev, AgentInput::ProcessExit, 0))
     }
 
@@ -552,6 +833,7 @@ mod tests {
             title: None,
             prompt: None,
             message: None,
+            subagents: Vec::new(),
         })
     }
 
@@ -1179,5 +1461,413 @@ mod tests {
         assert!(!w.as_ref().unwrap().unread);
         let d = run(w, "Stop", "", T0 + 5).unwrap();
         assert!(d.unread);
+    }
+
+    // ---- subagents ----
+
+    fn srun(
+        prev: Option<AgentStatus>,
+        pending: &mut VecDeque<SubagentSpawn>,
+        event: &str,
+        extra: &str,
+        now: u64,
+    ) -> Option<AgentStatus> {
+        let h = hook(&payload(event, extra));
+        apply_with(prev, AgentInput::Claude(&h), now, pending)
+    }
+
+    fn working() -> Option<AgentStatus> {
+        st(AgentState::Working)
+    }
+
+    fn start(prev: Option<AgentStatus>, pending: &mut VecDeque<SubagentSpawn>, id: &str, ty: &str, now: u64) -> Option<AgentStatus> {
+        srun(prev, pending, "SubagentStart", &format!(r#","agent_id":"{id}","agent_type":"{ty}""#), now)
+    }
+
+    #[test]
+    fn parse_subagent_fields() {
+        let h = hook(&payload("PreToolUse", r#","agent_id":"  agent-1 ","agent_type":" Explore ","tool_name":"Grep""#));
+        assert_eq!(h.agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(h.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(h.spawn, None);
+        let long = "x".repeat(200);
+        let h = hook(&payload("PreToolUse", &format!(r#","agent_id":"{long}""#)));
+        assert_eq!(h.agent_id.unwrap().chars().count(), 64);
+        let h = hook(&payload("PreToolUse", r#","agent_id":"  ","agent_type":"""#));
+        assert_eq!((h.agent_id, h.agent_type), (None, None));
+        let h = hook(&payload("PreToolUse", r#","agent_id":5"#));
+        assert_eq!(h.agent_id, None);
+    }
+
+    #[test]
+    fn parse_spawn_from_agent_and_task_tools() {
+        for tool in ["Agent", "Task"] {
+            let h = hook(&payload(
+                "PreToolUse",
+                &format!(r#","tool_name":"{tool}","tool_input":{{"description":" Find  the\nparser ","prompt":"p","subagent_type":" Explore "}}"#),
+            ));
+            let sp = h.spawn.expect("spawn");
+            assert_eq!(sp.agent_type, "Explore");
+            assert_eq!(sp.description.as_deref(), Some("Find the parser"));
+        }
+        // Default type, no description, malformed input.
+        let h = hook(&payload("PreToolUse", r#","tool_name":"Agent","tool_input":{}"#));
+        assert_eq!(h.spawn, Some(SubagentSpawn { agent_type: "general-purpose".into(), description: None }));
+        let h = hook(&payload("PreToolUse", r#","tool_name":"Agent","tool_input":"oops""#));
+        assert_eq!(h.spawn.unwrap().agent_type, "general-purpose");
+        // Not a spawn: other tool, other event, inside a subagent.
+        assert_eq!(hook(&payload("PreToolUse", r#","tool_name":"Bash""#)).spawn, None);
+        assert_eq!(hook(&payload("PostToolUse", r#","tool_name":"Agent""#)).spawn, None);
+        assert_eq!(hook(&payload("PostToolUse", r#","tool_name":"Agent""#)).spawn_tool_type.as_deref(), Some("general-purpose"));
+        assert_eq!(hook(&payload("PreToolUse", r#","agent_id":"a","tool_name":"Agent""#)).spawn, None);
+    }
+
+    #[test]
+    fn parse_background_tasks_variants() {
+        assert_eq!(hook(&payload("Stop", "")).background_tasks, None);
+        assert_eq!(hook(&payload("Stop", r#","background_tasks":"x""#)).background_tasks, None);
+        assert_eq!(hook(&payload("Stop", r#","background_tasks":{"id":"a"}"#)).background_tasks, None);
+        assert_eq!(hook(&payload("Stop", r#","background_tasks":[]"#)).background_tasks, Some(vec![]));
+        let h = hook(&payload(
+            "Stop",
+            r#","background_tasks":[
+                {"id":"a1","type":"local_agent","status":"running","agent_type":"Explore","description":"Look  around"},
+                {"id":"a2","type":"subagent","status":"Completed"},
+                {"id":"a3","type":"local_subagent"},
+                {"id":"a4","type":"teammate","status":"running"},
+                {"id":"a5","type":"shell","status":"running"},
+                {"id":"","type":"subagent"},
+                {"type":"subagent"},
+                {"id":7,"type":"subagent"},
+                "junk", 5, null,
+                {"id":"a6","type":"subagent","status":"TIMED_OUT"}
+            ]"#,
+        ));
+        let bg = h.background_tasks.unwrap();
+        let ids: Vec<(&str, bool)> = bg.iter().map(|t| (t.id.as_str(), t.running)).collect();
+        assert_eq!(ids, [("a1", true), ("a2", false), ("a3", true), ("a6", false)]);
+        assert_eq!(bg[0].agent_type.as_deref(), Some("Explore"));
+        assert_eq!(bg[0].description.as_deref(), Some("Look around"));
+        assert_eq!(bg[1].agent_type, None);
+    }
+
+    #[test]
+    fn background_task_terminal_statuses_are_not_running() {
+        for st in [
+            "idle", "done", "success", "succeeded", "complete", "completed", "finished", "failed", "error",
+            "terminated", "exited", "aborted", "expired", "skipped", "crashed", "killed", "cancelled",
+            "canceled", "timed_out", "DONE",
+        ] {
+            let h = hook(&payload("Stop", &format!(r#","background_tasks":[{{"id":"a","type":"subagent","status":"{st}"}}]"#)));
+            assert!(!h.background_tasks.unwrap()[0].running, "{st}");
+        }
+        for st in ["running", "pending", "started", ""] {
+            let h = hook(&payload("Stop", &format!(r#","background_tasks":[{{"id":"a","type":"subagent","status":"{st}"}}]"#)));
+            assert!(h.background_tasks.unwrap()[0].running, "{st}");
+        }
+    }
+
+    #[test]
+    fn subagent_start_without_pending_has_no_description() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "agent-1", "Explore", T0 + 5).unwrap();
+        assert_eq!(s.subagents.len(), 1);
+        let sub = &s.subagents[0];
+        assert_eq!(sub.id, "agent-1");
+        assert_eq!(sub.agent_type.as_deref(), Some("Explore"));
+        assert_eq!(sub.description, None);
+        assert_eq!((sub.state, sub.detail.clone(), sub.since_unix_ms), (AgentState::Working, None, T0 + 5));
+        assert_eq!(s.state, AgentState::Working);
+    }
+
+    #[test]
+    fn subagent_start_takes_matching_pending_description() {
+        let mut q = VecDeque::new();
+        let s = srun(
+            working(),
+            &mut q,
+            "PreToolUse",
+            r#","tool_name":"Agent","tool_input":{"description":"Find parser","subagent_type":"Explore"}"#,
+            T0 + 1,
+        );
+        let s = srun(
+            s,
+            &mut q,
+            "PreToolUse",
+            r#","tool_name":"Task","tool_input":{"description":"Review","subagent_type":"reviewer"}"#,
+            T0 + 2,
+        );
+        assert_eq!(q.len(), 2);
+        // Main detail is the tool label as usual.
+        assert_eq!(s.as_ref().unwrap().detail.as_deref(), Some("Task"));
+        // Case-insensitive match picks the second entry, not the first.
+        let s = start(s, &mut q, "agent-r", "Reviewer", T0 + 3).unwrap();
+        assert_eq!(s.subagents[0].description.as_deref(), Some("Review"));
+        assert_eq!(q.len(), 1);
+        let s = start(Some(s), &mut q, "agent-e", "Explore", T0 + 4).unwrap();
+        assert_eq!(s.subagents[1].description.as_deref(), Some("Find parser"));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn placeholder_labels_are_treated_as_absent() {
+        let mut q = VecDeque::new();
+        let s = srun(
+            working(),
+            &mut q,
+            "PreToolUse",
+            r#","tool_name":"Agent","tool_input":{"description":"Task","subagent_type":"Explore"}"#,
+            T0 + 1,
+        );
+        let s = start(s, &mut q, "a1", "Explore", T0 + 2).unwrap();
+        assert_eq!(s.subagents[0].description, None);
+        let s = start(Some(s), &mut q, "a2", "Unknown", T0 + 3).unwrap();
+        assert_eq!(s.subagents[1].agent_type, None);
+        assert!(is_placeholder_label(" Untitled "));
+        assert!(is_placeholder_label("SUBAGENT"));
+        assert!(!is_placeholder_label("Explore"));
+    }
+
+    #[test]
+    fn start_less_child_tool_event_creates_subagent_and_keeps_main() {
+        let mut q = VecDeque::new();
+        let main = srun(None, &mut q, "PreToolUse", r#","tool_name":"Bash","tool_input":{"command":"ls"}"#, T0).unwrap();
+        let s = srun(
+            Some(main.clone()),
+            &mut q,
+            "PreToolUse",
+            r#","agent_id":"agent-9","agent_type":"Explore","tool_name":"Grep""#,
+            T0 + 50,
+        )
+        .unwrap();
+        assert_eq!((s.state, s.detail.clone(), s.since_unix_ms), (main.state, main.detail.clone(), main.since_unix_ms));
+        assert_eq!(s.subagents.len(), 1);
+        let sub = &s.subagents[0];
+        assert_eq!((sub.id.as_str(), sub.since_unix_ms, sub.state), ("agent-9", T0 + 50, AgentState::Working));
+        assert_eq!(sub.detail.as_deref(), Some("Grep"));
+        assert_eq!(sub.agent_type.as_deref(), Some("Explore"));
+        // PostToolUse / PostToolUseFailure in the child update the same entry, no duplicates.
+        for ev in ["PostToolUse", "PostToolUseFailure"] {
+            let s2 = srun(Some(s.clone()), &mut q, ev, r#","agent_id":"agent-9","tool_name":"Read","tool_input":{"file_path":"/a/b.rs"}"#, T0 + 60).unwrap();
+            assert_eq!(s2.subagents.len(), 1);
+            assert_eq!(s2.subagents[0].detail.as_deref(), Some("Read: b.rs"));
+            assert_eq!(s2.subagents[0].since_unix_ms, T0 + 50);
+            assert_eq!((s2.state, s2.detail.clone()), (main.state, main.detail.clone()));
+        }
+        // Child events without any main status are ignored.
+        assert_eq!(srun(None, &mut q, "PreToolUse", r#","agent_id":"a","tool_name":"Grep""#, T0), None);
+    }
+
+    #[test]
+    fn child_post_tool_use_ignores_straggler_rule() {
+        let mut q = VecDeque::new();
+        let done = srun(working(), &mut q, "Stop", "", T0 + 100);
+        let s = srun(done, &mut q, "PostToolUse", r#","agent_id":"a","tool_name":"Read""#, T0 + 200).unwrap();
+        assert_eq!(s.state, AgentState::Done);
+        assert_eq!(s.subagents.len(), 1);
+    }
+
+    #[test]
+    fn waiting_child_events() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1);
+        for (ev, extra, want) in [
+            ("PreToolUse", r#","tool_name":"AskUserQuestion""#, "AskUserQuestion"),
+            ("PermissionRequest", r#","tool_name":"Bash","tool_input":{"command":"rm x"}"#, "Bash: rm x"),
+            ("Notification", r#","message":"needs input","notification_type":"permission_prompt""#, "needs input"),
+            ("Elicitation", r#","message":"pick one""#, "pick one"),
+        ] {
+            let extra = format!(r#","agent_id":"a1"{extra}"#);
+            let w = srun(s.clone(), &mut q, ev, &extra, T0 + 5).unwrap();
+            assert_eq!(w.subagents[0].state, AgentState::Waiting, "{ev}");
+            assert_eq!(w.subagents[0].detail.as_deref(), Some(want), "{ev}");
+            assert_eq!(w.state, AgentState::Working, "{ev}");
+            assert_eq!(w.detail, None, "{ev}");
+            // The next tool event brings it back to Working.
+            let b = srun(Some(w), &mut q, "PreToolUse", r#","agent_id":"a1","tool_name":"Grep""#, T0 + 6).unwrap();
+            assert_eq!(b.subagents[0].state, AgentState::Working);
+        }
+        // idle_prompt inside a child changes nothing.
+        let same = srun(s.clone(), &mut q, "Notification", r#","agent_id":"a1","notification_type":"idle_prompt","message":"idle""#, T0 + 7);
+        assert_eq!(same, s);
+    }
+
+    #[test]
+    fn subagent_stop_removes_and_stores_message() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1);
+        let s = start(s, &mut q, "a2", "Plan", T0 + 2);
+        let s = srun(s, &mut q, "SubagentStop", r#","agent_id":"a1","agent_type":"Explore","last_assistant_message":"found it""#, T0 + 3).unwrap();
+        assert_eq!(s.subagents.len(), 1);
+        assert_eq!(s.subagents[0].id, "a2");
+        assert_eq!(s.message.as_deref(), Some("found it"));
+        assert_eq!(s.state, AgentState::Working);
+        // Unknown id: no-op for the roster. Without status: nothing.
+        let s2 = srun(Some(s.clone()), &mut q, "SubagentStop", r#","agent_id":"zzz""#, T0 + 4).unwrap();
+        assert_eq!(s2.subagents, s.subagents);
+        assert_eq!(srun(None, &mut q, "SubagentStop", r#","agent_id":"a""#, T0), None);
+    }
+
+    #[test]
+    fn stop_failure_with_agent_id_only_removes_subagent() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1).unwrap();
+        let f = srun(Some(s.clone()), &mut q, "StopFailure", r#","agent_id":"a1","error":"rate_limit""#, T0 + 2).unwrap();
+        assert!(f.subagents.is_empty());
+        assert_eq!((f.state, f.unread, f.detail.clone()), (AgentState::Working, false, None));
+        // A main StopFailure still fails the main agent.
+        let f = srun(Some(s), &mut q, "StopFailure", r#","error":"rate_limit""#, T0 + 3).unwrap();
+        assert_eq!(f.state, AgentState::Failed);
+    }
+
+    #[test]
+    fn reconcile_adds_removes_and_updates() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1);
+        let s = start(s, &mut q, "a2", "Plan", T0 + 2);
+        let s = srun(
+            s,
+            &mut q,
+            "Stop",
+            r#","background_tasks":[
+                {"id":"a1","type":"local_agent","status":"running","description":"Scan repo","agent_type":"Task"},
+                {"id":"a2","type":"local_agent","status":"completed"},
+                {"id":"a3","type":"subagent","agent_type":"Reviewer"},
+                {"id":"a4","type":"subagent","status":"failed"}
+            ]"#,
+            T0 + 10,
+        )
+        .unwrap();
+        let ids: Vec<&str> = s.subagents.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(ids, ["a1", "a3"]);
+        assert_eq!(s.subagents[0].description.as_deref(), Some("Scan repo"));
+        assert_eq!(s.subagents[0].agent_type.as_deref(), Some("Explore"), "placeholder does not overwrite");
+        assert_eq!(s.subagents[0].since_unix_ms, T0 + 1);
+        assert_eq!(s.subagents[1].agent_type.as_deref(), Some("Reviewer"));
+        assert_eq!((s.subagents[1].state, s.subagents[1].since_unix_ms), (AgentState::Working, T0 + 10));
+        assert_eq!(s.state, AgentState::Done);
+        // Empty inventory removes everything.
+        let s = srun(Some(s), &mut q, "Stop", r#","background_tasks":[]"#, T0 + 20).unwrap();
+        assert!(s.subagents.is_empty());
+    }
+
+    #[test]
+    fn absent_inventory_keeps_roster() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1);
+        let s = srun(s, &mut q, "Stop", "", T0 + 5).unwrap();
+        assert_eq!(s.state, AgentState::Done);
+        assert_eq!(s.subagents.len(), 1);
+        let s = srun(Some(s), &mut q, "SubagentStop", r#","agent_id":"other","background_tasks":"bad""#, T0 + 6).unwrap();
+        assert_eq!(s.subagents.len(), 1);
+        // SubagentStop reconciles with an inventory too.
+        let s = srun(Some(s), &mut q, "SubagentStop", r#","agent_id":"a1","background_tasks":[{"id":"b","type":"subagent"}]"#, T0 + 7).unwrap();
+        assert_eq!(s.subagents.len(), 1);
+        assert_eq!(s.subagents[0].id, "b");
+        // A new prompt keeps background subagents.
+        let s = srun(Some(s), &mut q, "UserPromptSubmit", r#","prompt":"x""#, T0 + 8).unwrap();
+        assert_eq!(s.subagents.len(), 1);
+        assert_eq!(s.state, AgentState::Working);
+    }
+
+    #[test]
+    fn hook_agent_events_are_ignored() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1);
+        for ev in ["SubagentStart", "PreToolUse", "PostToolUse", "PermissionRequest", "SubagentStop", "StopFailure"] {
+            let r = srun(s.clone(), &mut q, ev, r#","agent_id":"hook-agent-42","agent_type":"x","tool_name":"Bash""#, T0 + 9);
+            assert_eq!(r, s, "{ev}");
+        }
+        assert_eq!(srun(None, &mut q, "SubagentStart", r#","agent_id":"hook-agent-1""#, T0), None);
+    }
+
+    #[test]
+    fn subagent_roster_is_capped_at_16() {
+        let mut q = VecDeque::new();
+        let mut s = working();
+        for i in 0..20 {
+            s = start(s, &mut q, &format!("a{i}"), "Explore", T0 + i);
+        }
+        let list = s.as_ref().unwrap().subagents.clone();
+        assert_eq!(list.len(), MAX_SUBAGENTS);
+        assert_eq!(list.last().unwrap().id, "a15");
+        // Child tool events for a new id are dropped, known ones still update.
+        let s2 = srun(s.clone(), &mut q, "PreToolUse", r#","agent_id":"new","tool_name":"Grep""#, T0 + 99).unwrap();
+        assert_eq!(s2.subagents.len(), MAX_SUBAGENTS);
+        let s3 = srun(s, &mut q, "PreToolUse", r#","agent_id":"a3","tool_name":"Grep""#, T0 + 99).unwrap();
+        assert_eq!(s3.subagents[3].detail.as_deref(), Some("Grep"));
+        // Inventory cannot overflow either.
+        let many: Vec<String> = (0..30).map(|i| format!(r#"{{"id":"b{i}","type":"subagent"}}"#)).collect();
+        let s4 = srun(working(), &mut q, "Stop", &format!(r#","background_tasks":[{}]"#, many.join(",")), T0).unwrap();
+        assert_eq!(s4.subagents.len(), MAX_SUBAGENTS);
+    }
+
+    #[test]
+    fn pending_queue_cap_and_removal_on_main_post_tool_use() {
+        let mut q = VecDeque::new();
+        let mut s = working();
+        for i in 0..20 {
+            s = srun(
+                s,
+                &mut q,
+                "PreToolUse",
+                &format!(r#","tool_name":"Agent","tool_input":{{"description":"d{i}","subagent_type":"t{i}"}}"#),
+                T0 + i,
+            );
+        }
+        assert_eq!(q.len(), MAX_PENDING_SPAWNS);
+        assert_eq!(q.front().unwrap().description.as_deref(), Some("d4"), "oldest dropped");
+        // Main PostToolUse of the Agent tool drops its still-queued spawn.
+        let s = srun(s, &mut q, "PostToolUse", r#","tool_name":"Agent","tool_input":{"subagent_type":"t10"}"#, T0 + 100);
+        assert_eq!(q.len(), MAX_PENDING_SPAWNS - 1);
+        assert!(!q.iter().any(|p| p.agent_type == "t10"));
+        // The same event from inside a subagent does not touch the queue.
+        srun(s, &mut q, "PostToolUse", r#","agent_id":"x","tool_name":"Agent","tool_input":{"subagent_type":"t11"}"#, T0 + 101);
+        assert!(q.iter().any(|p| p.agent_type == "t11"));
+        // Stop clears the queue.
+        srun(working(), &mut q, "Stop", "", T0 + 102);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn session_end_start_and_exit_clear_roster() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1);
+        assert_eq!(srun(s.clone(), &mut q, "SessionEnd", "", T0 + 2), None);
+        let fresh = srun(s.clone(), &mut q, "SessionStart", "", T0 + 2).unwrap();
+        assert!(fresh.subagents.is_empty());
+        assert_eq!(apply(s.clone(), AgentInput::ProcessExit, T0), None);
+        // MarkSeen keeps it.
+        let seen = apply(s.clone(), AgentInput::MarkSeen, T0 + 3).unwrap();
+        assert_eq!(seen.subagents.len(), 1);
+        // A different agent kind (title fallback) starts from scratch.
+        let gem = apply(s, AgentInput::Title { title: "\u{2726} g", hooks_seen: false }, T0 + 4).unwrap();
+        assert_eq!(gem.kind, AgentKind::Gemini);
+        assert!(gem.subagents.is_empty());
+    }
+
+    #[test]
+    fn settle_carries_roster_within_same_kind() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1);
+        for ev in ["PreToolUse", "PermissionRequest", "Notification", "Stop", "UserPromptSubmit"] {
+            let r = srun(s.clone(), &mut q, ev, r#","tool_name":"Bash","message":"m""#, T0 + 9).unwrap();
+            assert_eq!(r.subagents.len(), 1, "{ev}");
+        }
+    }
+
+    #[test]
+    fn tracker_keeps_pending_queue_and_clears_it() {
+        let mut t = AgentTracker::default();
+        let spawn = hook(&payload("PreToolUse", r#","tool_name":"Agent","tool_input":{"description":"D","subagent_type":"Explore"}"#));
+        assert!(t.on_claude_hook(&spawn, T0));
+        assert_eq!(t.pending_spawns().len(), 1);
+        assert!(t.on_claude_hook(&hook(&payload("SubagentStart", r#","agent_id":"a1","agent_type":"Explore""#)), T0 + 1));
+        assert!(t.pending_spawns().is_empty());
+        let s = t.status().unwrap();
+        assert_eq!(s.subagents[0].description.as_deref(), Some("D"));
+        t.on_claude_hook(&spawn, T0 + 2);
+        t.on_exit();
+        assert!(t.pending_spawns().is_empty());
     }
 }

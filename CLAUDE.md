@@ -11,6 +11,7 @@ Sich is a terminal shell for AI agents. It is not an agent harness. The user run
   - official plugin/settings APIs
   - official CLI flags and env vars
   - passively reading what the agent prints to the terminal (titles, OSC, BEL)
+  - reading (read-only) the agent's local session/transcript files on the user's disk, e.g. a `transcript_path` passed by a hook. Read only the fields needed, and fail soft: these formats are undocumented and may change.
 - NEVER:
   - read, copy or reuse the agents' credentials or OAuth tokens;
   - call Anthropic/other model APIs using a subscription login;

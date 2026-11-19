@@ -595,6 +595,15 @@ pub fn codex_hooks_installed(lang: Language, events: Option<usize>, codex_versio
     if parts.is_empty() { head.to_string() } else { format!("{head} ({})", parts.join(", ")) }
 }
 
+/// The "+N" row under an agent when more subagents run than are listed.
+pub fn more_subagents(lang: Language, n: usize) -> String {
+    match lang {
+        Language::Uk => format!("ще {n} субагентів"),
+        Language::Ru => format!("ещё {n} субагентов"),
+        Language::En => format!("{n} more subagents"),
+    }
+}
+
 pub fn connected(lang: Language, pid: u32) -> String {
     match lang {
         Language::Uk => format!("Підключено до демона (pid {pid})"),
@@ -702,6 +711,7 @@ mod tests {
             assert!(daemon_incompatible(lang, Some(1), 2).contains("v1"));
             assert!(daemon_incompatible(lang, None, 2).contains("v2"));
             assert!(exited_tab(lang, "pwsh").starts_with("pwsh ("));
+            assert!(more_subagents(lang, 7).contains('7'));
             assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains('9'));
             assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains("v2.1.3"));
             assert!(!hooks_installed(lang, None, None).contains('('));

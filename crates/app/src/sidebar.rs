@@ -8,20 +8,21 @@ use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMen
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    ClickEvent, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement as _,
+    AnyElement, ClickEvent, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, PathPromptOptions, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use sich_proto::{GroupId, GroupInfo, ProjectId, ProjectInfo, TermId, TerminalInfo, WorktreeInfo};
+use sich_proto::{GroupId, GroupInfo, ProjectId, ProjectInfo, SubagentStatus, TermId, TerminalInfo, WorktreeInfo};
 
 use crate::agent_badge::{
-    Badge, agent_icon_element, agent_preview, badge_element, badge_for, rollup, shorten_model,
+    Badge, agent_icon_element, agent_preview, badge_element, badge_for, rollup, shorten_model, subagent_badge,
+    subagent_detail, subagent_label, subagent_tooltip,
 };
 use crate::app_view::AppView;
 use crate::daemon_client::Snapshot;
 use crate::group_dialogs;
 use crate::groups::{group_badge, group_projects};
-use crate::i18n::{Language, Tr, relative_time, tr};
+use crate::i18n::{Language, Tr, more_subagents, relative_time, tr};
 use crate::os;
 use crate::tab_bar::{entry_title, tab_label};
 use crate::workspace::{WorkspaceKey, same_path, terminals_in};
@@ -54,6 +55,16 @@ const ROW_GAP: f32 = 6.;
 /// Preview line indent: under the title (lead slot + gap).
 const PREVIEW_INDENT: f32 = LEAD_SLOT_W + ROW_GAP;
 const INDENT: f32 = 14.;
+/// Height of a subagent child row.
+const SUB_ROW_H: f32 = 24.;
+/// At most this many subagent rows are listed under an agent (the rest collapse into "+N").
+const MAX_VISIBLE_SUBAGENTS: usize = 4;
+
+/// The subagents to list (first `max`, in roster order) and how many are hidden.
+pub fn visible_subagents(list: &[SubagentStatus], max: usize) -> (&[SubagentStatus], usize) {
+    let shown = list.len().min(max);
+    (&list[..shown], list.len() - shown)
+}
 
 /// Branch name, or the folder name when detached / not a git project.
 pub fn worktree_label(w: &WorktreeInfo) -> String {
@@ -655,7 +666,7 @@ impl AppView {
         snap: &Snapshot,
         lang: Language,
         cx: &mut Context<Self>,
-    ) -> Vec<Stateful<Div>> {
+    ) -> Vec<AnyElement> {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let active = self.ws.active_in(key, ids);
@@ -683,6 +694,7 @@ impl AppView {
                         cx.stop_propagation();
                     }));
                 let close = div().invisible().group_hover(group.clone(), |s| s.visible()).child(close);
+                let key_for_sub = key.clone();
                 let key = key.clone();
                 let row = row_base(("side-term", id), selected, indent, &theme)
                     .group(group.clone())
@@ -702,7 +714,8 @@ impl AppView {
                         row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
                             .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
                             .children(badge)
-                            .child(close),
+                            .child(close)
+                            .into_any_element(),
                     );
                 };
                 let icon = agent_icon_element(status.kind, LEAD_SLOT_W, theme.foreground, muted);
@@ -763,12 +776,96 @@ impl AppView {
                         .child(text)
                 });
                 let height = if line2.is_some() { AGENT_ROW_H } else { ROW_H };
-                Some(
-                    row.h(px(height))
-                        .child(v_flex().flex_1().min_w_0().gap(px(2.)).child(line1).children(line2)),
-                )
+                let row = row
+                    .h(px(height))
+                    .child(v_flex().flex_1().min_w_0().gap(px(2.)).child(line1).children(line2));
+                if status.subagents.is_empty() {
+                    return Some(row.into_any_element());
+                }
+                let (shown, hidden) = visible_subagents(&status.subagents, MAX_VISIBLE_SUBAGENTS);
+                let mut children: Vec<AnyElement> = shown
+                    .iter()
+                    .map(|sub| self.render_subagent_row(key_for_sub.clone(), id, sub, indent + INDENT, lang, cx))
+                    .collect();
+                if hidden > 0 {
+                    children.push(
+                        h_flex()
+                            .id(("side-sub-more", id))
+                            .w_full()
+                            .h(px(SUB_ROW_H))
+                            .flex_shrink_0()
+                            .pl(px(8. + indent + INDENT + LEAD_SLOT_W + ROW_GAP))
+                            .pr_2()
+                            .items_center()
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child(more_subagents(lang, hidden))
+                            .into_any_element(),
+                    );
+                }
+                Some(v_flex().child(row).children(children).into_any_element())
             })
             .collect()
+    }
+
+    /// One child row of an agent row: status badge, label, detail and elapsed time.
+    fn render_subagent_row(
+        &self,
+        key: WorkspaceKey,
+        term: TermId,
+        sub: &SubagentStatus,
+        indent: f32,
+        lang: Language,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let muted = theme.muted_foreground;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(term, &sub.id), &mut hasher);
+        let uid = std::hash::Hasher::finish(&hasher);
+        let tip = subagent_tooltip(sub);
+        let badge = badge_element(&subagent_badge(sub), lang, ("side-sub-badge", uid), cx);
+        row_base(("side-sub", uid), false, indent, &theme)
+            .h(px(SUB_ROW_H))
+            .gap(px(ROW_GAP))
+            .text_color(theme.sidebar_foreground)
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.activate_terminal_in(key.clone(), term, window, cx)
+            }))
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .w(px(LEAD_SLOT_W))
+                    .h(px(LEAD_SLOT_W))
+                    .items_center()
+                    .justify_center()
+                    .child(badge),
+            )
+            .child(
+                div()
+                    .max_w(gpui_kit::relative(0.6))
+                    .truncate()
+                    .text_size(px(12.))
+                    .child(subagent_label(sub)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.5))
+                    .text_color(muted)
+                    .children(subagent_detail(sub)),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.))
+                    .text_color(muted)
+                    .child(relative_time(lang, now_unix_ms(), sub.since_unix_ms)),
+            )
+            .into_any_element()
     }
 }
 
@@ -777,6 +874,35 @@ mod tests {
     use super::*;
     use crate::agent_badge::BadgeKind;
     use sich_proto::{AgentKind, AgentState, AgentStatus};
+
+    #[test]
+    fn visible_subagents_caps_and_counts_hidden() {
+        let mk = |n: usize| -> Vec<SubagentStatus> {
+            (0..n)
+                .map(|i| SubagentStatus {
+                    id: format!("a{i}"),
+                    agent_type: None,
+                    description: None,
+                    state: AgentState::Working,
+                    detail: None,
+                    since_unix_ms: 1,
+                })
+                .collect()
+        };
+        let empty = mk(0);
+        let (v, h) = visible_subagents(&empty, 4);
+        assert_eq!((v.len(), h), (0, 0));
+        let four = mk(4);
+        let (v, h) = visible_subagents(&four, 4);
+        assert_eq!((v.len(), h), (4, 0));
+        let list = mk(7);
+        let (v, h) = visible_subagents(&list, 4);
+        assert_eq!((v.len(), h), (4, 3));
+        assert_eq!(v[0].id, "a0");
+        assert_eq!(v[3].id, "a3");
+        let (v, h) = visible_subagents(&list, 0);
+        assert_eq!((v.len(), h), (0, 7));
+    }
 
     #[test]
     fn sidebar_width_is_clamped() {
@@ -837,6 +963,7 @@ mod tests {
                 title: None,
                 prompt: None,
                 message: None,
+                subagents: Vec::new(),
             }),
         }
     }

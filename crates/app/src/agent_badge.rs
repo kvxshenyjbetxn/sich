@@ -11,7 +11,7 @@ use gpui_kit::{
     ParentElement as _, StatefulInteractiveElement as _, Styled as _, Transformation, div,
     percentage, px, rgb, svg,
 };
-use sich_proto::{AgentKind, AgentState, AgentStatus};
+use sich_proto::{AgentKind, AgentState, AgentStatus, SubagentStatus};
 
 use crate::i18n::{self, Language, Tr, tr};
 use crate::settings;
@@ -42,8 +42,47 @@ pub struct Badge {
     pub detail: Option<String>,
 }
 
-/// The badge of one terminal; `None` = nothing to show (Idle, or Failed already seen).
-pub fn badge_for(status: &AgentStatus) -> Option<Badge> {
+fn is_placeholder(s: &str) -> bool {
+    let l = s.trim().to_lowercase();
+    ["unknown", "untitled", "task", "subagent"].contains(&l.as_str())
+}
+
+fn real(s: &Option<String>) -> Option<&str> {
+    s.as_deref().map(str::trim).filter(|s| !s.is_empty() && !is_placeholder(s))
+}
+
+/// Display label of a subagent: description, else agent type, else the last 8 chars of its id.
+pub fn subagent_label(s: &SubagentStatus) -> String {
+    if let Some(l) = real(&s.description).or_else(|| real(&s.agent_type)) {
+        return l.to_string();
+    }
+    let n = s.id.chars().count();
+    s.id.chars().skip(n.saturating_sub(8)).collect()
+}
+
+/// The muted detail of a subagent row: its current detail, else the agent type when the label
+/// is the description (so the type is not lost).
+pub fn subagent_detail(s: &SubagentStatus) -> Option<String> {
+    if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        return Some(d.to_string());
+    }
+    if real(&s.description).is_some() { real(&s.agent_type).map(String::from) } else { None }
+}
+
+/// Row tooltip: "<agent_type> \u{2014} <description> \u{2014} <detail>", missing parts skipped.
+pub fn subagent_tooltip(s: &SubagentStatus) -> String {
+    let parts = [real(&s.agent_type), real(&s.description), s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty())];
+    let parts: Vec<&str> = parts.into_iter().flatten().collect();
+    if parts.is_empty() { subagent_label(s) } else { parts.join(" \u{2014} ") }
+}
+
+/// The badge of one subagent (`Working` or `Waiting`).
+pub fn subagent_badge(s: &SubagentStatus) -> Badge {
+    let kind = if s.state == AgentState::Waiting { BadgeKind::Waiting } else { BadgeKind::Working };
+    Badge { kind, detail: s.detail.clone() }
+}
+
+fn main_badge(status: &AgentStatus) -> Option<Badge> {
     let kind = match status.state {
         AgentState::Working => BadgeKind::Working,
         AgentState::Waiting => BadgeKind::Waiting,
@@ -53,6 +92,25 @@ pub fn badge_for(status: &AgentStatus) -> Option<Badge> {
         AgentState::Failed | AgentState::Idle => return None,
     };
     Some(Badge { kind, detail: status.detail.clone() })
+}
+
+/// The badge of one terminal: the highest-priority of the main agent's badge and its
+/// subagents' badges (a waiting or still-working subagent shows through a finished main agent).
+/// `None` = nothing to show (Idle, or Failed already seen).
+pub fn badge_for(status: &AgentStatus) -> Option<Badge> {
+    let mut best = main_badge(status);
+    for sub in &status.subagents {
+        let kind = subagent_badge(sub).kind;
+        if best.as_ref().is_none_or(|b| kind < b.kind) {
+            let label = subagent_label(sub);
+            let detail = match non_blank(&sub.detail) {
+                Some(d) => format!("{label}: {d}"),
+                None => label,
+            };
+            best = Some(Badge { kind, detail: Some(detail) });
+        }
+    }
+    best
 }
 
 /// The most important badge of a group: Waiting > Working > Failed > Done > SeenDone > none. Ties keep the
@@ -225,7 +283,102 @@ mod tests {
             title: None,
             prompt: None,
             message: None,
+            subagents: Vec::new(),
         }
+    }
+
+    fn sub(id: &str, state: AgentState, detail: Option<&str>) -> SubagentStatus {
+        SubagentStatus {
+            id: id.into(),
+            agent_type: None,
+            description: None,
+            state,
+            detail: detail.map(String::from),
+            since_unix_ms: 1,
+        }
+    }
+
+    #[test]
+    fn subagent_label_priority_and_placeholders() {
+        let mut s = sub("agent-abcdef123456", AgentState::Working, None);
+        assert_eq!(subagent_label(&s), "ef123456");
+        s.agent_type = Some("Explore".into());
+        assert_eq!(subagent_label(&s), "Explore");
+        s.description = Some("Find parser".into());
+        assert_eq!(subagent_label(&s), "Find parser");
+        // Placeholders are ignored.
+        s.description = Some(" Untitled ".into());
+        assert_eq!(subagent_label(&s), "Explore");
+        s.agent_type = Some("subagent".into());
+        assert_eq!(subagent_label(&s), "ef123456");
+        // Short ids are used whole.
+        assert_eq!(subagent_label(&sub("ab", AgentState::Working, None)), "ab");
+    }
+
+    #[test]
+    fn subagent_detail_and_tooltip() {
+        let mut s = sub("agent-1", AgentState::Working, Some(" Bash: ls "));
+        assert_eq!(subagent_detail(&s).as_deref(), Some("Bash: ls"));
+        assert_eq!(subagent_tooltip(&s), "Bash: ls");
+        s.agent_type = Some("Explore".into());
+        s.description = Some("Find parser".into());
+        assert_eq!(subagent_tooltip(&s), "Explore \u{2014} Find parser \u{2014} Bash: ls");
+        s.detail = None;
+        assert_eq!(subagent_detail(&s).as_deref(), Some("Explore"));
+        assert_eq!(subagent_tooltip(&s), "Explore \u{2014} Find parser");
+        s.description = None;
+        assert_eq!(subagent_detail(&s), None);
+        assert_eq!(subagent_tooltip(&s), "Explore");
+        let bare = sub("agent-abcdefghij", AgentState::Working, None);
+        assert_eq!(subagent_tooltip(&bare), "cdefghij");
+    }
+
+    #[test]
+    fn waiting_subagent_wins_over_done_main() {
+        let mut m = st(AgentState::Done, true, None);
+        m.subagents.push(sub("a1", AgentState::Waiting, Some("Bash: rm x")));
+        let b = badge_for(&m).unwrap();
+        assert_eq!(b.kind, BadgeKind::Waiting);
+        assert_eq!(b.detail.as_deref(), Some("a1: Bash: rm x"));
+        // Flash decision follows naturally.
+        assert!(should_flash(Some(BadgeKind::Done), Some(b.kind)));
+    }
+
+    #[test]
+    fn working_subagent_keeps_spinner_after_main_stop() {
+        let mut m = st(AgentState::Done, false, None);
+        m.subagents.push(sub("a1", AgentState::Working, None));
+        m.subagents[0].description = Some("Scan".into());
+        let b = badge_for(&m).unwrap();
+        assert_eq!((b.kind, b.detail.as_deref()), (BadgeKind::Working, Some("Scan")));
+        // Idle main with a subagent also shows it.
+        let mut i = st(AgentState::Idle, false, None);
+        assert_eq!(badge_for(&i), None);
+        i.subagents.push(sub("a1", AgentState::Working, None));
+        assert_eq!(badge_for(&i).unwrap().kind, BadgeKind::Working);
+    }
+
+    #[test]
+    fn main_badge_wins_ties_and_higher_priority() {
+        let mut m = st(AgentState::Waiting, false, Some("Perm"));
+        m.subagents.push(sub("a1", AgentState::Waiting, Some("x")));
+        assert_eq!(badge_for(&m).unwrap().detail.as_deref(), Some("Perm"));
+        let mut w = st(AgentState::Working, false, Some("Bash"));
+        w.subagents.push(sub("a1", AgentState::Working, None));
+        assert_eq!(badge_for(&w).unwrap().detail.as_deref(), Some("Bash"));
+        // A waiting subagent beats a working main; the first of several waiting ones is used.
+        w.subagents.push(sub("a2", AgentState::Waiting, None));
+        w.subagents.push(sub("a3", AgentState::Waiting, Some("later")));
+        let b = badge_for(&w).unwrap();
+        assert_eq!((b.kind, b.detail.as_deref()), (BadgeKind::Waiting, Some("a2")));
+    }
+
+    #[test]
+    fn rollup_sees_subagents() {
+        let plain = st(AgentState::Working, false, None);
+        let mut other = st(AgentState::Done, false, None);
+        other.subagents.push(sub("a1", AgentState::Waiting, None));
+        assert_eq!(rollup([&plain, &other]).unwrap().kind, BadgeKind::Waiting);
     }
 
     fn full(state: AgentState, detail: Option<&str>, prompt: Option<&str>, message: Option<&str>) -> AgentStatus {

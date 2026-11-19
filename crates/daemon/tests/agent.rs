@@ -310,3 +310,39 @@ async fn terminal_env_carries_term_id_and_socket() {
     assert!(text.contains(&format!("SICH_SOCKET={}", d.name)), "{text}");
     stop(a, d).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_roster_follows_hooks() {
+    let d = start_daemon("subagents");
+    let mut a = client(&d.name).await;
+    let (shell, args) = idle_shell();
+    let id = create(&mut a, shell, &args).await;
+
+    send(&mut a, hook(id, &event("SubagentStart", r#","agent_id":"agent-abc123","agent_type":"Explore""#))).await;
+    let s = next_status(&mut a, id).await.expect("status");
+    assert_eq!(s.subagents.len(), 1);
+    assert_eq!(s.subagents[0].id, "agent-abc123");
+
+    send(
+        &mut a,
+        hook(
+            id,
+            &event(
+                "PreToolUse",
+                r#","agent_id":"agent-abc123","agent_type":"Explore","tool_name":"Bash","tool_input":{"command":"ls"}"#,
+            ),
+        ),
+    )
+    .await;
+    let s = next_status(&mut a, id).await.expect("status");
+    assert_eq!(s.subagents.len(), 1);
+    assert_eq!(s.subagents[0].detail.as_deref(), Some("Bash: ls"));
+    assert_eq!(s.subagents[0].state, AgentState::Working);
+    assert_eq!(s.detail, None, "main detail untouched");
+
+    send(&mut a, hook(id, &event("SubagentStop", r#","agent_id":"agent-abc123","agent_type":"Explore""#))).await;
+    let s = next_status(&mut a, id).await.expect("status");
+    assert!(s.subagents.is_empty());
+
+    stop(a, d).await;
+}

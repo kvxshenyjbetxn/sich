@@ -118,6 +118,7 @@ mod tests {
                 title: None,
                 prompt: None,
                 message: None,
+                subagents: Vec::new(),
             }),
         }
     }

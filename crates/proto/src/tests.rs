@@ -27,6 +27,24 @@ fn status() -> AgentStatus {
         title: Some("Sync phone feature".into()),
         prompt: Some("fix the bug".into()),
         message: Some("Done, tests pass".into()),
+        subagents: vec![
+            SubagentStatus {
+                id: "agent-abc123".into(),
+                agent_type: Some("Explore".into()),
+                description: Some("Find the parser".into()),
+                state: AgentState::Working,
+                detail: Some("Grep".into()),
+                since_unix_ms: 1_700_000_000_050,
+            },
+            SubagentStatus {
+                id: "agent-def".into(),
+                agent_type: None,
+                description: None,
+                state: AgentState::Waiting,
+                detail: None,
+                since_unix_ms: 1_700_000_000_060,
+            },
+        ],
     }
 }
 
@@ -157,8 +175,8 @@ fn agent_enums_round_trip() {
 }
 
 #[test]
-fn proto_version_is_5() {
-    assert_eq!(PROTO_VERSION, 5);
+fn proto_version_is_6() {
+    assert_eq!(PROTO_VERSION, 6);
 }
 
 #[test]
@@ -185,4 +203,13 @@ fn hello_and_welcome_stay_first_variants() {
     assert_eq!(&hello[..], &[0u8, 1, 1, b'x'][..]);
     let welcome = encode(&ServerMsg::Welcome { proto_version: 2, daemon_pid: 300 }).unwrap();
     assert_eq!(&welcome[..], &[0u8, 2, 0xAC, 0x02][..]);
+}
+
+#[test]
+fn agent_status_with_and_without_subagents_round_trips() {
+    let st = status();
+    assert_eq!(st.subagents.len(), 2);
+    assert_eq!(decode::<AgentStatus>(&encode(&st).unwrap()).unwrap(), st);
+    let none = AgentStatus { subagents: Vec::new(), ..status() };
+    assert_eq!(decode::<AgentStatus>(&encode(&none).unwrap()).unwrap(), none);
 }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTO_VERSION: u32 = 5;
+pub const PROTO_VERSION: u32 = 6;
 
 /// Maximum payload of a single `ServerMsg::Output` frame.
 pub const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
@@ -113,6 +113,22 @@ pub struct AgentStatus {
     pub prompt: Option<String>,
     /// Last assistant message, or the failure text for `Failed` (normalized, <= 400 chars).
     pub message: Option<String>,
+    /// Live Claude Code subagents of this terminal, in start order.
+    pub subagents: Vec<SubagentStatus>,
+}
+
+/// One running Claude Code subagent (attributed by the hook payload's `agent_id`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentStatus {
+    pub id: String,
+    pub agent_type: Option<String>,
+    pub description: Option<String>,
+    /// Only `Working` or `Waiting`.
+    pub state: AgentState,
+    /// Current tool label or the waiting message.
+    pub detail: Option<String>,
+    /// When the subagent started.
+    pub since_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
