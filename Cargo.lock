@@ -6060,6 +6060,7 @@ dependencies = [
  "futures",
  "gpui-kit",
  "parking_lot",
+ "raw-window-handle",
  "regex",
  "serde",
  "serde_json",
@@ -6072,6 +6073,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -1,12 +1,13 @@
 //! Custom gpui element that paints the alacritty grid (modelled after Zed's terminal_element).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use gpui_kit::{
-    App, BorderStyle, Bounds, DispatchPhase, Element, ElementId, FocusHandle, Font, FontStyle,
+    App, BorderStyle, Bounds, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
+    FocusHandle, Font, FontStyle,
     FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, MouseMoveEvent,
     Pixels, Point, SharedString,
     StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point,
@@ -16,6 +17,8 @@ use sich_term::TermSession;
 
 use crate::colors::{self, to_gpui};
 use crate::links::Span;
+use crate::view::TerminalView;
+use crate::win_caret::{self, Caret};
 
 /// Layout of the grid in window coordinates, shared with the view for mouse hit-testing.
 #[derive(Clone, Copy)]
@@ -25,9 +28,12 @@ pub struct Geometry {
     pub line_h: Pixels,
     pub cols: usize,
     pub rows: usize,
+    /// Cursor cell (row, col) in the viewport, when it is visible.
+    pub cursor: Option<(usize, usize)>,
 }
 
 pub type SharedGeometry = Rc<Cell<Option<Geometry>>>;
+pub type SharedCaret = Rc<RefCell<Caret>>;
 
 pub type MoveHandler = Rc<dyn Fn(&MouseMoveEvent, &mut Window, &mut App)>;
 
@@ -37,6 +43,10 @@ pub struct TerminalElement {
     geometry: SharedGeometry,
     on_move: MoveHandler,
     link: Vec<Span>,
+    view: Entity<TerminalView>,
+    /// IME composition text drawn inline at the cursor.
+    marked: Option<String>,
+    caret: SharedCaret,
 }
 
 impl TerminalElement {
@@ -46,8 +56,11 @@ impl TerminalElement {
         geometry: SharedGeometry,
         on_move: MoveHandler,
         link: Vec<Span>,
+        view: Entity<TerminalView>,
+        marked: Option<String>,
+        caret: SharedCaret,
     ) -> Self {
-        Self { session, focus, geometry, on_move, link }
+        Self { session, focus, geometry, on_move, link, view, marked, caret }
     }
 }
 
@@ -187,6 +200,7 @@ impl Element for TerminalElement {
             line_h,
             cols: cols as usize,
             rows: rows as usize,
+            cursor: None,
         }));
 
         let focused = self.focus.is_focused(window) && window.is_window_active();
@@ -355,7 +369,29 @@ impl Element for TerminalElement {
         }
         drop(term);
 
-        let link = std::mem::take(&mut self.link);
+        // Cursor cell for IME positioning and the system caret (even when the shape is hidden).
+        let cursor_cell_pos = (cursor_row >= 0 && (cursor_row as usize) < max_rows)
+            .then(|| (cursor_row as usize, cursor_col.min(max_cols.saturating_sub(1))));
+        if let Some(mut g) = self.geometry.get() {
+            g.cursor = cursor_cell_pos;
+            self.geometry.set(Some(g));
+        }
+
+        // Hidden system caret: lets layout switchers / accessibility see a text field.
+        {
+            let scale = window.scale_factor();
+            let (row, col) = cursor_cell_pos.unwrap_or((0, 0));
+            let pos = win_caret::caret_px(
+                (f32::from(bounds.origin.x), f32::from(bounds.origin.y)),
+                (f32::from(cell_w), f32::from(line_h)),
+                (row, col),
+                scale,
+            );
+            let height = win_caret::caret_height_px(f32::from(line_h), scale);
+            self.caret.borrow_mut().sync(window, focused, pos, height);
+        }
+
+        let link =std::mem::take(&mut self.link);
         Prepaint {
             cell_w,
             line_h,
@@ -386,6 +422,12 @@ impl Element for TerminalElement {
                 on_move(ev, window, cx);
             }
         });
+
+        window.handle_input(
+            &self.focus,
+            ElementInputHandler::new(bounds, self.view.clone()),
+            cx,
+        );
 
         let origin = bounds.origin;
         let (cw, lh) = (prepaint.cell_w, prepaint.line_h);
@@ -498,6 +540,34 @@ impl Element for TerminalElement {
                 }
                 CursorShape::Hidden => {}
             }
+        }
+
+        // IME composition preview: underlined text over the cursor cell.
+        if let (Some(text), Some(g)) = (self.marked.as_ref(), self.geometry.get())
+            && let Some((row, col)) = g.cursor
+            && !text.is_empty()
+        {
+            let o = cell_origin(row, col);
+            let fg = to_gpui(prepaint.link_color);
+            let run = TextRun {
+                len: text.len(),
+                font: prepaint.font.clone(),
+                color: fg,
+                background_color: None,
+                underline: Some(UnderlineStyle { thickness: px(1.), color: Some(fg), wavy: false }),
+                strikethrough: None,
+            };
+            let shaped = window.text_system().shape_line(
+                SharedString::from(text.clone()),
+                prepaint.font_size,
+                &[run],
+                None,
+            );
+            window.paint_quad(fill(
+                Bounds::new(o, size(shaped.width, lh)),
+                to_gpui(prepaint.bg),
+            ));
+            let _ = shaped.paint(o, lh, TextAlign::Left, None, window, cx);
         }
     }
 }

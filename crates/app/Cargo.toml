@@ -28,6 +28,9 @@ dirs.workspace = true
 sys-locale = "0.3"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 embed-resource = "3"
