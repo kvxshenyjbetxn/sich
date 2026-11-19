@@ -31,6 +31,7 @@ dirs.workspace = true
 tempfile = "3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 sys-locale = "0.3"
+dunce = "1"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 
 [target.'cfg(windows)'.dependencies]

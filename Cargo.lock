@@ -6091,6 +6091,7 @@ dependencies = [
  "async-channel",
  "chrono",
  "dirs 6.0.0",
+ "dunce",
  "embed-resource",
  "futures",
  "gpui-kit",

@@ -31,8 +31,9 @@ pub fn launcher_exe() -> Option<PathBuf> {
 
 fn resolve_launcher(env: Option<std::ffi::OsString>, current: Option<PathBuf>) -> Option<PathBuf> {
     match env.filter(|v| !v.is_empty()) {
-        Some(v) => Some(PathBuf::from(v)),
-        None => current,
+        // Never hand out a `\\?\` verbatim path: shells (Git Bash runs agent hooks) can't run it.
+        Some(v) => Some(dunce::simplified(Path::new(&v)).to_path_buf()),
+        None => current.map(|p| dunce::simplified(&p).to_path_buf()),
     }
 }
 
@@ -71,7 +72,7 @@ fn gui_spawn_args(args: &[String]) -> Vec<String> {
 }
 
 fn canonical_or(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Launcher step for the GUI: copies this build to the host dir, spawns it with the same args,
@@ -255,6 +256,13 @@ mod tests {
         assert_eq!(resolve_launcher(Some("".into()), cur.clone()), cur);
         assert_eq!(resolve_launcher(None, cur.clone()), cur);
         assert_eq!(resolve_launcher(None, None), None);
+        // Regression: a `\\?\` verbatim path broke hook commands run by Git Bash.
+        #[cfg(windows)]
+        {
+            let plain = Some(PathBuf::from(r"E:\dev\sich.exe"));
+            assert_eq!(resolve_launcher(Some(r"\\?\E:\dev\sich.exe".into()), None), plain);
+            assert_eq!(resolve_launcher(None, Some(PathBuf::from(r"\\?\E:\dev\sich.exe"))), plain);
+        }
         assert_eq!(gui_spawn_args(&s(&["--takeover"])), s(&["--takeover"]));
         assert!(gui_spawn_args(&[]).is_empty());
     }
