@@ -1,7 +1,9 @@
-//! Terminal tab bar of the selected workspace.
+//! Terminal and diff tabs of the selected workspace.
 
 use std::path::Path;
 
+use gpui_kit::assets::IconName as Ic;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
 use gpui_kit::{
@@ -13,6 +15,7 @@ use sich_proto::TermId;
 use crate::agent_badge::{agent_icon_element, badge_element, badge_for, strip_status_glyphs};
 use crate::app_view::AppView;
 use crate::daemon_client::{Snapshot, TermEntry};
+use crate::diff_view::{source_label, split_file_label};
 use crate::i18n::{self, Language, Tr, tr};
 
 pub const TAB_BAR_H: f32 = 34.;
@@ -129,6 +132,43 @@ impl AppView {
             )
         });
 
+        let diff_tabs = self.workspace_diffs().into_iter().flat_map(|tabs| {
+            tabs.tabs.iter().map(|tab| {
+                let id = tab.id;
+                let is_active = tabs.active == Some(id);
+                let (name, _) = split_file_label(&tab.key.path);
+                let source = source_label(&tab.key.source, lang).to_owned();
+                let path = self.ws.selected.path().map(|root| root.join(&tab.key.path).display().to_string())
+                    .unwrap_or_else(|| tab.key.path.clone());
+                let tooltip: SharedString = format!("{path} ({source})").into();
+                let group = SharedString::from(format!("diff-tab-{id}"));
+                let close = Button::new(("diff-tab-close", id)).ghost().xsmall()
+                    .icon(Icon::new(IconName::Close))
+                    .tooltip(tr(lang, Tr::DiffClose))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_diff(id, cx);
+                        cx.stop_propagation();
+                    }));
+                let close = if is_active { div().child(close) } else {
+                    div().invisible().group_hover(group.clone(), |s| s.visible()).child(close)
+                };
+                h_flex().id(("diff-tab", id)).group(group).h_full().flex_shrink_0().max_w(px(240.))
+                    .pl_2().pr_1().gap_1().cursor_pointer().border_t_2()
+                    .border_color(if is_active { theme.primary } else { theme.primary.opacity(0.) })
+                    .bg(if is_active { theme.background } else { theme.tab_bar.opacity(0.) })
+                    .hover(|s| if is_active { s } else { s.bg(theme.list_hover) })
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _, window, cx| this.activate_diff(id, window, cx)))
+                    .on_mouse_down(MouseButton::Middle, cx.listener(move |this, _, _, cx| {
+                        this.close_diff(id, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(Icon::new(Ic::FileDiff).size(px(13.)).flex_shrink_0())
+                    .child(div().min_w_0().truncate().text_size(px(13.)).child(name.to_owned()))
+                    .child(div().flex_shrink_0().text_size(px(11.)).text_color(theme.muted_foreground).child(source))
+                    .child(close)
+            })
+        });
         let path_text = self.ws.selected.path().map(|p| p.display().to_string()).unwrap_or_default();
         h_flex()
             .w_full()
@@ -144,7 +184,9 @@ impl AppView {
                     .h_full()
                     .min_w_0()
                     .overflow_x_scroll()
-                    .children(tabs),
+                    .track_scroll(&self.tab_scroll)
+                    .children(tabs)
+                    .children(diff_tabs),
             )
             .child(
                 div().px_1().child(

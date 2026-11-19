@@ -1,4 +1,5 @@
 //! Blocking Git operations and worktree observation, independent of the UI.
+pub mod compare;
 mod diff;
 mod history;
 mod mutation;

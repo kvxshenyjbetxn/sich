@@ -6,6 +6,7 @@
 //! get a small helper fn (see [`connected`]) instead of a variant.
 
 use serde::{Deserialize, Serialize};
+use sich_git::compare::LineEndings;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -135,7 +136,24 @@ pub enum Tr {
     GitNoChanges,
     GitTruncated,
     GitNoDiff,
-    GitDiffTruncated,
+    DiffWorking,
+    DiffStaged,
+    DiffConflict,
+    DiffClose,
+    DiffIndex,
+    DiffHead,
+    DiffBefore,
+    DiffAfter,
+    DiffOurs,
+    DiffTheirs,
+    DiffSideBySide,
+    DiffInline,
+    DiffPrevious,
+    DiffNext,
+    DiffBinary,
+    DiffTooLarge,
+    DiffEolMixed,
+    DiffEolNone,
     GitCommits,
     GitNoCommits,
     GitLoadMore,
@@ -238,7 +256,24 @@ impl Tr {
         Tr::GitNoChanges,
         Tr::GitTruncated,
         Tr::GitNoDiff,
-        Tr::GitDiffTruncated,
+        Tr::DiffWorking,
+        Tr::DiffStaged,
+        Tr::DiffConflict,
+        Tr::DiffClose,
+        Tr::DiffIndex,
+        Tr::DiffHead,
+        Tr::DiffBefore,
+        Tr::DiffAfter,
+        Tr::DiffOurs,
+        Tr::DiffTheirs,
+        Tr::DiffSideBySide,
+        Tr::DiffInline,
+        Tr::DiffPrevious,
+        Tr::DiffNext,
+        Tr::DiffBinary,
+        Tr::DiffTooLarge,
+        Tr::DiffEolMixed,
+        Tr::DiffEolNone,
         Tr::GitCommits,
         Tr::GitNoCommits,
         Tr::GitLoadMore,
@@ -388,10 +423,95 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "Нет различий",
             En => "No diff",
         },
-        Tr::GitDiffTruncated => match lang {
-            Uk => "… різницю скорочено",
-            Ru => "… разница сокращена",
-            En => "… diff truncated",
+        Tr::DiffWorking => match lang {
+            Uk => "Робочі зміни",
+            Ru => "Рабочие изменения",
+            En => "Working",
+        },
+        Tr::DiffStaged => match lang {
+            Uk => "В індексі",
+            Ru => "В индексе",
+            En => "Staged",
+        },
+        Tr::DiffConflict => match lang {
+            Uk => "Конфлікт",
+            Ru => "Конфликт",
+            En => "Conflict",
+        },
+        Tr::DiffClose => match lang {
+            Uk => "Закрити порівняння",
+            Ru => "Закрыть сравнение",
+            En => "Close diff",
+        },
+        Tr::DiffIndex => match lang {
+            Uk => "Індекс",
+            Ru => "Индекс",
+            En => "Index",
+        },
+        Tr::DiffHead => match lang {
+            Uk => "HEAD",
+            Ru => "HEAD",
+            En => "HEAD",
+        },
+        Tr::DiffBefore => match lang {
+            Uk => "До змін",
+            Ru => "До изменений",
+            En => "Before",
+        },
+        Tr::DiffAfter => match lang {
+            Uk => "Після змін",
+            Ru => "После изменений",
+            En => "After",
+        },
+        Tr::DiffOurs => match lang {
+            Uk => "Наша версія",
+            Ru => "Наша версия",
+            En => "Ours",
+        },
+        Tr::DiffTheirs => match lang {
+            Uk => "Їхня версія",
+            Ru => "Их версия",
+            En => "Theirs",
+        },
+        Tr::DiffSideBySide => match lang {
+            Uk => "Поруч",
+            Ru => "Рядом",
+            En => "Side-by-side",
+        },
+        Tr::DiffInline => match lang {
+            Uk => "В одному стовпці",
+            Ru => "В одном столбце",
+            En => "Inline",
+        },
+        Tr::DiffPrevious => match lang {
+            Uk => "Попередня зміна (Shift+F7)",
+            Ru => "Предыдущее изменение (Shift+F7)",
+            En => "Previous change (Shift+F7)",
+        },
+        Tr::DiffNext => match lang {
+            Uk => "Наступна зміна (F7)",
+            Ru => "Следующее изменение (F7)",
+            En => "Next change (F7)",
+        },
+        Tr::DiffBinary => match lang {
+            Uk => "Двійковий файл приховано",
+            Ru => "Двоичный файл скрыт",
+            En => "Binary file — not shown",
+        },
+        Tr::DiffEolMixed => match lang {
+            Uk => "змішані",
+            Ru => "смешанные",
+            En => "mixed",
+        },
+        Tr::DiffEolNone => match lang {
+            Uk => "відсутні",
+            Ru => "отсутствуют",
+            En => "none",
+        },
+        Tr::DiffTooLarge => match lang {
+            Uk => "Файл завеликий для порівняння",
+            Ru => "Файл слишком большой для сравнения",
+            En => "File too large to diff",
         },
         Tr::GitCommits => match lang {
             Uk => "Коміти",
@@ -744,13 +864,31 @@ pub fn agent_tooltip(label: &str, detail: Option<&str>) -> String {
     }
 }
 
-pub fn git_more_lines(lang: Language, count: usize, truncated: bool) -> String {
-    let plus = if truncated { "+" } else { "" };
+pub fn diff_eol_text(lang: Language, old: LineEndings, new: LineEndings, only: bool) -> String {
+    let label = |style| match style {
+        LineEndings::Lf => "LF",
+        LineEndings::Crlf => "CRLF",
+        LineEndings::Cr => "CR",
+        LineEndings::Mixed => tr(lang, Tr::DiffEolMixed),
+        LineEndings::None => tr(lang, Tr::DiffEolNone),
+    };
+    let change = format!("{} → {}", label(old), label(new));
+    match (lang, only) {
+        (Language::Uk, false) => format!("Закінчення рядків: {change}"),
+        (Language::Ru, false) => format!("Окончания строк: {change}"),
+        (Language::En, false) => format!("Line endings: {change}"),
+        (Language::Uk, true) => format!("Змінено лише закінчення рядків ({change})"),
+        (Language::Ru, true) => format!("Изменились только окончания строк ({change})"),
+        (Language::En, true) => format!("Only line endings changed ({change})"),
+    }
+}
+
+pub fn diff_unchanged_lines(lang: Language, count: usize) -> String {
     match lang {
-        Language::Uk => format!("… ще {count}{plus} ряд."),
-        Language::Ru => format!("… ещё {count}{plus} стр."),
-        Language::En if count == 1 && !truncated => "… 1 more line".to_owned(),
-        Language::En => format!("… {count}{plus} more lines"),
+        Language::Uk => format!("⋯ Незмінені рядки ({count})"),
+        Language::Ru => format!("⋯ Неизменённые строки ({count})"),
+        Language::En if count == 1 => "⋯ 1 unchanged line".to_owned(),
+        Language::En => format!("⋯ {count} unchanged lines"),
     }
 }
 
@@ -955,11 +1093,25 @@ mod tests {
     }
 
     #[test]
-    fn diff_omission_text_marks_partial_counts() {
-        assert_eq!(git_more_lines(Language::En, 1, false), "… 1 more line");
+    fn diff_eol_messages_include_the_ordered_styles_in_all_languages() {
         for lang in Language::ALL {
-            assert!(git_more_lines(lang, 42, true).contains("42+"));
-            assert!(!git_more_lines(lang, 42, false).contains('+'));
+            for only in [false, true] {
+                assert!(diff_eol_text(lang, LineEndings::Lf, LineEndings::Crlf, only)
+                    .contains("LF → CRLF"));
+            }
+        }
+        assert_eq!(diff_eol_text(Language::En, LineEndings::Mixed, LineEndings::Lf, false),
+                   "Line endings: mixed → LF");
+        assert_eq!(diff_eol_text(Language::En, LineEndings::Lf, LineEndings::Crlf, true),
+                   "Only line endings changed (LF → CRLF)");
+    }
+
+    #[test]
+    fn diff_fold_text_includes_count_in_all_languages() {
+        assert_eq!(diff_unchanged_lines(Language::En, 1), "⋯ 1 unchanged line");
+        assert_eq!(diff_unchanged_lines(Language::En, 8), "⋯ 8 unchanged lines");
+        for lang in Language::ALL {
+            assert!(diff_unchanged_lines(lang, 42).contains("42"));
         }
     }
 

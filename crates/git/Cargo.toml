@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 dunce = "1"
 notify = "8.2"
+similar = "2.7"
 
 [dev-dependencies]
 tempfile = "3"

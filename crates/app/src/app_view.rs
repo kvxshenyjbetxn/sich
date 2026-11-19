@@ -14,14 +14,18 @@ use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, Window
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
     CursorStyle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render,
-    StatefulInteractiveElement as _, Styled as _, Window, WindowBounds,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, WindowBounds,
     div, px,
 };
+use sich_git::Repo;
+use sich_git::compare::CompareKey;
 use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot};
-use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, MIN_RIGHT_W, clamp_right_w};
+use crate::diff_tabs::{DiffTab, DiffTabs};
+use crate::diff_view::DiffView;
+use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
 use crate::sidebar::{DEFAULT_SIDEBAR_W, clamp_sidebar_w};
@@ -60,6 +64,10 @@ struct RestoreTarget {
 pub struct AppView {
     pub(crate) client: DaemonClient,
     views: HashMap<TermId, Entity<TerminalView>>,
+    diff_tabs: HashMap<WorkspaceKey, DiffTabs<Entity<DiffView>>>,
+    next_diff_id: u64,
+    focused_diff: Option<u64>,
+    pub(crate) tab_scroll: ScrollHandle,
     pub(crate) ws: Workspaces,
     /// Saved workspace to restore when the first `Projects` update arrives.
     restore: Option<Option<PathBuf>>,
@@ -168,6 +176,10 @@ impl AppView {
         Self {
             client,
             views: HashMap::new(),
+            diff_tabs: HashMap::new(),
+            next_diff_id: 0,
+            focused_diff: None,
+            tab_scroll: ScrollHandle::new(),
             ws: Workspaces::default(),
             // The session's selection wins over the older `last_workspace` setting.
             restore: Some(match &saved {
@@ -232,6 +244,9 @@ impl AppView {
                 this.right_panel.history_collapsed = collapsed;
                 this.sidebar_changed(cx);
             }
+        }).detach();
+        cx.subscribe_in(&self.git_panel, window, |this, _, event, window, cx| {
+            this.on_git_panel_event(event, window, cx);
         }).detach();
         self.window_active = window.is_window_active();
         self.hwnd = win_flash::hwnd_of(window);
@@ -303,7 +318,7 @@ impl AppView {
             if let Some(prev) = self.attention.insert(id, now) {
                 flash |= !self.window_active && should_flash(prev, now);
             }
-            if should_mark_seen(active == Some(id), self.window_active, status) {
+            if should_mark_seen(active == Some(id) && self.active_diff().is_none(), self.window_active, status) {
                 let since = status.map_or(0, |s| s.since_unix_ms);
                 if self.seen_sent.get(&id) != Some(&since) {
                     self.seen_sent.insert(id, since);
@@ -526,6 +541,7 @@ impl AppView {
             settings::set_last_workspace(key.path().map(PathBuf::from), cx);
             self.ws.selected = key;
             self.sync_right_worktree(cx);
+            self.sync_diff_highlight(cx);
         }
         cx.notify();
     }
@@ -537,6 +553,7 @@ impl AppView {
     pub(crate) fn activate_terminal(&mut self, id: TermId, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.ws.selected.clone();
         self.ws.set_active(&key, id);
+        self.deactivate_diff(&key, cx);
         self.focused = Some(id);
         if let Some(view) = self.views.get(&id) {
             view.update(cx, |v, cx| v.focus(window, cx));
@@ -554,6 +571,112 @@ impl AppView {
     ) {
         self.set_selected(key, cx);
         self.activate_terminal(id, window, cx);
+    }
+
+    pub(crate) fn workspace_diffs(&self) -> Option<&DiffTabs<Entity<DiffView>>> {
+        self.diff_tabs.get(&self.ws.selected)
+    }
+
+    fn active_diff(&self) -> Option<&DiffTab<Entity<DiffView>>> {
+        self.workspace_diffs()?.active()
+    }
+
+    fn sync_diff_highlight(&self, cx: &mut Context<Self>) {
+        let key = self.active_diff().map(|tab| tab.key.clone());
+        self.git_panel.update(cx, |panel, cx| panel.set_active_diff(key, cx));
+    }
+
+    fn deactivate_diff(&mut self, key: &WorkspaceKey, cx: &mut Context<Self>) {
+        if let Some(tabs) = self.diff_tabs.get_mut(key) {
+            tabs.active = None;
+        }
+        self.focused_diff = None;
+        self.sync_diff_highlight(cx);
+    }
+
+    fn on_git_panel_event(
+        &mut self,
+        event: &GitPanelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            GitPanelEvent::OpenDiff { worktree, repo, key, original } => {
+                if self.ws.selected.contains(Some(worktree)) {
+                    self.open_diff(worktree.clone(), repo.clone(), key.clone(), original.clone(), window, cx);
+                }
+            }
+            GitPanelEvent::Refreshed(worktree) | GitPanelEvent::Mutated { worktree, .. } => {
+                if let Some(tabs) = self.diff_tabs.get(&WorkspaceKey::of(Some(worktree))) {
+                    for tab in &tabs.tabs {
+                        if let GitPanelEvent::Mutated { diff_tab: Some(id), error, .. } = event {
+                            if tab.id == *id {
+                                tab.view.update(cx, |view, cx| view.mutation_finished(error.clone(), cx));
+                            }
+                        }
+                        if tab.key.source.is_live() {
+                            let rename = self.git_panel.read(cx).diff_rename(worktree, &tab.key);
+                            tab.view.update(cx, |view, cx| view.refresh_live(rename, cx));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn open_diff(
+        &mut self,
+        worktree: PathBuf,
+        repo: Repo,
+        key: CompareKey,
+        original: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = self.next_diff_id;
+        let panel = self.git_panel.clone();
+        let tabs = self.diff_tabs.entry(self.ws.selected.clone()).or_default();
+        let tab = tabs.open(id, key.clone(), || {
+            cx.new(|cx| DiffView::new(id, worktree, repo, key, original, panel, cx))
+        });
+        let opened = tab.id;
+        if opened == id {
+            self.next_diff_id += 1;
+            tab.view.update(cx, DiffView::reload);
+        }
+        self.activate_diff(opened, window, cx);
+    }
+
+    pub(crate) fn activate_diff(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tabs) = self.diff_tabs.get_mut(&self.ws.selected) {
+            tabs.activate(id);
+        }
+        self.focus_diff(window, cx);
+        self.sync_diff_highlight(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_diff(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(tabs) = self.diff_tabs.get_mut(&self.ws.selected) {
+            tabs.close(id);
+        }
+        self.sync_diff_highlight(cx);
+        cx.notify();
+    }
+
+    fn focus_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_diff() {
+            let id = tab.id;
+            let view = tab.view.clone();
+            // The tab bar measures terminal children before diff children on the next frame.
+            let snapshot = self.client.snapshot();
+            let index = snapshot.terminals.iter().filter(|term| self.ws.selected.contains(term.info.worktree.as_deref())).count()
+                + self.workspace_diffs().and_then(|tabs| tabs.tabs.iter().position(|tab| tab.id == id)).unwrap_or(0);
+            self.tab_scroll.scroll_to_item(index);
+            self.focused_diff = Some(id);
+            self.focused = None;
+            view.update(cx, |view, cx| view.focus(window, cx));
+        }
     }
 
     fn workspace_ids(&self, infos: &[TerminalInfo]) -> Vec<TermId> {
@@ -638,7 +761,8 @@ impl AppView {
             if let Some(pos) = self.pending_creates.iter().position(|k| *k == key) {
                 self.pending_creates.remove(pos);
                 self.ws.set_active(&key, id);
-                self.set_selected(key, cx);
+                self.set_selected(key.clone(), cx);
+                self.deactivate_diff(&key, cx);
                 self.focused = None;
             }
         }
@@ -658,12 +782,19 @@ impl AppView {
         self.maybe_restore_terminals();
         self.finish_restore_targets(infos);
 
-        let ws_ids = self.workspace_ids(infos);
-        let active = self.ws.active_in(&self.ws.selected, &ws_ids);
-        if active != self.focused {
-            self.focused = active;
-            if let Some(view) = active.and_then(|a| self.views.get(&a)) {
-                view.update(cx, |v, cx| v.focus(window, cx));
+        if let Some(id) = self.active_diff().map(|tab| tab.id) {
+            if self.focused_diff != Some(id) {
+                self.focus_diff(window, cx);
+            }
+        } else {
+            self.focused_diff = None;
+            let ws_ids = self.workspace_ids(infos);
+            let active = self.ws.active_in(&self.ws.selected, &ws_ids);
+            if active != self.focused {
+                self.focused = active;
+                if let Some(view) = active.and_then(|a| self.views.get(&a)) {
+                    view.update(cx, |v, cx| v.focus(window, cx));
+                }
             }
         }
         self.track_agents(snap);
@@ -672,6 +803,7 @@ impl AppView {
     }
 
     fn on_projects_changed(&mut self, cx: &mut Context<Self>) {
+        self.diff_tabs.retain(|key, _| workspace_exists(key, &self.projects));
         if let Some(saved) = self.restore.take() {
             if let Some(session) = &self.saved {
                 let (projects, groups) = session::resolve_collapsed(session, &self.projects, &self.groups);
@@ -704,11 +836,13 @@ impl AppView {
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let ids = self.workspace_ids(infos);
-        let active = self.ws.active_in(&self.ws.selected, &ids);
+        let diff = self.active_diff();
+        let active = if diff.is_none() { self.ws.active_in(&self.ws.selected, &ids) } else { None };
         let tab_bar = self.render_tab_bar(snap, &ids, active, lang, cx);
-        let content = match active.and_then(|a| self.views.get(&a)) {
-            Some(view) => div().flex_1().min_h_0().w_full().child(view.clone()),
-            None => div()
+        let content = match (diff, active.and_then(|a| self.views.get(&a))) {
+            (Some(tab), _) => div().flex_1().min_h_0().w_full().child(tab.view.clone()),
+            (None, Some(view)) => div().flex_1().min_h_0().w_full().child(view.clone()),
+            (None, None) => div()
                 .flex_1()
                 .min_h_0()
                 .w_full()

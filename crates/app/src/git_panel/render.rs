@@ -8,18 +8,19 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, Context, ElementId, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
-use sich_git::{DiffLine, DiffLineKind, STATUS_LIMIT};
+use sich_git::STATUS_LIMIT;
 
 use super::*;
-use crate::i18n::{git_more_lines, relative_time};
+use crate::diff_view::split_file_label;
+use crate::i18n::relative_time;
 use crate::settings;
 use crate::sidebar::now_unix_ms;
 
-const DIFF_ROWS: usize = 400;
 const FILE_ACTION_W: f32 = 20.;
 const FILE_COUNT_W: f32 = 42.;
 const REF_LABEL_CHARS: usize = 16;
@@ -341,7 +342,11 @@ impl GitPanel {
                     .children(actions),
             )
             .children(files.iter().filter(|_| !collapsed).map(|file| {
-                let key = DiffKey::worktree(section, file);
+                let source = match section {
+                    Section::Conflicts => CompareSource::Conflict,
+                    Section::Staged => CompareSource::Staged,
+                    Section::Changes => CompareSource::Working,
+                };
                 let group = SharedString::from(format!("{id}-{}", file.path));
                 let (label, icon, mutation) = if section == Section::Staged {
                     (
@@ -378,17 +383,16 @@ impl GitPanel {
                             }))
                     }))
                     .into_any_element();
-                self.file_row(file, key, group, Some(actions), lang, cx)
+                self.file_row(file, source, group, Some(actions), cx)
             }))
     }
 
     fn file_row(
         &self,
         file: &FileChange,
-        key: DiffKey,
+        source: CompareSource,
         group: SharedString,
         actions: Option<AnyElement>,
-        lang: Language,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
@@ -411,10 +415,14 @@ impl GitPanel {
                 |path| format!("{path} → {}", file.path),
             )
             .into();
-        let diff = self
-            .diffs
-            .get(&key)
-            .map(|diff| self.render_diff(diff, lang, cx));
+        let original = file.orig_path.clone().filter(|_| {
+            matches!(source, CompareSource::Commit(_)) || file.status == ChangeKind::Renamed
+        });
+        let key = CompareKey {
+            path: file.path.clone(),
+            source,
+        };
+        let selected = self.active_diff.as_ref() == Some(&key);
         v_flex()
             .id(SharedString::from(format!("{group}-row")))
             .w_full()
@@ -427,11 +435,26 @@ impl GitPanel {
                     .gap_1()
                     .px_2()
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme.list_hover))
-                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                    .on_click(
-                        cx.listener(move |panel, _, _, cx| panel.toggle_diff(key.clone(), cx)),
-                    )
+                    .bg(if selected {
+                        theme.list_active
+                    } else {
+                        theme.sidebar.opacity(0.)
+                    })
+                    .hover(|s| {
+                        s.bg(if selected {
+                            theme.list_active
+                        } else {
+                            theme.list_hover
+                        })
+                    })
+                    .when(!selected, |row| {
+                        row.tooltip(move |window, cx| {
+                            Tooltip::new(tooltip.clone()).build(window, cx)
+                        })
+                    })
+                    .on_click(cx.listener(move |panel, _, _, cx| {
+                        panel.open_diff(key.clone(), original.clone(), cx);
+                    }))
                     .child(
                         div()
                             .w(px(14.))
@@ -474,77 +497,6 @@ impl GitPanel {
                             .children(actions),
                     ),
             )
-            .children(diff)
-    }
-
-    fn render_diff(
-        &self,
-        diff: &Expansion<Diff>,
-        lang: Language,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        let content = match &diff.result {
-            None => return tiny(tr(lang, Tr::GitLoading), cx),
-            Some(Err(error)) => return tiny(error.to_string(), cx),
-            Some(Ok(diff)) => diff,
-        };
-        let lines = inline_diff_lines(&content.lines);
-        let count = lines.clone().count();
-        if count == 0 {
-            let label = if content.truncated {
-                Tr::GitDiffTruncated
-            } else {
-                Tr::GitNoDiff
-            };
-            return tiny(tr(lang, label), cx);
-        }
-        v_flex()
-            .w_full()
-            .min_w_0()
-            .border_y_1()
-            .border_color(theme.border)
-            .bg(theme.background)
-            .child(
-                div()
-                    .id("git-inline-diff")
-                    .min_w_0()
-                    .overflow_x_scroll()
-                    .child(
-                        v_flex()
-                            .min_w_full()
-                            .w_auto()
-                            .font_family("Cascadia Mono")
-                            .text_size(px(11.5))
-                            .children(lines.take(DIFF_ROWS).map(|line| {
-                                let (foreground, background) = match line.kind {
-                                    DiffLineKind::Added => (theme.green, theme.green.opacity(0.12)),
-                                    DiffLineKind::Removed => (theme.red, theme.red.opacity(0.12)),
-                                    DiffLineKind::Hunk | DiffLineKind::Meta => {
-                                        (theme.muted_foreground, theme.background)
-                                    }
-                                    DiffLineKind::Context => (theme.foreground, theme.background),
-                                };
-                                div()
-                                    .px_2()
-                                    .whitespace_nowrap()
-                                    .bg(background)
-                                    .text_color(foreground)
-                                    .child(line.text.clone())
-                            })),
-                    ),
-            )
-            .children((count > DIFF_ROWS).then(|| {
-                tiny(
-                    git_more_lines(lang, count - DIFF_ROWS, content.truncated),
-                    cx,
-                )
-            }))
-            .children(
-                (content.truncated && count <= DIFF_ROWS)
-                    .then(|| tiny(tr(lang, Tr::GitDiffTruncated), cx)),
-            )
-            .into_any_element()
     }
 
     fn history_section(&self, lang: Language, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -734,14 +686,11 @@ impl GitPanel {
                         Some(Ok(files)) => v_flex()
                             .w_full()
                             .children(files.iter().map(|file| {
-                                let key =
-                                    DiffKey::new(DiffSource::Commit(commit.oid.clone()), file);
                                 self.file_row(
                                     file,
-                                    key,
+                                    CompareSource::Commit(commit.oid.clone()),
                                     format!("git-commit-file-{}-{}", commit.oid, file.path).into(),
                                     None,
-                                    lang,
                                     cx,
                                 )
                             }))
@@ -779,11 +728,6 @@ fn tiny(value: impl Into<SharedString>, cx: &Context<GitPanel>) -> AnyElement {
         .into_any_element()
 }
 
-fn split_file_label(path: &str) -> (&str, &str) {
-    path.rsplit_once('/')
-        .map_or((path, ""), |(directory, name)| (name, directory))
-}
-
 fn file_count(count: Option<u32>, sign: char, color: Hsla) -> impl IntoElement {
     div()
         .w(px(FILE_COUNT_W))
@@ -793,10 +737,6 @@ fn file_count(count: Option<u32>, sign: char, color: Hsla) -> impl IntoElement {
         .text_size(px(11.))
         .text_color(color)
         .children(count.map(|n| format!("{sign}{n}")))
-}
-
-fn inline_diff_lines(lines: &[DiffLine]) -> impl Iterator<Item = &DiffLine> + Clone {
-    lines.iter().filter(|line| line.kind != DiffLineKind::Meta)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -914,39 +854,6 @@ mod tests {
         assert_eq!(badge_text("origin/main"), "origin/main");
         assert_eq!(badge_text("1234567890abcdef"), "1234567890abcdef");
         assert_eq!(badge_text("1234567890abcdeї😀"), "1234567890abcdeї…");
-    }
-
-    #[test]
-    fn inline_diff_keeps_only_hunks_and_content() {
-        use DiffLineKind::*;
-        let lines = [
-            (Meta, "diff --git a/old b/new"),
-            (Meta, "index abc..def 100644"),
-            (Meta, "new file mode 100644"),
-            (Meta, "deleted file mode 100644"),
-            (Meta, "similarity index 80%"),
-            (Meta, "rename from old"),
-            (Meta, "rename to new"),
-            (Meta, "--- a/old"),
-            (Meta, "+++ b/new"),
-            (Hunk, "@@ -1,2 +1,2 @@"),
-            (Context, " context"),
-            (Removed, "--- content"),
-            (Added, "+++ content"),
-            (Meta, r"\ No newline at end of file"),
-        ]
-        .map(|(kind, text)| DiffLine {
-            kind,
-            text: text.into(),
-        });
-        let shown = inline_diff_lines(&lines)
-            .map(|line| line.text.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            shown,
-            ["@@ -1,2 +1,2 @@", " context", "--- content", "+++ content"]
-        );
-        assert_eq!(inline_diff_lines(&lines[..9]).count(), 0);
     }
 
     #[test]

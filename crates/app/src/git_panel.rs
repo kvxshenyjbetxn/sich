@@ -12,13 +12,13 @@ use async_channel::{Receiver, Sender};
 use futures::future::{Either, select};
 use gpui_kit::component::input::{InputEvent, TextareaState};
 use gpui_kit::{
-    AppContext as _, AsyncApp, Context, Entity, Subscription, Task, WeakEntity, Window,
+    AppContext as _, AsyncApp, Context, Entity, EventEmitter, Subscription, Task, WeakEntity,
+    Window,
 };
+use sich_git::compare::{CompareKey, CompareSource};
 use sich_git::scheduler::Scheduler;
 use sich_git::watch::{self, WatchSignal};
-use sich_git::{
-    ChangeKind, Commit, Diff, DiffSource, FileChange, GitError, HISTORY_PAGE_SIZE, Repo, RepoStatus,
-};
+use sich_git::{ChangeKind, Commit, FileChange, GitError, HISTORY_PAGE_SIZE, Repo, RepoStatus};
 
 use crate::i18n::{Language, Tr, tr};
 use crate::worktree_dialogs;
@@ -47,34 +47,19 @@ enum Section {
     Changes,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct DiffKey {
-    source: DiffSource,
-    path: String,
-    orig: Option<String>,
-}
-
-impl DiffKey {
-    fn new(source: DiffSource, file: &FileChange) -> Self {
-        Self {
-            source,
-            path: file.path.clone(),
-            orig: file.orig_path.clone(),
-        }
-    }
-
-    fn worktree(section: Section, file: &FileChange) -> Self {
-        let source = match (section, file.status) {
-            (Section::Staged, _) => DiffSource::Staged,
-            (_, ChangeKind::Untracked) => DiffSource::Untracked,
-            _ => DiffSource::Unstaged,
-        };
-        Self::new(source, file)
-    }
-
-    fn read(&self, repo: &Repo) -> Result<Diff, GitError> {
-        repo.diff(&self.source, &self.path, self.orig.as_deref())
-    }
+pub(crate) enum GitPanelEvent {
+    OpenDiff {
+        worktree: PathBuf,
+        repo: Repo,
+        key: CompareKey,
+        original: Option<String>,
+    },
+    Refreshed(PathBuf),
+    Mutated {
+        worktree: PathBuf,
+        diff_tab: Option<u64>,
+        error: Option<String>,
+    },
 }
 
 struct Expansion<T> {
@@ -226,13 +211,6 @@ impl History {
     }
 }
 
-struct RefreshPlan {
-    history_count: Option<usize>,
-    diffs: Vec<(DiffKey, u64)>,
-}
-
-type DiffResult = (DiffKey, u64, Result<Diff, GitError>);
-
 struct CommitInput {
     state: Entity<TextareaState>,
     language: Language,
@@ -251,7 +229,7 @@ pub(crate) struct GitPanel {
     history_collapsed: bool,
     history: History,
     collapsed: HashSet<Section>,
-    diffs: HashMap<DiffKey, Expansion<Diff>>,
+    active_diff: Option<CompareKey>,
     next_request: u64,
     drafts: HashMap<PathBuf, String>,
     input: Option<CommitInput>,
@@ -260,6 +238,8 @@ pub(crate) struct GitPanel {
     wake: Option<Sender<()>>,
     watch_task: Option<Task<()>>,
 }
+
+impl EventEmitter<GitPanelEvent> for GitPanel {}
 
 impl GitPanel {
     pub(crate) fn new(history_collapsed: bool) -> Self {
@@ -275,7 +255,7 @@ impl GitPanel {
             history_collapsed,
             history: History::default(),
             collapsed: HashSet::new(),
-            diffs: HashMap::new(),
+            active_diff: None,
             next_request: 0,
             drafts: HashMap::new(),
             input: None,
@@ -306,7 +286,6 @@ impl GitPanel {
         self.refreshing_history = false;
         self.history = History::default();
         self.collapsed.clear();
-        self.diffs.clear();
         self.input = None;
         self.scheduler = Scheduler::default();
 
@@ -334,25 +313,43 @@ impl GitPanel {
         }
     }
 
-    fn plan_refresh(&mut self, cx: &mut Context<Self>) -> Option<RefreshPlan> {
+    fn plan_refresh(&mut self, cx: &mut Context<Self>) -> Option<Option<usize>> {
         let refresh = self.scheduler.start(Instant::now())?;
         self.refreshing = true;
         self.refreshing_history = refresh.history;
         cx.notify();
-        let history_count = refresh.history.then(|| {
+        Some(refresh.history.then(|| {
             let loading = usize::from(self.history.loading_more) * HISTORY_PAGE_SIZE;
             (self.history.commits.len() + loading).max(HISTORY_PAGE_SIZE)
-        });
-        let diffs = self
-            .diffs
-            .iter()
-            .filter(|(key, _)| !matches!(key.source, DiffSource::Commit(_)))
-            .map(|(key, expansion)| (key.clone(), expansion.request))
-            .collect();
-        Some(RefreshPlan {
-            history_count,
-            diffs,
-        })
+        }))
+    }
+
+    pub(crate) fn set_active_diff(&mut self, key: Option<CompareKey>, cx: &mut Context<Self>) {
+        if self.active_diff != key {
+            self.active_diff = key;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn operation_busy(&self, worktree: &Path) -> bool {
+        self.operations.contains_key(worktree)
+    }
+
+    pub(crate) fn diff_rename(&self, worktree: &Path, key: &CompareKey) -> Option<Option<String>> {
+        if self.worktree.as_deref() != Some(worktree) {
+            return None;
+        }
+        let status = self.status.as_ref()?;
+        let changes = match key.source {
+            CompareSource::Working => &status.unstaged,
+            CompareSource::Staged => &status.staged,
+            _ => return None,
+        };
+        match changes.iter().find(|file| file.path == key.path) {
+            Some(file) if file.status == ChangeKind::Renamed => Some(file.orig_path.clone()),
+            None if status.truncated => None,
+            _ => Some(None),
+        }
     }
 
     fn finish_status(
@@ -365,20 +362,10 @@ impl GitPanel {
         match result {
             Ok(status) => {
                 self.unavailable = None;
-                self.diffs.retain(|key, _| match key.source {
-                    DiffSource::Commit(_) => true,
-                    DiffSource::Staged => status.staged.iter().any(|file| file.path == key.path),
-                    DiffSource::Unstaged => status
-                        .unstaged
-                        .iter()
-                        .chain(&status.conflicted)
-                        .any(|file| file.path == key.path && file.status != ChangeKind::Untracked),
-                    DiffSource::Untracked => status
-                        .unstaged
-                        .iter()
-                        .any(|file| file.path == key.path && file.status == ChangeKind::Untracked),
-                });
                 self.status = Some(status);
+                if let Some(worktree) = &self.worktree {
+                    cx.emit(GitPanelEvent::Refreshed(worktree.clone()));
+                }
             }
             Err(error @ (GitError::NotRepository | GitError::GitMissing)) => {
                 self.repo = None;
@@ -399,10 +386,6 @@ impl GitPanel {
         match result {
             Ok(commits) => {
                 self.history.apply(commits, count, true);
-                self.diffs.retain(|key, _| match &key.source {
-                    DiffSource::Commit(oid) => self.history.expanded.contains_key(oid),
-                    _ => true,
-                });
             }
             Err(error) if self.status.is_some() => self.error = Some(error.to_string()),
             Err(_) => {}
@@ -492,12 +475,44 @@ impl GitPanel {
         let (Some(repo), Some(path)) = (self.repo.clone(), self.worktree.clone()) else {
             return;
         };
+        self.run_mutation(path, repo, mutation, None, window, cx);
+    }
+
+    pub(crate) fn stage_from_diff(
+        &mut self,
+        tab: u64,
+        repo: Repo,
+        worktree: PathBuf,
+        paths: Vec<String>,
+        unstage: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mutation = if unstage {
+            Mutation::Unstage(paths)
+        } else {
+            Mutation::Stage(paths)
+        };
+        self.run_mutation(worktree, repo, mutation, Some(tab), window, cx);
+    }
+
+    fn run_mutation(
+        &mut self,
+        path: PathBuf,
+        repo: Repo,
+        mutation: Mutation,
+        diff_tab: Option<u64>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.operations.contains_key(&path) {
             return;
         }
         let operation = mutation.operation();
         self.operations.insert(path.clone(), operation);
-        self.error = None;
+        if self.worktree.as_ref() == Some(&path) {
+            self.error = None;
+        }
         let generation = self.generation;
         let message = match &mutation {
             Mutation::Commit { message, .. } => Some(message.clone()),
@@ -522,8 +537,16 @@ impl GitPanel {
                         }
                     }
                 }
-                panel.generation.apply(generation, || {
-                    panel.error = result.err().map(|error| error.to_string());
+                let error = result.err().map(|error| error.to_string());
+                if panel.worktree.as_ref() == Some(&path) {
+                    panel
+                        .generation
+                        .apply(generation, || panel.error = error.clone());
+                }
+                cx.emit(GitPanelEvent::Mutated {
+                    worktree: path.clone(),
+                    diff_tab,
+                    error,
                 });
                 if panel.worktree.as_ref() == Some(&path) {
                     let history = matches!(
@@ -576,40 +599,19 @@ impl GitPanel {
         );
     }
 
-    fn toggle_diff(&mut self, key: DiffKey, cx: &mut Context<Self>) {
-        if self.diffs.remove(&key).is_some() {
-            cx.notify();
-            return;
-        }
-        let Some(repo) = self.repo.clone() else {
-            return;
-        };
-        self.next_request += 1;
-        let request = self.next_request;
-        self.diffs.insert(key.clone(), Expansion::pending(request));
-        let generation = self.generation;
-        let worker_key = key.clone();
-        let load = cx.background_spawn(async move { worker_key.read(&repo) });
-        cx.spawn(async move |panel, cx| {
-            let result = load.await;
-            let _ = panel.update(cx, |panel, cx| {
-                panel.generation.apply(generation, || {
-                    if let Some(expansion) = panel.diffs.get_mut(&key) {
-                        expansion.apply(request, result);
-                        cx.notify();
-                    }
-                });
+    fn open_diff(&self, key: CompareKey, original: Option<String>, cx: &mut Context<Self>) {
+        if let (Some(worktree), Some(repo)) = (&self.worktree, &self.repo) {
+            cx.emit(GitPanelEvent::OpenDiff {
+                worktree: worktree.clone(),
+                repo: repo.clone(),
+                key,
+                original,
             });
-        })
-        .detach();
-        cx.notify();
+        }
     }
 
     fn toggle_commit(&mut self, oid: String, cx: &mut Context<Self>) {
         if self.history.expanded.remove(&oid).is_some() {
-            self.diffs.retain(
-                |key, _| !matches!(&key.source, DiffSource::Commit(commit) if commit == &oid),
-            );
             cx.notify();
             return;
         }
@@ -781,7 +783,7 @@ async fn refresh_loop(
         let opened = repo.clone().expect("opened repository");
         let status_repo = opened.clone();
         let status = cx.background_spawn(async move { status_repo.status() });
-        let history = plan.history_count.map(|count| {
+        let history = plan.map(|count| {
             let repo = opened.clone();
             (
                 count,
@@ -805,29 +807,6 @@ async fn refresh_loop(
                 panel
                     .generation
                     .apply(generation, || panel.finish_history(result, count, cx));
-            });
-        }
-        if !plan.diffs.is_empty() && repo.is_some() {
-            let results = cx
-                .background_spawn(async move {
-                    plan.diffs
-                        .into_iter()
-                        .map(|(key, request)| {
-                            let result = key.read(&opened);
-                            (key, request, result)
-                        })
-                        .collect::<Vec<DiffResult>>()
-                })
-                .await;
-            let _ = panel.update(cx, |panel, cx| {
-                panel.generation.apply(generation, || {
-                    for (key, request, result) in results {
-                        if let Some(expansion) = panel.diffs.get_mut(&key) {
-                            expansion.apply(request, result);
-                        }
-                    }
-                    cx.notify();
-                });
             });
         }
         let _ = panel.update(cx, |panel, cx| {

@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 use crate::i18n::Language;
 use crate::theme::{self, ThemeKind};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiffMode {
+    #[default]
+    SideBySide,
+    Inline,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -21,6 +29,7 @@ pub struct AppSettings {
     pub codex_hooks: bool,
     /// Closing the window hides it to the system tray instead of quitting.
     pub close_to_tray: bool,
+    pub(crate) diff_mode: DiffMode,
 }
 
 impl Default for AppSettings {
@@ -32,6 +41,7 @@ impl Default for AppSettings {
             agent_hooks: true,
             codex_hooks: true,
             close_to_tray: true,
+            diff_mode: DiffMode::default(),
         }
     }
 }
@@ -144,6 +154,14 @@ pub fn set_close_to_tray(enabled: bool, cx: &mut App) {
     cx.refresh_windows();
 }
 
+pub(crate) fn set_diff_mode(mode: DiffMode, cx: &mut App) {
+    let mut s = get(cx);
+    if s.diff_mode != mode {
+        s.diff_mode = mode;
+        store(s, cx);
+    }
+}
+
 pub fn set_theme(kind: ThemeKind, cx: &mut App) {
     let mut s = get(cx);
     if s.theme == kind {
@@ -157,6 +175,15 @@ pub fn set_theme(kind: ThemeKind, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_mode_defaults_to_side_by_side_and_persists_inline() {
+        let mut settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.diff_mode, DiffMode::SideBySide);
+        settings.diff_mode = DiffMode::Inline;
+        let stored = serde_json::to_string(&settings).unwrap();
+        assert_eq!(serde_json::from_str::<AppSettings>(&stored).unwrap().diff_mode, DiffMode::Inline);
+    }
 
     #[test]
     fn old_settings_without_last_workspace_load() {

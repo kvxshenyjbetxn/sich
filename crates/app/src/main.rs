@@ -10,6 +10,8 @@ mod colors;
 mod daemon_client;
 mod daemon_conn;
 mod daemon_kill;
+mod diff_tabs;
+mod diff_view;
 mod element;
 mod git_panel;
 mod group_dialogs;
