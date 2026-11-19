@@ -229,6 +229,11 @@ pub async fn remove_worktree(
         return fail(conn, OP, "Cannot remove the main worktree");
     }
 
+    // Refuse before killing terminals, so a failed non-forced removal loses nothing.
+    if !force && info.as_ref().is_some_and(|w| w.dirty) {
+        return fail(conn, OP, "Worktree has uncommitted changes");
+    }
+
     mgr.kill_in_worktree(&path);
 
     let branch = info.and_then(|w| w.branch);
