@@ -33,5 +33,5 @@ The app will grow a lot of features. Tests are what keep old features from break
 The main model, after merging, runs the full `cargo test --workspace` again. For UI changes it also launches the app and verifies with screenshots before telling the user it's done.
 
 ## Practical notes
-- A daemon running from `target/release` locks `sich.exe`. Stop it with `sich daemon stop` before a release rebuild, but only with the user's consent, since it holds their terminals.
+- A daemon running from `target/release` locks `sich.exe`. During the development stage the main model may stop the user's daemon and close Sich windows without asking (`sich daemon stop` / kill), e.g. before a release rebuild. Mention it in the report. Coders still must not kill processes.
 - On Windows, git and other child processes must use `CREATE_NO_WINDOW` (no console flashes).
