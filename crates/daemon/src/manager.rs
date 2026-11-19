@@ -15,6 +15,7 @@ use crate::terminal::{SpawnRequest, Terminal};
 pub struct Manager {
     pub hub: Arc<Hub>,
     pub shutdown: CancellationToken,
+    pub projects: crate::projects::Registry,
     terminals: Mutex<BTreeMap<TermId, Arc<Terminal>>>,
     next_term: AtomicU64,
     next_conn: AtomicU64,
@@ -24,6 +25,7 @@ impl Manager {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             hub: Arc::new(Hub::default()),
+            projects: crate::projects::Registry::load(),
             shutdown: CancellationToken::new(),
             terminals: Mutex::new(BTreeMap::new()),
             next_term: AtomicU64::new(1),
@@ -64,6 +66,20 @@ impl Manager {
         term.kill();
         self.hub.broadcast(ServerMsg::TerminalRemoved { id });
         true
+    }
+
+    /// Kills and removes every terminal that belongs to `worktree`.
+    pub fn kill_in_worktree(&self, worktree: &std::path::Path) {
+        let ids: Vec<TermId> = self
+            .terminals
+            .lock()
+            .values()
+            .filter(|t| t.info().worktree.is_some_and(|w| crate::git::same_path(&w, worktree)))
+            .map(|t| t.id())
+            .collect();
+        for id in ids {
+            self.kill(id);
+        }
     }
 
     /// Drops all subscriptions of a closed connection.

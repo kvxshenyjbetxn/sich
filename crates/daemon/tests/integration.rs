@@ -98,7 +98,7 @@ async fn create_subscribe_replay_shutdown() {
     let (shell, args) = shell_command();
     send(
         &mut a,
-        ClientMsg::CreateTerminal { cwd: None, shell: Some(shell), args, cols: 80, rows: 24 },
+        ClientMsg::CreateTerminal { cwd: None, shell: Some(shell), args, cols: 80, rows: 24, worktree: None },
     )
     .await;
     let id = loop {

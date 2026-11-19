@@ -21,6 +21,7 @@ pub struct SpawnRequest {
     pub args: Vec<String>,
     pub cols: u16,
     pub rows: u16,
+    pub worktree: Option<PathBuf>,
 }
 
 struct State {
@@ -37,6 +38,7 @@ struct Shared {
     id: TermId,
     title: String,
     cwd: PathBuf,
+    worktree: Option<PathBuf>,
     created_unix_ms: u64,
     hub: Arc<Hub>,
     state: Mutex<State>,
@@ -79,6 +81,7 @@ impl Terminal {
             id,
             title: shell_title(&shell),
             cwd,
+            worktree: req.worktree,
             created_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as u64),
@@ -155,6 +158,7 @@ impl Terminal {
             rows: st.rows,
             exited: st.exited,
             created_unix_ms: self.shared.created_unix_ms,
+            worktree: self.shared.worktree.clone(),
         }
     }
 
