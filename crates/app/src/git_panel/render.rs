@@ -1,3 +1,6 @@
+use std::fmt::Display;
+
+use chrono::{DateTime, Local, TimeZone};
 use gpui_kit::assets::IconName as Ic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::Textarea;
@@ -6,10 +9,10 @@ use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, h_flex, v_flex,
 };
 use gpui_kit::{
-    AnyElement, Context, ElementId, InteractiveElement as _, IntoElement, ParentElement as _,
+    AnyElement, Context, ElementId, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
     Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
-use sich_git::{DiffLineKind, STATUS_LIMIT};
+use sich_git::{DiffLine, DiffLineKind, STATUS_LIMIT};
 
 use super::*;
 use crate::i18n::{git_more_lines, relative_time};
@@ -17,6 +20,9 @@ use crate::settings;
 use crate::sidebar::now_unix_ms;
 
 const DIFF_ROWS: usize = 400;
+const FILE_ACTION_W: f32 = 20.;
+const FILE_COUNT_W: f32 = 42.;
+const REF_LABEL_CHARS: usize = 16;
 
 impl Render for GitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -347,11 +353,9 @@ impl GitPanel {
                     (Tr::GitStage, Ic::Plus, Mutation::Stage(action_paths(file)))
                 };
                 let actions = h_flex()
-                    .flex_shrink_0()
-                    .invisible()
-                    .group_hover(group.clone(), |s| s.visible())
                     .child(
                         tool_button("git-stage-path", icon, tr(lang, label))
+                            .w(px(FILE_ACTION_W))
                             .disabled(busy.is_some())
                             .on_click(cx.listener(move |panel, _, window, cx| {
                                 panel.mutate(mutation.clone(), window, cx);
@@ -361,6 +365,7 @@ impl GitPanel {
                     .children((section == Section::Changes).then(|| {
                         let file = file.clone();
                         tool_button("git-discard-path", Ic::Trash, tr(lang, Tr::GitDiscard))
+                            .w(px(FILE_ACTION_W))
                             .disabled(busy.is_some())
                             .on_click(cx.listener(move |panel, _, window, cx| {
                                 panel.confirm_discard(
@@ -416,7 +421,7 @@ impl GitPanel {
             .child(
                 h_flex()
                     .id(group.clone())
-                    .group(group)
+                    .group(group.clone())
                     .h(px(24.))
                     .min_w_0()
                     .gap_1()
@@ -458,21 +463,16 @@ impl GitPanel {
                                     .child(directory.to_owned()),
                             ),
                     )
-                    .children(file.added.map(|n| {
+                    .child(file_count(file.added, '+', theme.green))
+                    .child(file_count(file.removed, '−', theme.red))
+                    .child(
                         div()
+                            .w(px(2. * FILE_ACTION_W))
                             .flex_shrink_0()
-                            .text_size(px(11.))
-                            .text_color(theme.green)
-                            .child(format!("+{n}"))
-                    }))
-                    .children(file.removed.map(|n| {
-                        div()
-                            .flex_shrink_0()
-                            .text_size(px(11.))
-                            .text_color(theme.red)
-                            .child(format!("−{n}"))
-                    }))
-                    .children(actions),
+                            .invisible()
+                            .group_hover(group, |s| s.visible())
+                            .children(actions),
+                    ),
             )
             .children(diff)
     }
@@ -487,9 +487,18 @@ impl GitPanel {
         let content = match &diff.result {
             None => return tiny(tr(lang, Tr::GitLoading), cx),
             Some(Err(error)) => return tiny(error.to_string(), cx),
-            Some(Ok(diff)) if diff.lines.is_empty() => return tiny(tr(lang, Tr::GitNoDiff), cx),
             Some(Ok(diff)) => diff,
         };
+        let lines = inline_diff_lines(&content.lines);
+        let count = lines.clone().count();
+        if count == 0 {
+            let label = if content.truncated {
+                Tr::GitDiffTruncated
+            } else {
+                Tr::GitNoDiff
+            };
+            return tiny(tr(lang, label), cx);
+        }
         v_flex()
             .w_full()
             .min_w_0()
@@ -507,7 +516,7 @@ impl GitPanel {
                             .w_auto()
                             .font_family("Cascadia Mono")
                             .text_size(px(11.5))
-                            .children(content.lines.iter().take(DIFF_ROWS).map(|line| {
+                            .children(lines.take(DIFF_ROWS).map(|line| {
                                 let (foreground, background) = match line.kind {
                                     DiffLineKind::Added => (theme.green, theme.green.opacity(0.12)),
                                     DiffLineKind::Removed => (theme.red, theme.red.opacity(0.12)),
@@ -525,14 +534,14 @@ impl GitPanel {
                             })),
                     ),
             )
-            .children((content.lines.len() > DIFF_ROWS).then(|| {
+            .children((count > DIFF_ROWS).then(|| {
                 tiny(
-                    git_more_lines(lang, content.lines.len() - DIFF_ROWS, content.truncated),
+                    git_more_lines(lang, count - DIFF_ROWS, content.truncated),
                     cx,
                 )
             }))
             .children(
-                (content.truncated && content.lines.len() <= DIFF_ROWS)
+                (content.truncated && count <= DIFF_ROWS)
                     .then(|| tiny(tr(lang, Tr::GitDiffTruncated), cx)),
             )
             .into_any_element()
@@ -642,24 +651,38 @@ impl GitPanel {
                             .text_size(px(12.))
                             .child(commit.subject.clone()),
                     )
-                    .children(
-                        badges
-                            .iter()
-                            .cloned()
-                            .chain((more > 0).then(|| format!("+{more}")))
-                            .map(|badge| {
-                                div()
-                                    .max_w(px(52.))
-                                    .min_w_0()
-                                    .px_1()
-                                    .truncate()
-                                    .rounded_sm()
-                                    .bg(theme.muted.opacity(0.75))
-                                    .text_color(theme.muted_foreground)
-                                    .text_size(px(10.))
-                                    .child(badge)
-                            }),
-                    )
+                    .children(badges.into_iter().enumerate().map(|(index, badge)| {
+                        let (background, color) = if badge.current {
+                            (theme.primary.opacity(0.20), theme.primary)
+                        } else {
+                            (theme.muted.opacity(0.75), theme.muted_foreground)
+                        };
+                        let tooltip: SharedString = badge.label.to_owned().into();
+                        div()
+                            .id(("git-ref-badge", index))
+                            .min_w_0()
+                            .max_w(px(180.))
+                            .px_1()
+                            .truncate()
+                            .rounded_sm()
+                            .bg(background)
+                            .text_color(color)
+                            .text_size(px(10.))
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(tooltip.clone()).build(window, cx)
+                            })
+                            .child(badge_text(badge.label))
+                    }))
+                    .children((more > 0).then(|| {
+                        div()
+                            .flex_shrink_0()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(theme.muted.opacity(0.75))
+                            .text_color(theme.muted_foreground)
+                            .text_size(px(10.))
+                            .child(format!("+{more}"))
+                    }))
                     .child(
                         div()
                             .flex_shrink_0()
@@ -681,9 +704,7 @@ impl GitPanel {
                     ),
             )
             .children(expansion.map(|files| {
-                let date = chrono::DateTime::from_timestamp(commit.time_unix, 0)
-                    .map(|date| date.format("%Y-%m-%d %H:%M UTC").to_string())
-                    .unwrap_or_default();
+                let date = format_commit_date(commit.time_unix, &Local);
                 let metadata = format!("{} <{}> · {date}", commit.author, commit.email);
                 v_flex()
                     .w_full()
@@ -763,16 +784,68 @@ fn split_file_label(path: &str) -> (&str, &str) {
         .map_or((path, ""), |(directory, name)| (name, directory))
 }
 
-fn ref_badges(refs: &[String]) -> (Vec<String>, usize) {
+fn file_count(count: Option<u32>, sign: char, color: Hsla) -> impl IntoElement {
+    div()
+        .w(px(FILE_COUNT_W))
+        .flex_shrink_0()
+        .truncate()
+        .text_right()
+        .text_size(px(11.))
+        .text_color(color)
+        .children(count.map(|n| format!("{sign}{n}")))
+}
+
+fn inline_diff_lines(lines: &[DiffLine]) -> impl Iterator<Item = &DiffLine> + Clone {
+    lines.iter().filter(|line| line.kind != DiffLineKind::Meta)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RefBadge<'a> {
+    label: &'a str,
+    current: bool,
+}
+
+fn parse_ref_badge(decoration: &str) -> RefBadge<'_> {
+    if let Some(branch) = decoration.strip_prefix("HEAD -> ") {
+        RefBadge {
+            label: branch,
+            current: true,
+        }
+    } else {
+        RefBadge {
+            label: decoration.strip_prefix("tag: ").unwrap_or(decoration),
+            current: decoration == "HEAD",
+        }
+    }
+}
+
+fn ref_badges(refs: &[String]) -> (Vec<RefBadge<'_>>, usize) {
     let badges = refs
         .iter()
         .take(2)
-        .map(|name| {
-            name.strip_prefix("HEAD -> ")
-                .map_or_else(|| name.clone(), |branch| format!("HEAD → {branch}"))
-        })
+        .map(|name| parse_ref_badge(name))
         .collect();
     (badges, refs.len().saturating_sub(2))
+}
+
+fn badge_text(label: &str) -> String {
+    match label.char_indices().nth(REF_LABEL_CHARS) {
+        Some((end, _)) => format!("{}…", &label[..end]),
+        None => label.to_owned(),
+    }
+}
+
+fn format_commit_date<Tz: TimeZone>(timestamp: i64, timezone: &Tz) -> String
+where
+    Tz::Offset: Display,
+{
+    DateTime::from_timestamp(timestamp, 0)
+        .map(|date| {
+            date.with_timezone(timezone)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -790,12 +863,104 @@ mod tests {
     }
 
     #[test]
-    fn ref_badges_limit_visible_labels_and_preserve_head() {
+    fn ref_badges_strip_prefixes_mark_current_and_limit_visible_refs() {
         let refs = ["HEAD -> main", "tag: v1", "topic", "origin/main"].map(str::to_owned);
         assert_eq!(
             ref_badges(&refs),
-            (vec!["HEAD → main".into(), "tag: v1".into()], 2)
+            (
+                vec![
+                    RefBadge {
+                        label: "main",
+                        current: true
+                    },
+                    RefBadge {
+                        label: "v1",
+                        current: false
+                    }
+                ],
+                2
+            )
         );
         assert_eq!(ref_badges(&[]), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn detached_head_and_remote_refs_keep_their_labels() {
+        assert_eq!(
+            parse_ref_badge("HEAD"),
+            RefBadge {
+                label: "HEAD",
+                current: true
+            }
+        );
+        assert_eq!(
+            parse_ref_badge("origin/main"),
+            RefBadge {
+                label: "origin/main",
+                current: false
+            }
+        );
+        assert_eq!(
+            parse_ref_badge("tag: HEAD"),
+            RefBadge {
+                label: "HEAD",
+                current: false
+            }
+        );
+    }
+
+    #[test]
+    fn badge_labels_fit_sixteen_characters_and_truncate_at_a_utf8_boundary() {
+        assert_eq!(badge_text("origin/main"), "origin/main");
+        assert_eq!(badge_text("1234567890abcdef"), "1234567890abcdef");
+        assert_eq!(badge_text("1234567890abcdeї😀"), "1234567890abcdeї…");
+    }
+
+    #[test]
+    fn inline_diff_keeps_only_hunks_and_content() {
+        use DiffLineKind::*;
+        let lines = [
+            (Meta, "diff --git a/old b/new"),
+            (Meta, "index abc..def 100644"),
+            (Meta, "new file mode 100644"),
+            (Meta, "deleted file mode 100644"),
+            (Meta, "similarity index 80%"),
+            (Meta, "rename from old"),
+            (Meta, "rename to new"),
+            (Meta, "--- a/old"),
+            (Meta, "+++ b/new"),
+            (Hunk, "@@ -1,2 +1,2 @@"),
+            (Context, " context"),
+            (Removed, "--- content"),
+            (Added, "+++ content"),
+            (Meta, r"\ No newline at end of file"),
+        ]
+        .map(|(kind, text)| DiffLine {
+            kind,
+            text: text.into(),
+        });
+        let shown = inline_diff_lines(&lines)
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shown,
+            ["@@ -1,2 +1,2 @@", " context", "--- content", "+++ content"]
+        );
+        assert_eq!(inline_diff_lines(&lines[..9]).count(), 0);
+    }
+
+    #[test]
+    fn commit_dates_apply_the_display_timezone_and_omit_its_suffix() {
+        let timestamp = DateTime::parse_from_rfc3339("2026-11-19T20:50:27Z")
+            .unwrap()
+            .timestamp();
+        let plus_two = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        let plus_five = chrono::FixedOffset::east_opt(5 * 3600).unwrap();
+        assert_eq!(format_commit_date(timestamp, &plus_two), "2026-11-19 22:50");
+        assert_eq!(
+            format_commit_date(timestamp, &plus_five),
+            "2026-11-20 01:50"
+        );
+        assert_eq!(format_commit_date(i64::MAX, &plus_two), "");
     }
 }
