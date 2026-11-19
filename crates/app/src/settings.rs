@@ -17,6 +17,8 @@ pub struct AppSettings {
     pub last_workspace: Option<PathBuf>,
     /// Track Claude Code status through hooks in `~/.claude/settings.json`.
     pub agent_hooks: bool,
+    /// Closing the window hides it to the system tray instead of quitting.
+    pub close_to_tray: bool,
 }
 
 impl Default for AppSettings {
@@ -26,19 +28,25 @@ impl Default for AppSettings {
             theme: ThemeKind::Gray,
             last_workspace: None,
             agent_hooks: true,
+            close_to_tray: true,
         }
     }
 }
 
 impl Global for AppSettings {}
 
-fn path() -> Option<PathBuf> {
-    // SICH_CONFIG_DIR isolates test/dev instances (same override the daemon uses).
+/// `<config>/sich/<name>`; SICH_CONFIG_DIR isolates test/dev instances (same override the
+/// daemon uses).
+pub(crate) fn config_file(name: &str) -> Option<PathBuf> {
     let base = match std::env::var_os("SICH_CONFIG_DIR") {
         Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
         _ => dirs::config_dir(),
     };
-    base.map(|d| d.join("sich").join("settings.json"))
+    base.map(|d| d.join("sich").join(name))
+}
+
+fn path() -> Option<PathBuf> {
+    config_file("settings.json")
 }
 
 impl AppSettings {
@@ -114,6 +122,16 @@ pub fn set_agent_hooks(enabled: bool, cx: &mut App) {
     store(s, cx);
 }
 
+pub fn set_close_to_tray(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.close_to_tray == enabled {
+        return;
+    }
+    s.close_to_tray = enabled;
+    store(s, cx);
+    cx.refresh_windows();
+}
+
 pub fn set_theme(kind: ThemeKind, cx: &mut App) {
     let mut s = get(cx);
     if s.theme == kind {
@@ -166,5 +184,28 @@ mod tests {
         assert!(!back.agent_hooks);
         let parsed: AppSettings = serde_json::from_str(r#"{"agent_hooks":false}"#).unwrap();
         assert!(!parsed.agent_hooks);
+    }
+
+    #[test]
+    fn close_to_tray_defaults_to_true_for_old_files() {
+        let s: AppSettings = serde_json::from_str(r#"{"language":"uk","theme":"gray"}"#).unwrap();
+        assert!(s.close_to_tray);
+        assert!(AppSettings::default().close_to_tray);
+    }
+
+    #[test]
+    fn close_to_tray_false_round_trips() {
+        let s = AppSettings { close_to_tray: false, ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!back.close_to_tray);
+        let parsed: AppSettings = serde_json::from_str(r#"{"close_to_tray":false}"#).unwrap();
+        assert!(!parsed.close_to_tray);
+    }
+
+    #[test]
+    fn config_file_lives_under_sich_dir() {
+        if let Some(p) = config_file("session.json") {
+            assert!(p.ends_with(std::path::Path::new("sich").join("session.json")));
+        }
     }
 }

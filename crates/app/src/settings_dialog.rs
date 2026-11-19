@@ -29,7 +29,13 @@ pub fn open(window: &mut Window, cx: &mut App) {
                     .pb_2()
                     .child(section(tr(lang, Tr::Language), language_picker(lang, cx), cx))
                     .child(section(tr(lang, Tr::Theme), theme_cards(lang, cx), cx))
-                    .child(section(tr(lang, Tr::AgentsSection), agents_section(lang, cx), cx)),
+                    .child(section(tr(lang, Tr::AgentsSection), agents_section(lang, cx), cx))
+                    .child(
+                        Switch::new("close-to-tray")
+                            .checked(settings::get(cx).close_to_tray)
+                            .label(tr(lang, Tr::CloseToTray))
+                            .on_click(|checked, _window, cx| settings::set_close_to_tray(*checked, cx)),
+                    ),
             )
     });
 }

@@ -42,6 +42,11 @@ pub(crate) struct ClientState {
     pub terminals: Vec<TermEntry>,
     /// Set once the first terminal list arrived (used for the "create one if empty" rule).
     pub synced: bool,
+    /// How many terminals the daemon had in the first list after startup (`None` = not yet).
+    pub first_list_count: Option<usize>,
+    /// Create a Home terminal when the daemon starts out empty (off while a session restore
+    /// is going to fill it).
+    pub auto_create: bool,
     pub daemon_pid: Option<u32>,
     pub projects: Vec<ProjectInfo>,
     pub groups: Vec<GroupInfo>,
@@ -55,7 +60,7 @@ pub(crate) struct ClientState {
 pub(crate) enum Cmd {
     /// Leave the `Incompatible` state and connect again.
     Reconnect,
-    Create { cols: u16, rows: u16, worktree: Option<PathBuf> },
+    Create { cols: u16, rows: u16, worktree: Option<PathBuf>, cwd: Option<PathBuf> },
     RefreshProjects,
     AddProject { path: PathBuf, group: Option<GroupId> },
     CreateGroup(String),
@@ -87,12 +92,14 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     /// Starts the connection task on `rt`.
-    pub fn start(rt: &Handle, socket: String, wake: Wake) -> DaemonClient {
+    pub fn start(rt: &Handle, socket: String, wake: Wake, auto_create: bool) -> DaemonClient {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(ClientState {
             status: ConnStatus::Reconnecting,
             terminals: Vec::new(),
             synced: false,
+            first_list_count: None,
+            auto_create,
             daemon_pid: None,
             projects: Vec::new(),
             groups: Vec::new(),
@@ -117,7 +124,17 @@ impl DaemonClient {
 
     /// Creates a terminal whose cwd is `worktree` (when given).
     pub fn create_terminal_in(&self, cols: u16, rows: u16, worktree: Option<PathBuf>) {
-        let _ = self.cmd_tx.send(Cmd::Create { cols, rows, worktree });
+        let _ = self.cmd_tx.send(Cmd::Create { cols, rows, worktree, cwd: None });
+    }
+
+    /// Like [`create_terminal_in`](Self::create_terminal_in) but starting in `cwd` (session restore).
+    pub fn create_terminal_at(&self, cols: u16, rows: u16, worktree: Option<PathBuf>, cwd: Option<PathBuf>) {
+        let _ = self.cmd_tx.send(Cmd::Create { cols, rows, worktree, cwd });
+    }
+
+    /// Terminal count of the first list received after startup; `None` until it arrives.
+    pub fn first_list_count(&self) -> Option<usize> {
+        self.state.lock().first_list_count
     }
 
     /// Projects plus the revision counter (changes on every `Projects` message).

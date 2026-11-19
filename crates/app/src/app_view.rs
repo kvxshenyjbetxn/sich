@@ -2,14 +2,17 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
+use futures::StreamExt as _;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
-    KeyDownEvent, ParentElement as _, Render, Styled as _, Window,
+    KeyDownEvent, ParentElement as _, Render, Styled as _, Window, WindowBounds,
     div, px,
 };
 use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
@@ -18,18 +21,34 @@ use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
+use crate::session::{self, SavedWindow, Session, SessionInput};
 use crate::settings;
 use crate::settings_dialog;
+use crate::tray::{self, Tray, UiEvent};
 use crate::view::TerminalView;
 use crate::workspace::{
     PendingWorktree, WorkspaceKey, Workspaces, cycle_id,
     match_pending_worktree, restore_selection, terminals_in, workspace_exists,
 };
 use crate::win_flash;
+use crate::win_show;
 use crate::worktree_dialogs;
 
 /// Upper bound for creations waiting to be matched with a `TerminalCreated`.
 const MAX_PENDING_CREATES: usize = 8;
+
+/// Delay before a changed session is written to disk.
+const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// How long a session restore may take before it stops blocking session saves.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Terminals of one workspace being recreated from the saved session.
+struct RestoreTarget {
+    key: WorkspaceKey,
+    expected: usize,
+    active: Option<usize>,
+}
 
 pub struct AppView {
     pub(crate) client: DaemonClient,
@@ -58,18 +77,44 @@ pub struct AppView {
     attention: HashMap<TermId, Option<BadgeKind>>,
     /// `since_unix_ms` of the status for which `mark_seen` was already sent, per terminal.
     seen_sent: HashMap<TermId, u64>,
+    /// Daemon socket name (for the final `Shutdown`).
+    socket: String,
+    events_tx: UnboundedSender<UiEvent>,
+    events_rx: Option<UnboundedReceiver<UiEvent>>,
+    tray: Option<Tray>,
+    tray_lang: i18n::Language,
+    /// Session loaded at startup, consumed by the restore.
+    saved: Option<Session>,
+    /// Whether the terminal restore decision was made (once per run).
+    restored: bool,
+    /// The client does not auto-create a first terminal because the restore will fill the daemon.
+    suppress_auto_create: bool,
+    restore_targets: Vec<RestoreTarget>,
+    restore_started: Option<Instant>,
+    window_state: Option<SavedWindow>,
+    last_session: Option<Session>,
+    pending_save: Option<Session>,
+    save_scheduled: bool,
 }
 
 impl AppView {
-    pub fn new(rt: tokio::runtime::Handle, socket: String, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        rt: tokio::runtime::Handle,
+        socket: String,
+        events: (UnboundedSender<UiEvent>, UnboundedReceiver<UiEvent>),
+        saved: Option<Session>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let suppress_auto_create = saved.as_ref().is_some_and(Session::has_terminals);
         // Coalescing wake path: bounded(1), try_send never blocks.
         let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
         let client = DaemonClient::start(
             &rt,
-            socket,
+            socket.clone(),
             Arc::new(move || {
                 let _ = wake_tx.try_send(());
             }),
+            !suppress_auto_create,
         );
         cx.spawn(async move |this, cx| {
             while wake_rx.recv().await.is_ok() {
@@ -85,7 +130,11 @@ impl AppView {
             client,
             views: HashMap::new(),
             ws: Workspaces::default(),
-            restore: Some(settings::get(cx).last_workspace),
+            // The session's selection wins over the older `last_workspace` setting.
+            restore: Some(match &saved {
+                Some(s) => s.selected.clone(),
+                None => settings::get(cx).last_workspace,
+            }),
             projects: Vec::new(),
             groups: Vec::new(),
             collapsed_groups: HashSet::new(),
@@ -99,6 +148,20 @@ impl AppView {
             hwnd: None,
             attention: HashMap::new(),
             seen_sent: HashMap::new(),
+            socket,
+            events_tx: events.0,
+            events_rx: Some(events.1),
+            tray: None,
+            tray_lang: settings::language(cx),
+            saved,
+            restored: false,
+            suppress_auto_create,
+            restore_targets: Vec::new(),
+            restore_started: None,
+            window_state: None,
+            last_session: None,
+            pending_save: None,
+            save_scheduled: false,
         }
     }
 
@@ -108,14 +171,58 @@ impl AppView {
         }
         let snap = self.client.snapshot();
         self.track_agents(&snap);
+        // The window may be hidden in the tray (no renders), so keep these going from here too.
+        let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
+        self.after_state_change(&infos, cx);
         cx.notify();
     }
 
-    /// Hooks the window up: focus tracking (mark seen on focus, flash only in the background)
-    /// and the native handle for the taskbar flash.
+    /// Hooks the window up: focus tracking (mark seen on focus, flash only in the background),
+    /// the native handle (taskbar flash, hide to tray), close interception, the tray icon and
+    /// window-bounds tracking for the session.
     pub fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.window_active = window.is_window_active();
         self.hwnd = win_flash::hwnd_of(window);
+        self.window_state = saved_window_of(window);
+
+        let lang = settings::language(cx);
+        match Tray::new(lang, &tray::tray_tooltip(lang, 0, 0), self.events_tx.clone()) {
+            Ok(t) => self.tray = Some(t),
+            Err(e) => tracing::warn!("no tray icon: {e:#}"),
+        }
+        self.tray_lang = lang;
+
+        let this = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
+            if this.upgrade().is_none() {
+                return true;
+            }
+            // Decide outside the platform callback; the window never closes by itself.
+            let this = this.clone();
+            window.defer(cx, move |window, cx| {
+                let _ = this.update(cx, |this, cx| this.on_close_requested(window, cx));
+            });
+            false
+        });
+        cx.observe_window_bounds(window, |this, window, cx| {
+            this.window_state = saved_window_of(window).or(this.window_state);
+            let infos: Vec<TerminalInfo> =
+                this.client.snapshot().terminals.iter().map(|t| t.info.clone()).collect();
+            this.touch_session(&infos, cx);
+        })
+        .detach();
+
+        if let Some(mut rx) = self.events_rx.take() {
+            cx.spawn_in(window, async move |this, cx| {
+                while let Some(ev) = rx.next().await {
+                    let alive = this.update_in(cx, |this, window, cx| this.on_ui_event(ev, window, cx));
+                    if alive.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
             let snap = this.client.snapshot();
@@ -156,6 +263,193 @@ impl AppView {
                 win_flash::flash(hwnd);
             }
         }
+    }
+
+    // ---- tray, quit ------------------------------------------------------------------------
+
+    fn on_ui_event(&mut self, ev: UiEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match ev {
+            UiEvent::Show => self.show_window(cx),
+            UiEvent::Quit => self.request_quit(window, cx),
+        }
+    }
+
+    fn show_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(hwnd) = self.hwnd {
+            win_show::show(hwnd);
+        }
+        cx.activate(true);
+        cx.notify();
+    }
+
+    /// The window's close button / Alt+F4: hide to the tray, or quit.
+    fn on_close_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.hwnd {
+            Some(hwnd) if self.tray.is_some() && settings::get(cx).close_to_tray => win_show::hide(hwnd),
+            _ => self.request_quit(window, cx),
+        }
+    }
+
+    /// Quits, after a confirmation when agents are still busy.
+    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let infos: Vec<TerminalInfo> =
+            self.client.snapshot().terminals.iter().map(|t| t.info.clone()).collect();
+        if !tray::needs_quit_confirm(&infos) {
+            self.quit_now(cx);
+            return;
+        }
+        self.show_window(cx);
+        if window.has_active_dialog(cx) {
+            window.close_dialog(cx);
+        }
+        let lang = settings::language(cx);
+        let app = cx.entity();
+        worktree_dialogs::open_confirm(
+            window,
+            cx,
+            tr(lang, Tr::QuitConfirmTitle).to_string(),
+            tr(lang, Tr::QuitConfirmText).to_string(),
+            None,
+            tr(lang, Tr::Quit),
+            true,
+            Rc::new(move |_, cx| {
+                app.update(cx, |this, cx| this.quit_now(cx));
+            }),
+        );
+    }
+
+    /// Saves the session, stops the daemon (and with it every terminal) and exits.
+    fn quit_now(&mut self, cx: &mut Context<Self>) {
+        let infos: Vec<TerminalInfo> =
+            self.client.snapshot().terminals.iter().map(|t| t.info.clone()).collect();
+        if self.session_ready() {
+            let session = self.build_session(&infos);
+            if let Err(e) = session.save() {
+                tracing::error!("failed to save session: {e:#}");
+            }
+        }
+        if let Err(e) = crate::cli::stop_daemon(&self.socket) {
+            tracing::warn!("could not stop the daemon: {e:#}");
+        }
+        self.tray = None;
+        cx.quit();
+    }
+
+    // ---- session ---------------------------------------------------------------------------
+
+    /// True once the saved state has been applied; before that the live state is incomplete and
+    /// must not overwrite the file on disk.
+    fn session_ready(&self) -> bool {
+        self.restored && self.restore.is_none() && self.restore_targets.is_empty()
+    }
+
+    fn build_session(&self, infos: &[TerminalInfo]) -> Session {
+        session::build_session(&SessionInput {
+            terminals: infos,
+            ws: &self.ws,
+            projects: &self.projects,
+            groups: &self.groups,
+            collapsed: &self.collapsed,
+            collapsed_groups: &self.collapsed_groups,
+            window: self.window_state,
+        })
+    }
+
+    /// Schedules a debounced save when the session differs from the last one seen.
+    fn touch_session(&mut self, infos: &[TerminalInfo], cx: &mut Context<Self>) {
+        if !self.session_ready() {
+            return;
+        }
+        let session = self.build_session(infos);
+        if self.last_session.as_ref() == Some(&session) {
+            return;
+        }
+        self.last_session = Some(session.clone());
+        self.pending_save = Some(session);
+        if !self.save_scheduled {
+            self.save_scheduled = true;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(SESSION_SAVE_DEBOUNCE).await;
+                let _ = this.update(cx, |this, _| this.flush_session());
+            })
+            .detach();
+        }
+    }
+
+    fn flush_session(&mut self) {
+        self.save_scheduled = false;
+        if let Some(session) = self.pending_save.take() {
+            if let Err(e) = session.save() {
+                tracing::error!("failed to save session: {e:#}");
+            }
+        }
+    }
+
+    /// Recreates the saved terminals once, after the first terminal list and the projects have
+    /// arrived and only when the daemon started out empty.
+    fn maybe_restore_terminals(&mut self) {
+        if self.restored || self.restore.is_some() {
+            return;
+        }
+        let Some(count) = self.client.first_list_count() else { return };
+        self.restored = true;
+        let plan = match self.saved.take() {
+            Some(saved) => session::restore_plan(&saved, count, &self.projects),
+            None => Vec::new(),
+        };
+        if plan.is_empty() {
+            if self.suppress_auto_create && count == 0 {
+                // Nothing restorable: behave like a fresh start.
+                self.client.create_terminal_in(DEFAULT_COLS, DEFAULT_ROWS, None);
+            }
+            return;
+        }
+        for (key, cwds, active) in plan {
+            let worktree = key.path().map(PathBuf::from);
+            for cwd in &cwds {
+                let cwd = (!cwd.as_os_str().is_empty()).then(|| cwd.clone());
+                self.client.create_terminal_at(DEFAULT_COLS, DEFAULT_ROWS, worktree.clone(), cwd);
+            }
+            self.restore_targets.push(RestoreTarget { key, expected: cwds.len(), active });
+        }
+        self.restore_started = Some(Instant::now());
+    }
+
+    /// Activates the saved tab in each restored workspace once all its terminals exist.
+    fn finish_restore_targets(&mut self, infos: &[TerminalInfo]) {
+        if self.restore_targets.is_empty() {
+            return;
+        }
+        let timed_out = self.restore_started.is_some_and(|t| t.elapsed() > RESTORE_TIMEOUT);
+        let ws = &mut self.ws;
+        self.restore_targets.retain(|t| {
+            let ids = terminals_in(&t.key, infos);
+            if ids.len() < t.expected && !timed_out {
+                return true;
+            }
+            if let Some(id) = t.active.and_then(|a| ids.get(a)) {
+                ws.set_active(&t.key, *id);
+            }
+            false
+        });
+    }
+
+    /// Everything that follows terminal / selection changes: restore progress, tray and session.
+    fn after_state_change(&mut self, infos: &[TerminalInfo], cx: &mut Context<Self>) {
+        self.finish_restore_targets(infos);
+        self.update_tray(infos, cx);
+        self.touch_session(infos, cx);
+    }
+
+    fn update_tray(&mut self, infos: &[TerminalInfo], cx: &mut Context<Self>) {
+        let Some(tray) = self.tray.as_mut() else { return };
+        let lang = settings::language(cx);
+        if lang != self.tray_lang {
+            tray.set_language(lang);
+            self.tray_lang = lang;
+        }
+        let (waiting, working) = tray::agent_counts(infos);
+        tray.set_tooltip(&tray::tray_tooltip(lang, waiting, working));
     }
 
     // ---- selection -------------------------------------------------------------------------
@@ -295,6 +589,9 @@ impl AppView {
             self.on_projects_changed(cx);
         }
 
+        self.maybe_restore_terminals();
+        self.finish_restore_targets(infos);
+
         let ws_ids = self.workspace_ids(infos);
         let active = self.ws.active_in(&self.ws.selected, &ws_ids);
         if active != self.focused {
@@ -304,10 +601,17 @@ impl AppView {
             }
         }
         self.track_agents(snap);
+        self.update_tray(infos, cx);
+        self.touch_session(infos, cx);
     }
 
     fn on_projects_changed(&mut self, cx: &mut Context<Self>) {
         if let Some(saved) = self.restore.take() {
+            if let Some(session) = &self.saved {
+                let (projects, groups) = session::resolve_collapsed(session, &self.projects, &self.groups);
+                self.collapsed = projects;
+                self.collapsed_groups = groups;
+            }
             let key = restore_selection(saved.as_deref(), &self.projects);
             self.set_selected(key, cx);
         } else if !workspace_exists(&self.ws.selected, &self.projects) {
@@ -407,6 +711,22 @@ impl AppView {
                     })),
             )
     }
+}
+
+/// Window bounds for the session (logical pixels); `None` when they look bogus.
+fn saved_window_of(window: &Window) -> Option<SavedWindow> {
+    let (bounds, maximized) = match window.window_bounds() {
+        WindowBounds::Windowed(b) => (b, false),
+        WindowBounds::Maximized(b) => (b, true),
+        WindowBounds::Fullscreen(b) => (b, false),
+    };
+    SavedWindow::from_bounds(
+        f32::from(bounds.origin.x),
+        f32::from(bounds.origin.y),
+        f32::from(bounds.size.width),
+        f32::from(bounds.size.height),
+        maximized,
+    )
 }
 
 impl Render for AppView {

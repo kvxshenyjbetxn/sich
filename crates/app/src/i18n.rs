@@ -95,6 +95,14 @@ pub enum Tr {
     AddProjectToGroup,
     MoveToGroup,
     RemoveFromGroup,
+    CloseToTray,
+    TrayShow,
+    TrayQuit,
+    QuitConfirmTitle,
+    QuitConfirmText,
+    Quit,
+    TrayWaiting,
+    TrayWorking,
 }
 
 impl Tr {
@@ -154,6 +162,14 @@ impl Tr {
         Tr::AddProjectToGroup,
         Tr::MoveToGroup,
         Tr::RemoveFromGroup,
+        Tr::CloseToTray,
+        Tr::TrayShow,
+        Tr::TrayQuit,
+        Tr::QuitConfirmTitle,
+        Tr::QuitConfirmText,
+        Tr::Quit,
+        Tr::TrayWaiting,
+        Tr::TrayWorking,
     ];
 }
 
@@ -424,6 +440,46 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Uk => "Прибрати з групи",
             Ru => "Убрать из группы",
             En => "Remove from group",
+        },
+        Tr::CloseToTray => match lang {
+            Uk => "Згортати в трей при закритті",
+            Ru => "Сворачивать в трей при закрытии",
+            En => "Minimize to tray on close",
+        },
+        Tr::TrayShow => match lang {
+            Uk => "Показати Sich",
+            Ru => "Показать Sich",
+            En => "Show Sich",
+        },
+        Tr::TrayQuit => match lang {
+            Uk => "Вийти з Sich",
+            Ru => "Выйти из Sich",
+            En => "Quit Sich",
+        },
+        Tr::QuitConfirmTitle => match lang {
+            Uk => "Вийти з Sich?",
+            Ru => "Выйти из Sich?",
+            En => "Quit Sich?",
+        },
+        Tr::QuitConfirmText => match lang {
+            Uk => "Агенти ще працюють. Вийти й зупинити всі термінали?",
+            Ru => "Агенты ещё работают. Выйти и остановить все терминалы?",
+            En => "Agents are still running. Quit and stop all terminals?",
+        },
+        Tr::Quit => match lang {
+            Uk => "Вийти",
+            Ru => "Выйти",
+            En => "Quit",
+        },
+        Tr::TrayWaiting => match lang {
+            Uk => "чекає",
+            Ru => "ждёт",
+            En => "waiting",
+        },
+        Tr::TrayWorking => match lang {
+            Uk => "працює",
+            Ru => "работает",
+            En => "working",
         },
     }
 }

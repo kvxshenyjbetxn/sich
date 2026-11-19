@@ -135,8 +135,8 @@ async fn session(
                 let Some(cmd) = cmd else { return Ok(End::Closed) };
                 let msg = match cmd {
                     Cmd::Reconnect => continue,
-                    Cmd::Create { cols, rows, worktree } => ClientMsg::CreateTerminal {
-                        cwd: None,
+                    Cmd::Create { cols, rows, worktree, cwd } => ClientMsg::CreateTerminal {
+                        cwd,
                         shell: None,
                         args: Vec::new(),
                         cols,
@@ -298,7 +298,10 @@ impl Conn {
             }
         }
         // Terminals still in `old` no longer exist on the daemon and are dropped.
-        if terminals.is_empty() && !st.synced {
+        if !st.synced {
+            st.first_list_count = Some(terminals.len());
+        }
+        if terminals.is_empty() && !st.synced && st.auto_create {
             out.push(ClientMsg::CreateTerminal {
                 cwd: None,
                 shell: None,
@@ -352,5 +355,66 @@ mod tests {
     #[test]
     fn other_messages_are_ignored() {
         assert_eq!(classify_incompatible(&ServerMsg::Terminals(Vec::new()), false), None);
+    }
+
+    fn test_conn(rt: &tokio::runtime::Runtime, auto_create: bool) -> Conn {
+        let (cmd_tx, _rx) = mpsc::unbounded_channel();
+        Conn {
+            socket: "unused".into(),
+            rt: rt.handle().clone(),
+            state: Arc::new(Mutex::new(ClientState {
+                status: ConnStatus::Reconnecting,
+                terminals: Vec::new(),
+                synced: false,
+                first_list_count: None,
+                auto_create,
+                daemon_pid: None,
+                projects: Vec::new(),
+                groups: Vec::new(),
+                projects_rev: 0,
+                last_error: None,
+            })),
+            cmd_tx,
+            wake: Arc::new(|| {}),
+        }
+    }
+
+    #[test]
+    fn empty_first_list_auto_creates_a_terminal_only_when_enabled() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for (auto, expect) in [(true, true), (false, false)] {
+            let conn = test_conn(&rt, auto);
+            let mut out = Vec::new();
+            conn.reconcile(Vec::new(), &mut out);
+            let created = out.iter().any(|m| matches!(m, ClientMsg::CreateTerminal { .. }));
+            assert_eq!(created, expect, "auto_create={auto}");
+            assert_eq!(conn.state.lock().first_list_count, Some(0));
+            // Only the very first list counts.
+            let mut out = Vec::new();
+            conn.reconcile(Vec::new(), &mut out);
+            assert!(out.is_empty());
+            assert_eq!(conn.state.lock().first_list_count, Some(0));
+        }
+    }
+
+    #[test]
+    fn first_list_count_records_existing_terminals() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let conn = test_conn(&rt, true);
+        let info = TerminalInfo {
+            id: 1,
+            title: String::new(),
+            cwd: std::path::PathBuf::new(),
+            cols: 80,
+            rows: 24,
+            exited: None,
+            created_unix_ms: 1,
+            worktree: None,
+            agent: None,
+        };
+        let mut out = Vec::new();
+        conn.reconcile(vec![info], &mut out);
+        assert_eq!(conn.state.lock().first_list_count, Some(1));
+        assert!(!out.iter().any(|m| matches!(m, ClientMsg::CreateTerminal { .. })));
     }
 }

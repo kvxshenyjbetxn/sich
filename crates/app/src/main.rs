@@ -18,20 +18,29 @@ mod links;
 mod notifications;
 mod os;
 mod settings;
+mod session;
 mod settings_dialog;
 mod sidebar;
+mod single_instance;
 mod tab_bar;
 mod term_settings;
 mod theme;
+mod tray;
 mod view;
 mod win_caret;
 mod win_flash;
+mod win_show;
 mod workspace;
 mod worktree_dialogs;
 
-use gpui_kit::{AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{
+    AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
+};
 
 use crate::app_view::AppView;
+use crate::session::{Rect, Session};
+use crate::single_instance::Acquire;
+use crate::tray::UiEvent;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,6 +72,20 @@ fn run_ui(socket: String) -> anyhow::Result<()> {
             .try_init();
     }
 
+    // A second GUI launch just shows the running window and exits.
+    let (events_tx, events_rx) = futures::channel::mpsc::unbounded::<UiEvent>();
+    match single_instance::acquire(&socket) {
+        Acquire::AlreadyRunning => return Ok(()),
+        Acquire::Primary(listener) => {
+            let tx = events_tx.clone();
+            single_instance::serve(listener, move || {
+                let _ = tx.unbounded_send(UiEvent::Show);
+            });
+        }
+        Acquire::Unavailable => {}
+    }
+    let session = Session::load();
+
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -87,9 +110,31 @@ fn run_ui(socket: String) -> anyhow::Result<()> {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
+        let displays: Vec<Rect> = cx
+            .displays()
+            .iter()
+            .map(|d| {
+                let b = d.bounds();
+                Rect {
+                    x: f32::from(b.origin.x),
+                    y: f32::from(b.origin.y),
+                    w: f32::from(b.size.width),
+                    h: f32::from(b.size.height),
+                }
+            })
+            .collect();
+        let placement = session::window_placement(session.as_ref().and_then(|s| s.window.as_ref()), &displays);
+        let win_size = size(px(placement.width), px(placement.height));
+        let bounds = match placement.origin {
+            Some((x, y)) => Bounds { origin: point(px(x), px(y)), size: win_size },
+            None => Bounds::centered(None, win_size, cx),
+        };
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(if placement.maximized {
+                WindowBounds::Maximized(bounds)
+            } else {
+                WindowBounds::Windowed(bounds)
+            }),
             titlebar: Some(TitlebarOptions {
                 title: Some("Sich".into()),
                 ..Default::default()
@@ -98,7 +143,7 @@ fn run_ui(socket: String) -> anyhow::Result<()> {
         };
         gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| {
-                let mut view = AppView::new(handle, socket, cx);
+                let mut view = AppView::new(handle, socket, (events_tx, events_rx), session, cx);
                 view.watch_window(window, cx);
                 view
             })
