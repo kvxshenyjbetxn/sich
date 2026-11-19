@@ -10,12 +10,12 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     ClickEvent, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, PathPromptOptions, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, div, px, rgb,
+    StatefulInteractiveElement as _, Styled as _, div, px,
 };
 use sich_proto::{GroupId, GroupInfo, ProjectId, ProjectInfo, TermId, TerminalInfo, WorktreeInfo};
 
 use crate::agent_badge::{
-    Badge, agent_glyph, agent_preview, badge_element, badge_for, rollup, shorten_model,
+    Badge, agent_icon_element, agent_preview, badge_element, badge_for, rollup, shorten_model,
 };
 use crate::app_view::AppView;
 use crate::daemon_client::Snapshot;
@@ -696,8 +696,7 @@ impl AppView {
                             .child(close),
                     );
                 };
-                let (glyph, glyph_color) = agent_glyph(status.kind);
-                let glyph_color: Hsla = glyph_color.map_or(muted, |c| rgb(c).into());
+                let icon = agent_icon_element(status.kind, LEAD_SLOT_W, theme.foreground, muted);
                 let title = status.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or(label);
                 let model = status.model.as_deref().map(shorten_model).filter(|m| !m.is_empty());
                 let line1 = h_flex()
@@ -708,9 +707,8 @@ impl AppView {
                         div()
                             .flex_shrink_0()
                             .w(px(LEAD_SLOT_W))
-                            .text_size(px(13.))
-                            .text_color(glyph_color)
-                            .child(glyph),
+                            .h(px(LEAD_SLOT_W))
+                            .child(icon),
                     )
                     .child(
                         div()

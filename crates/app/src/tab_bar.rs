@@ -10,7 +10,7 @@ use gpui_kit::{
 };
 use sich_proto::TermId;
 
-use crate::agent_badge::{badge_element, badge_for, strip_status_glyphs};
+use crate::agent_badge::{agent_icon_element, badge_element, badge_for, strip_status_glyphs};
 use crate::app_view::AppView;
 use crate::daemon_client::{Snapshot, TermEntry};
 use crate::i18n::{self, Language, Tr, tr};
@@ -70,6 +70,11 @@ impl AppView {
                 .as_ref()
                 .and_then(badge_for)
                 .map(|b| badge_element(&b, lang, ("tab-badge", id), cx));
+            let agent_icon = entry
+                .info
+                .agent
+                .as_ref()
+                .map(|a| agent_icon_element(a.kind, 13., theme.foreground, theme.muted_foreground));
             let close = Button::new(("tab-close", id))
                 .ghost()
                 .xsmall()
@@ -112,6 +117,7 @@ impl AppView {
                         }),
                     )
                     .children(badge)
+                    .children(agent_icon)
                     .child(
                         div()
                             .min_w_0()

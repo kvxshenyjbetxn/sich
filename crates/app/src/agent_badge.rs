@@ -9,7 +9,7 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Size, Sizable as _};
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, App, Hsla, InteractiveElement as _, IntoElement,
     ParentElement as _, StatefulInteractiveElement as _, Styled as _, Transformation, div,
-    percentage, px, rgb,
+    percentage, px, rgb, svg,
 };
 use sich_proto::{AgentKind, AgentState, AgentStatus};
 
@@ -17,10 +17,10 @@ use crate::i18n::{self, Language, Tr, tr};
 use crate::settings;
 use crate::theme;
 
-/// Badge size in pixels.
+/// Badge box in pixels (layout slot; the badge icon itself is smaller than the 14px agent icon).
 const BADGE_SIZE: f32 = 14.;
-/// Diameter of the "finished and seen" dot.
-const SEEN_DOT_SIZE: f32 = 7.;
+/// Status icon size (spinner, waiting, done, failed) inside the badge box.
+const BADGE_ICON_SIZE: f32 = 10.;
 /// One full turn of the spinner.
 const SPIN_PERIOD: Duration = Duration::from_millis(1000);
 
@@ -72,15 +72,26 @@ pub fn kind_of(status: Option<&AgentStatus>) -> Option<BadgeKind> {
     status.and_then(badge_for).map(|b| b.kind)
 }
 
-/// Plain text glyph and brand color (`None` = muted) of an agent kind.
-pub fn agent_glyph(kind: AgentKind) -> (&'static str, Option<u32>) {
+/// Embedded SVG asset path and brand tint (`None` = theme color) of an agent kind.
+/// Icons come from Orca (MIT), see THIRD_PARTY_NOTICES.md.
+pub fn agent_icon(kind: AgentKind) -> (&'static str, Option<u32>) {
     match kind {
-        // U+273B has no emoji presentation (U+2733 renders as a green emoji on Windows).
-        AgentKind::Claude => ("\u{273B}", Some(0xD97757)),
-        AgentKind::Gemini => ("\u{2726}", Some(0x4796E3)),
-        AgentKind::Codex => ("\u{25CE}", Some(0x10A37F)),
-        AgentKind::Other => ("\u{2022}", None),
+        AgentKind::Claude => ("agents/claude.svg", Some(0xD97757)),
+        AgentKind::Gemini => ("agents/gemini.svg", Some(0x4796E3)),
+        AgentKind::Codex => ("agents/codex.svg", None),
+        AgentKind::Other => ("agents/generic.svg", None),
     }
+}
+
+/// The agent icon at `size` px. Untinted kinds use `fg` (Codex) or `muted` (other programs).
+pub fn agent_icon_element(kind: AgentKind, size: f32, fg: Hsla, muted: Hsla) -> AnyElement {
+    let (path, tint) = agent_icon(kind);
+    let color: Hsla = match (tint, kind) {
+        (Some(c), _) => rgb(c).into(),
+        (None, AgentKind::Other) => muted,
+        (None, _) => fg,
+    };
+    svg().path(path).size(px(size)).flex_shrink_0().text_color(color).into_any_element()
 }
 
 /// `claude-opus-5-5` -> `opus-5-5` (a leading `claude-` is dropped; empty stays empty).
@@ -165,7 +176,7 @@ pub fn badge_element(
     cx: &App,
 ) -> AnyElement {
     let color = badge_color(badge.kind, cx);
-    let size = Size::Size(px(BADGE_SIZE));
+    let size = Size::Size(px(BADGE_ICON_SIZE));
     let text = tooltip_text(lang, badge);
     let id: gpui_kit::ElementId = id.into();
     let icon = match badge.kind {
@@ -181,19 +192,19 @@ pub fn badge_element(
         BadgeKind::Waiting => Icon::new(Ic::CircleAlert).with_size(size).text_color(color).into_any_element(),
         BadgeKind::Done => Icon::new(Ic::CircleCheck).with_size(size).text_color(color).into_any_element(),
         BadgeKind::Failed => Icon::new(Ic::CircleX).with_size(size).text_color(color).into_any_element(),
-        BadgeKind::SeenDone => div()
-            .size_full()
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(div().size(px(SEEN_DOT_SIZE)).rounded_full().bg(color))
-            .into_any_element(),
+        // Same check as unread Done, dimmed: finished and already looked at.
+        BadgeKind::SeenDone => {
+            Icon::new(Ic::CircleCheck).with_size(size).text_color(color.opacity(0.55)).into_any_element()
+        }
     };
     div()
         .id(id)
         .flex_shrink_0()
         .size(px(BADGE_SIZE))
         .tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+        .flex()
+        .items_center()
+        .justify_center()
         .child(icon)
         .into_any_element()
 }
@@ -258,11 +269,27 @@ mod tests {
     }
 
     #[test]
-    fn glyph_per_agent_kind() {
-        assert_eq!(agent_glyph(AgentKind::Claude), ("\u{273B}", Some(0xD97757)));
-        assert_eq!(agent_glyph(AgentKind::Gemini), ("\u{2726}", Some(0x4796E3)));
-        assert_eq!(agent_glyph(AgentKind::Codex), ("\u{25CE}", Some(0x10A37F)));
-        assert_eq!(agent_glyph(AgentKind::Other).1, None);
+    fn icon_per_agent_kind() {
+        assert_eq!(agent_icon(AgentKind::Claude), ("agents/claude.svg", Some(0xD97757)));
+        assert_eq!(agent_icon(AgentKind::Gemini), ("agents/gemini.svg", Some(0x4796E3)));
+        assert_eq!(agent_icon(AgentKind::Codex), ("agents/codex.svg", None));
+        assert_eq!(agent_icon(AgentKind::Other), ("agents/generic.svg", None));
+    }
+
+    #[test]
+    fn every_agent_kind_maps_to_an_embedded_svg() {
+        use crate::assets::AGENT_SVGS;
+        for kind in [AgentKind::Claude, AgentKind::Gemini, AgentKind::Codex, AgentKind::Other] {
+            let (path, _) = agent_icon(kind);
+            let (_, bytes) = AGENT_SVGS.iter().find(|(p, _)| *p == path).expect("asset embedded");
+            assert!(!bytes.is_empty());
+        }
+    }
+
+    #[test]
+    fn status_badges_are_smaller_than_the_agent_icon() {
+        assert!(BADGE_ICON_SIZE < 14.);
+        assert!(BADGE_ICON_SIZE <= BADGE_SIZE);
     }
 
     fn kind(s: &AgentStatus) -> Option<BadgeKind> {
