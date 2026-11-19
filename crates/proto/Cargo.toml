@@ -1,0 +1,11 @@
+[package]
+name = "sich-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+postcard.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
+thiserror.workspace = true

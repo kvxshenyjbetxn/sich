@@ -1,0 +1,520 @@
+//! TerminalView: owns the session, handles input, renders the grid plus a status overlay.
+
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui_kit::{
+    App, ClipboardItem, Context, Div, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    Pixels, Point as PxPoint, Render, ScrollDelta, ScrollEvent, Styled, Subscription, Window,
+    div, px, rgb,
+};
+use sich_term::alacritty_terminal::index::{Column, Line, Point, Side};
+use sich_term::alacritty_terminal::selection::SelectionType;
+use sich_term::alacritty_terminal::term::TermMode;
+use sich_term::{
+    KeyMods, MouseAction, MouseButton as TermButton, MouseMods, TermSession,
+    key_to_bytes, mouse_report,
+};
+
+use crate::colors;
+use crate::element::{SharedGeometry, TerminalElement};
+use crate::links::Link;
+use crate::term_settings;
+
+pub struct TerminalView {
+    session: TermSession,
+    focus: FocusHandle,
+    scroll_rem: f32,
+    geometry: SharedGeometry,
+    selecting: bool,
+    /// Button whose press was reported to the remote app (so its release is reported too).
+    reported_btn: Option<TermButton>,
+    /// Last cell sent in a mouse report, used to suppress duplicate motion events.
+    last_cell: Option<(usize, usize)>,
+    /// Link under the pointer while Ctrl is held.
+    hover_link: Option<Link>,
+    _subs: Vec<Subscription>,
+}
+
+impl TerminalView {
+    pub fn new(session: TermSession, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        let subs = vec![
+            cx.on_focus_in(&focus, window, |this, _w, _cx| this.send_focus(true)),
+            cx.on_focus_out(&focus, window, |this, _ev, _w, _cx| this.send_focus(false)),
+        ];
+        Self {
+            session,
+            focus,
+            scroll_rem: 0.0,
+            geometry: Rc::new(Cell::new(None)),
+            selecting: false,
+            reported_btn: None,
+            last_cell: None,
+            hover_link: None,
+            _subs: subs,
+        }
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        window.focus(&self.focus, cx);
+    }
+
+    /// Called when the session changed: forwards clipboard writes and repaints if dirty.
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.session.take_clipboard() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        if self.session.take_dirty() {
+            cx.notify();
+        }
+    }
+
+    fn on_key_down(&mut self, ev: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let m = ks.modifiers;
+        if m.platform {
+            return;
+        }
+        let session = self.session.clone();
+        cx.stop_propagation();
+
+        if m.control && !m.alt {
+            let zoom = match ks.key.as_str() {
+                "=" | "+" | "plus" | "add" => Some(Some(1.0)),
+                "-" | "minus" | "subtract" => Some(Some(-1.0)),
+                "0" if !m.shift => Some(None),
+                _ => None,
+            };
+            if let Some(delta) = zoom {
+                term_settings::zoom(delta, cx);
+                return;
+            }
+        }
+
+        if m.control && m.shift {
+            match ks.key.as_str() {
+                "v" => {
+                    Self::paste_clipboard(&session, cx);
+                    cx.notify();
+                    return;
+                }
+                "c" => {
+                    Self::copy_selection(&session, cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if ks.key == "insert" && !m.alt {
+            if m.control && !m.shift {
+                Self::copy_selection(&session, cx);
+                return;
+            }
+            if m.shift && !m.control {
+                Self::paste_clipboard(&session, cx);
+                cx.notify();
+                return;
+            }
+        }
+
+        let mods = KeyMods { ctrl: m.control, alt: m.alt, shift: m.shift };
+        if let Some(bytes) = key_to_bytes(&ks.key, ks.key_char.as_deref(), mods, session.mode()) {
+            session.scroll_to_bottom();
+            session.write(bytes);
+            if session.clear_selection() {
+                cx.notify();
+            }
+        }
+    }
+
+    fn copy_selection(session: &TermSession, cx: &mut App) {
+        if let Some(text) = session.selection_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn paste_clipboard(session: &TermSession, cx: &mut App) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            session.clear_selection();
+            session.scroll_to_bottom();
+            session.paste(&text);
+        }
+    }
+
+    /// Maps a window position to a grid point and side, clamped to the visible grid.
+    fn grid_point(&self, session: &TermSession, pos: PxPoint<Pixels>) -> Option<(Point, Side)> {
+        let g = self.geometry.get()?;
+        let fx = f32::from(pos.x - g.origin.x) / f32::from(g.cell_w);
+        let fy = f32::from(pos.y - g.origin.y) / f32::from(g.line_h);
+        let (col, side) = if fx < 0.0 {
+            (0, Side::Left)
+        } else if fx.floor() as usize >= g.cols {
+            (g.cols - 1, Side::Right)
+        } else {
+            let side = if fx.fract() < 0.5 { Side::Left } else { Side::Right };
+            (fx.floor() as usize, side)
+        };
+        let row = if fy < 0.0 { 0 } else { (fy.floor() as usize).min(g.rows - 1) };
+        let line = row as i32 - session.display_offset() as i32;
+        Some((Point::new(Line(line), Column(col)), side))
+    }
+
+    fn send_focus(&self, focused: bool) {
+        let s = &self.session;
+        if s.mode().contains(TermMode::FOCUS_IN_OUT) {
+            s.write(if focused { &b"\x1b[I"[..] } else { &b"\x1b[O"[..] });
+        }
+    }
+
+    /// True when mouse events go to the remote app instead of our selection/paste handling.
+    fn reporting(session: &TermSession, shift: bool) -> bool {
+        !shift && session.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Viewport cell (col, row) under a window position, clamped to the grid.
+    fn cell_at(&self, pos: PxPoint<Pixels>) -> Option<(usize, usize)> {
+        let g = self.geometry.get()?;
+        let fx = f32::from(pos.x - g.origin.x) / f32::from(g.cell_w);
+        let fy = f32::from(pos.y - g.origin.y) / f32::from(g.line_h);
+        let col = if fx < 0.0 { 0 } else { (fx.floor() as usize).min(g.cols - 1) };
+        let row = if fy < 0.0 { 0 } else { (fy.floor() as usize).min(g.rows - 1) };
+        Some((col, row))
+    }
+
+    /// Link under a window position (only inside the grid).
+    fn link_at_pos(&self, session: &TermSession, pos: PxPoint<Pixels>) -> Option<Link> {
+        let g = self.geometry.get()?;
+        let fx = f32::from(pos.x - g.origin.x) / f32::from(g.cell_w);
+        let fy = f32::from(pos.y - g.origin.y) / f32::from(g.line_h);
+        if fx < 0.0 || fy < 0.0 || fx as usize >= g.cols || fy as usize >= g.rows {
+            return None;
+        }
+        let term = session.lock_term();
+        let offset = term.grid().display_offset();
+        crate::links::link_at(&term, offset, fx as usize, fy as usize)
+    }
+
+    fn set_hover_link(&mut self, link: Option<Link>, cx: &mut Context<Self>) {
+        if self.hover_link != link {
+            self.hover_link = link;
+            cx.notify();
+        }
+    }
+
+    fn on_modifiers_changed(
+        &mut self,
+        ev: &ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let link = if ev.modifiers.control {
+            self.link_at_pos(&self.session, window.mouse_position())
+        } else {
+            None
+        };
+        self.set_hover_link(link, cx);
+    }
+
+    fn send_mouse(
+        session: &TermSession,
+        button: TermButton,
+        action: MouseAction,
+        mods: gpui_kit::Modifiers,
+        (col, row): (usize, usize),
+    ) {
+        let mods = MouseMods { shift: mods.shift, alt: mods.alt, ctrl: mods.control };
+        if let Some(bytes) = mouse_report(button, action, mods, col, row, session.mode()) {
+            if session.display_offset() > 0 {
+                session.scroll_to_bottom();
+            }
+            session.write(bytes);
+        }
+    }
+
+    /// Reports a button press to the remote app. Returns true when it was handled.
+    fn report_down(
+        &mut self,
+        session: &TermSession,
+        button: TermButton,
+        ev: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !Self::reporting(session, ev.modifiers.shift) {
+            return false;
+        }
+        let Some(cell) = self.cell_at(ev.position) else { return true };
+        self.selecting = false;
+        if session.clear_selection() {
+            cx.notify();
+        }
+        self.reported_btn = Some(button);
+        self.last_cell = Some(cell);
+        Self::send_mouse(session, button, MouseAction::Press, ev.modifiers, cell);
+        true
+    }
+
+    /// Reports the release of a previously reported button. Returns true when it was handled.
+    fn report_up(&mut self, button: TermButton, ev: &MouseUpEvent) -> bool {
+        if self.reported_btn != Some(button) {
+            return false;
+        }
+        self.reported_btn = None;
+        self.last_cell = None;
+        let session = self.session.clone();
+        if let Some(cell) = self.cell_at(ev.position) {
+            Self::send_mouse(&session, button, MouseAction::Release, ev.modifiers, cell);
+        }
+        true
+    }
+
+    fn on_middle_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        let session = self.session.clone();
+        self.report_down(&session, TermButton::Middle, ev, cx);
+    }
+
+    fn on_middle_up(&mut self, ev: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.report_up(TermButton::Middle, ev);
+    }
+
+    fn on_right_up(&mut self, ev: &MouseUpEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.report_up(TermButton::Right, ev);
+    }
+
+    /// Hover motion without a button (only reported in any-motion mode).
+    fn on_hover_move(&mut self, ev: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if ev.pressed_button.is_some() {
+            return;
+        }
+        let session = self.session.clone();
+        let link = if ev.modifiers.control { self.link_at_pos(&session, ev.position) } else { None };
+        let over_link = link.is_some();
+        self.set_hover_link(link, cx);
+        if over_link {
+            return;
+        }
+        if !Self::reporting(&session, ev.modifiers.shift)
+            || !session.mode().contains(TermMode::MOUSE_MOTION)
+        {
+            return;
+        }
+        let Some(cell) = self.cell_at(ev.position) else { return };
+        if self.last_cell == Some(cell) {
+            return;
+        }
+        self.last_cell = Some(cell);
+        Self::send_mouse(&session, TermButton::None, MouseAction::Motion, ev.modifiers, cell);
+    }
+
+    fn on_left_down(&mut self, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus, cx);
+        let session = self.session.clone();
+        if ev.modifiers.control {
+            if let Some(link) = self.link_at_pos(&session, ev.position) {
+                cx.open_url(&link.url);
+                return;
+            }
+        }
+        if self.report_down(&session, TermButton::Left, ev, cx) {
+            return;
+        }
+        let Some((point, side)) = self.grid_point(&session, ev.position) else { return };
+        if !(ev.modifiers.shift && session.update_selection(point, side)) {
+            let ty = match ev.click_count {
+                2 => SelectionType::Semantic,
+                n if n >= 3 => SelectionType::Lines,
+                _ => SelectionType::Simple,
+            };
+            session.start_selection(point, side, ty);
+        }
+        self.selecting = true;
+        cx.notify();
+    }
+
+    fn on_drag(&mut self, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if let Some(button) = self.reported_btn {
+            let session = self.session.clone();
+            let Some(cell) = self.cell_at(ev.position) else { return };
+            if self.last_cell != Some(cell) {
+                self.last_cell = Some(cell);
+                Self::send_mouse(&session, button, MouseAction::Motion, ev.modifiers, cell);
+            }
+            return;
+        }
+        if !self.selecting {
+            return;
+        }
+        let session = self.session.clone();
+        let Some(g) = self.geometry.get() else { return };
+        if ev.position.y < g.origin.y {
+            session.scroll(1);
+        } else if ev.position.y > g.origin.y + g.line_h * g.rows as f32 {
+            session.scroll(-1);
+        }
+        if let Some((point, side)) = self.grid_point(&session, ev.position) {
+            session.update_selection(point, side);
+        }
+        cx.notify();
+    }
+
+    fn on_left_up(&mut self, ev: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.report_up(TermButton::Left, ev) {
+            return;
+        }
+        if !self.selecting {
+            return;
+        }
+        self.selecting = false;
+        if self.session.selection_is_empty() {
+            self.session.clear_selection();
+        }
+        cx.notify();
+    }
+
+    fn on_right_down(&mut self, ev: &MouseDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let session = self.session.clone();
+        if self.report_down(&session, TermButton::Right, ev, cx) {
+            return;
+        }
+        if session.has_selection() {
+            Self::copy_selection(&session, cx);
+            session.clear_selection();
+        } else {
+            Self::paste_clipboard(&session, cx);
+        }
+        cx.notify();
+    }
+
+    fn on_scroll(&mut self, ev: &ScrollEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let session = self.session.clone();
+        if ev.modifiers.control {
+            let dy = match ev.delta {
+                ScrollDelta::Lines(l) => l.y,
+                ScrollDelta::Pixels(p) => f32::from(p.y),
+            };
+            if dy != 0.0 {
+                term_settings::zoom(Some(dy.signum()), cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let line_h = term_settings::get(cx).line_px();
+        // Windows reports Lines already multiplied by the system setting (3 by default).
+        let lines = match ev.delta {
+            ScrollDelta::Lines(l) => l.y,
+            ScrollDelta::Pixels(p) => f32::from(p.y) / line_h,
+        };
+        let total = self.scroll_rem + lines;
+        let n = total.trunc();
+        self.scroll_rem = total - n;
+        let n = n as i32;
+        if n == 0 {
+            return;
+        }
+        let mode = session.mode();
+        if Self::reporting(&session, ev.modifiers.shift) {
+            if let Some(cell) = self.cell_at(ev.position) {
+                let button = if n > 0 { TermButton::WheelUp } else { TermButton::WheelDown };
+                for _ in 0..n.unsigned_abs() {
+                    Self::send_mouse(&session, button, MouseAction::Press, ev.modifiers, cell);
+                }
+            }
+            return;
+        }
+        if mode.contains(TermMode::ALT_SCREEN) && !mode.intersects(TermMode::MOUSE_MODE) {
+            // Alt screen has no history: send arrow keys like most terminals.
+            let key = if n > 0 { "up" } else { "down" };
+            if let Some(bytes) = key_to_bytes(key, None, KeyMods::default(), mode) {
+                let mut out = Vec::with_capacity(bytes.len() * n.unsigned_abs() as usize);
+                for _ in 0..n.unsigned_abs() {
+                    out.extend_from_slice(&bytes);
+                }
+                session.write(out);
+            }
+        } else {
+            session.scroll(n);
+            cx.notify();
+        }
+    }
+}
+
+impl Focusable for TerminalView {
+    fn focus_handle(&self, _cx: &gpui_kit::App) -> FocusHandle {
+        self.focus.clone()
+    }
+}
+
+fn overlay(text: String, color: u32, bg: u32) -> Div {
+    div()
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .right_0()
+        .px_3()
+        .py_1()
+        .bg(rgb(bg))
+        .text_color(rgb(color))
+        .text_size(px(13.))
+        .child(text)
+}
+
+impl Render for TerminalView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let bg = colors::to_gpui(colors::bg());
+        let root = div().size_full().relative().bg(bg).text_color(colors::to_gpui(colors::fg()));
+
+        let session = self.session.clone();
+
+        let this = cx.entity().downgrade();
+        let on_move: crate::element::MoveHandler = Rc::new(move |ev, _window, cx| {
+            let _ = this.update(cx, |this, cx| this.on_drag(ev, cx));
+        });
+
+        let mods = window.modifiers();
+        // Recompute so the hovered link follows scrolling and new output.
+        let link = if mods.control { self.link_at_pos(&session, window.mouse_position()) } else { None };
+        self.hover_link = link.clone();
+
+        let reporting = Self::reporting(&session, mods.shift);
+        let root = if link.is_some() {
+            root.cursor_pointer()
+        } else if reporting {
+            root.cursor_default()
+        } else {
+            root.cursor_text()
+        };
+        let mut root = root
+            .track_focus(&self.focus)
+            .capture_key_down(cx.listener(Self::on_key_down))
+            .on_scroll(cx.listener(Self::on_scroll))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_left_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_down))
+            .on_mouse_down(MouseButton::Middle, cx.listener(Self::on_middle_down))
+            .on_mouse_move(cx.listener(Self::on_hover_move))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_left_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_left_up))
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_middle_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_middle_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_right_up))
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::on_right_up))
+            .child(TerminalElement::new(
+                session.clone(),
+                self.focus.clone(),
+                self.geometry.clone(),
+                on_move,
+                link.map(|l| l.spans).unwrap_or_default(),
+            ));
+
+        if let Some(code) = session.exited() {
+            let text = match code {
+                Some(c) => format!("Process exited (code {c}). Close the terminal from the sidebar."),
+                None => "Process exited. Close the terminal from the sidebar.".to_string(),
+            };
+            root = root.child(overlay(text, 0xe0af68, crate::theme::OVERLAY_BG));
+        }
+        root
+    }
+}

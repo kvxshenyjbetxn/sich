@@ -1,0 +1,28 @@
+[package]
+name = "sich-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "sich"
+path = "src/main.rs"
+
+[dependencies]
+sich-proto.workspace = true
+sich-daemon.workspace = true
+sich-term.workspace = true
+gpui-kit.workspace = true
+alacritty_terminal.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-channel.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+regex = "1"
+
+
+[build-dependencies]
+embed-resource = "3"
