@@ -29,6 +29,25 @@ pub fn launcher_exe() -> Option<PathBuf> {
     resolve_launcher(std::env::var_os(LAUNCHER_ENV), std::env::current_exe().ok())
 }
 
+const CLI_EXE: &str = if cfg!(windows) { "sich-cli.exe" } else { "sich-cli" };
+
+/// The console-subsystem relay for CLI subcommands, next to the user-facing exe (so PowerShell
+/// waits for it and gets output and exit codes). Falls back to the launcher exe itself.
+pub fn cli_exe() -> Option<PathBuf> {
+    let launcher = launcher_exe()?;
+    let cli = resolve_cli_exe(&launcher, |p| p.is_file());
+    if cli == launcher {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| tracing::warn!("{CLI_EXE} not found next to {}; CLI commands fall back to it", launcher.display()));
+    }
+    Some(cli)
+}
+
+fn resolve_cli_exe(launcher: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let sibling = launcher.with_file_name(CLI_EXE);
+    if exists(&sibling) { sibling } else { launcher.to_path_buf() }
+}
+
 fn resolve_launcher(env: Option<std::ffi::OsString>, current: Option<PathBuf>) -> Option<PathBuf> {
     match env.filter(|v| !v.is_empty()) {
         // Never hand out a `\\?\` verbatim path: shells (Git Bash runs agent hooks) can't run it.
@@ -221,6 +240,14 @@ fn prune_hosts(root: &Path, current: &str, in_use: impl Fn(&Path) -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_exe_is_the_sibling_when_present_else_the_launcher() {
+        let launcher = Path::new("C:/Apps/Sich/sich.exe");
+        let sibling = launcher.with_file_name(CLI_EXE);
+        assert_eq!(resolve_cli_exe(launcher, |p| p == sibling), sibling);
+        assert_eq!(resolve_cli_exe(launcher, |_| false), launcher);
+    }
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|a| a.to_string()).collect()

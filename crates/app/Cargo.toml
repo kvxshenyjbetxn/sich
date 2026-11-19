@@ -7,6 +7,10 @@ edition.workspace = true
 name = "sich"
 path = "src/main.rs"
 
+[[bin]]
+name = "sich-cli"
+path = "src/bin/sich_cli.rs"
+
 [dependencies]
 sich-proto.workspace = true
 sich-daemon.workspace = true

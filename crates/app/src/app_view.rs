@@ -262,7 +262,7 @@ impl AppView {
     fn orch_tick_data(&self) -> orch_watch::TickData {
         let snap = self.client.snapshot();
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
-        let exe = crate::daemon_host::launcher_exe().map_or_else(|| "sich".to_string(), |p| p.to_string_lossy().into_owned());
+        let exe = crate::daemon_host::cli_exe().map_or_else(|| "sich-cli".to_string(), |p| p.to_string_lossy().into_owned());
         orch_watch::tick_data(&infos, self.client.terminals_synced(), sich_orch::paths::now_ms(), exe, Instant::now())
     }
 

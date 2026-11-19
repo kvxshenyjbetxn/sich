@@ -122,7 +122,7 @@ fn require_run(id: &Identity) -> Result<&Run> {
 }
 
 fn exe_text() -> String {
-    crate::daemon_host::launcher_exe().map_or_else(|| "sich".to_string(), |p| p.to_string_lossy().into_owned())
+    crate::daemon_host::cli_exe().map_or_else(|| "sich-cli".to_string(), |p| p.to_string_lossy().into_owned())
 }
 
 // ---- DB-only commands ---------------------------------------------------------------------

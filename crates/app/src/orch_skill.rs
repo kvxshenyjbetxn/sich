@@ -125,7 +125,7 @@ pub fn remove(claude_dir: &Path) -> std::io::Result<RemoveOutcome> {
 pub fn apply(enabled: bool) {
     let Some(dir) = claude_install::default_claude_config_dir() else { return };
     let result = if enabled {
-        match crate::daemon_host::launcher_exe() {
+        match crate::daemon_host::cli_exe() {
             Some(exe) => install(&dir, &exe).map(|_| ()),
             None => return,
         }
