@@ -12,6 +12,7 @@ use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_s
 use sich_proto::{AgentKind, MAX_OUTPUT_CHUNK, ServerMsg, TermId, TerminalInfo};
 
 use crate::agent::{self, AgentTracker};
+use crate::codex_rollout;
 use crate::hub::{ConnHandle, ConnId, Hub};
 use crate::osc::{OscEvent, OscScanner};
 use crate::ring::{DEFAULT_CAPACITY, RingBuffer};
@@ -202,7 +203,11 @@ impl Terminal {
                     tracing::debug!(id = self.shared.id, "ignoring unparsable codex hook payload");
                     return;
                 };
-                self.shared.update_agent(|a| a.on_codex_hook(&hook, now));
+                // A child hook may need its rollout's first line (identity). Decide under the lock,
+                // read the small file outside of it, then apply both together.
+                let plan = self.shared.state.lock().agent.identity_plan(&hook, now);
+                let ident = plan.as_ref().and_then(codex_rollout::execute);
+                self.shared.update_agent(|a| a.on_codex_hook_with(&hook, now, ident));
             }
             // Other agents have no hook integration yet.
             _ => {}

@@ -39,7 +39,7 @@ const fn ev(name: &'static str, min_version: Version, timeout_secs: u64) -> Even
     EventDef { name, min_version, timeout_secs }
 }
 
-/// `Interrupt` is documented for >= 0.150; for `SessionEnd` no minimum could be confirmed from the
+/// `SubagentStart`/`SubagentStop` exist since 0.133. `Interrupt` is documented for >= 0.150; for `SessionEnd` no minimum could be confirmed from the
 /// docs, so it is gated at 0.150 as well.
 pub const EVENTS: &[EventDef] = &[
     ev("SessionStart", MIN_CODEX_VERSION, 5),
@@ -50,6 +50,8 @@ pub const EVENTS: &[EventDef] = &[
     ev("Stop", MIN_CODEX_VERSION, 5),
     ev("Interrupt", (0, 150, 0), 3),
     ev("SessionEnd", (0, 150, 0), 3),
+    ev("SubagentStart", (0, 133, 0), 5),
+    ev("SubagentStop", (0, 133, 0), 5),
 ];
 
 /// Events that must carry our exact command for `is_installed`.
@@ -573,6 +575,13 @@ mod tests {
         let v129 = names(Some("0.129.0"));
         assert_eq!(v129.len(), 6);
         assert!(!v129.contains(&"Interrupt") && !v129.contains(&"SessionEnd"));
+        assert!(!v129.contains(&"SubagentStart") && !v129.contains(&"SubagentStop"));
+        let v132 = names(Some("0.132.9"));
+        assert!(!v132.contains(&"SubagentStart") && !v132.contains(&"SubagentStop"));
+        let v133 = names(Some("0.133.0"));
+        assert_eq!(v133.len(), 8);
+        assert!(v133.contains(&"SubagentStart") && v133.contains(&"SubagentStop"));
+        assert!(!v133.contains(&"Interrupt") && !v133.contains(&"SessionEnd"));
         assert!(!names(Some("0.149.9")).contains(&"Interrupt"));
         assert_eq!(names(Some("0.150.0")).len(), EVENTS.len());
         assert_eq!(names(Some("0.170.0")).len(), EVENTS.len());
@@ -625,6 +634,22 @@ mod tests {
         let hooks = v["hooks"].as_object().unwrap();
         assert_eq!(hooks.len(), 6);
         assert!(hooks.get("Interrupt").is_none() && hooks.get("SessionEnd").is_none());
+        assert!(hooks.get("SubagentStart").is_none() && hooks.get("SubagentStop").is_none());
+    }
+
+    #[test]
+    fn install_0133_has_subagent_events_and_uninstall_removes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        install(dir.path(), &exe(), Some("0.133.0")).unwrap();
+        let v = read(dir.path());
+        let hooks = v["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), 8);
+        assert_eq!(hooks["SubagentStart"][0]["hooks"][0]["timeout"], 5);
+        assert_eq!(hooks["SubagentStop"][0]["hooks"][0]["command"], hook_command(&exe()));
+        assert!(hooks.get("Interrupt").is_none());
+        let r = uninstall(dir.path(), &exe()).unwrap();
+        assert!(r.removed.contains(&"SubagentStart".to_string()) && r.removed.contains(&"SubagentStop".to_string()));
+        assert_eq!(read(dir.path()), json!({}));
     }
 
     #[test]
@@ -685,7 +710,10 @@ mod tests {
         assert!(r.removed.contains(&"Interrupt".to_string()));
         let v = read(dir.path());
         assert!(v["hooks"].get("Interrupt").is_none() && v["hooks"].get("SessionEnd").is_none());
-        assert_eq!(ours_count(&v), 6);
+        assert_eq!(ours_count(&v), 8);
+        let r = install(dir.path(), &exe(), Some("0.130.0")).unwrap();
+        assert!(r.removed.contains(&"SubagentStart".to_string()));
+        assert_eq!(ours_count(&read(dir.path())), 6);
     }
 
     #[test]

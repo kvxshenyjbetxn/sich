@@ -346,3 +346,45 @@ async fn subagent_roster_follows_hooks() {
 
     stop(a, d).await;
 }
+
+fn codex_hook(id: TermId, json: &str) -> ClientMsg {
+    ClientMsg::AgentHook { term_id: id, agent: AgentKind::Codex, payload: json.into() }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_subagent_label_comes_from_rollout_first_line() {
+    let d = start_daemon("codex-subagents");
+    let mut a = client(&d.name).await;
+    let (shell, args) = idle_shell();
+    let id = create(&mut a, shell, &args).await;
+
+    let dir = std::env::temp_dir().join(format!("sich-codex-rollout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rollout = dir.join("child.jsonl");
+    std::fs::write(
+        &rollout,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"child-1\",\"source\":{\"subagent\":{\"thread_spawn\":{\"agent_path\":\"root/explorer\"}}}}}\n{\"type\":\"event_msg\"}\n",
+    )
+    .unwrap();
+    let path = serde_json::Value::String(rollout.display().to_string()).to_string();
+
+    send(&mut a, codex_hook(id, &event("SessionStart", ""))).await;
+    let s = next_status(&mut a, id).await.expect("status");
+    assert_eq!((s.kind, s.subagents.len()), (AgentKind::Codex, 0));
+
+    let start = event("SubagentStart", &format!(r#","agent_id":"child-1","agent_type":"explorer","transcript_path":{path}"#));
+    send(&mut a, codex_hook(id, &start)).await;
+    let s = next_status(&mut a, id).await.expect("status");
+    assert_eq!(s.subagents.len(), 1);
+    assert_eq!(s.subagents[0].id, "child-1");
+    assert_eq!(s.subagents[0].description.as_deref(), Some("explorer"));
+    assert_eq!(s.state, AgentState::Idle, "main status untouched");
+
+    let stop_ev = event("SubagentStop", r#","agent_id":"child-1","agent_type":"explorer""#);
+    send(&mut a, codex_hook(id, &stop_ev)).await;
+    let s = next_status(&mut a, id).await.expect("status");
+    assert!(s.subagents.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+    stop(a, d).await;
+}

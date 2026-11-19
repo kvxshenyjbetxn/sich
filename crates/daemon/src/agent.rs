@@ -5,9 +5,11 @@
 //! - terminal title glyphs (Claude's spinner, Gemini's markers), used only while the terminal
 //!   has not received any hook event during the current agent session.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use sich_proto::{AgentKind, AgentState, AgentStatus, SubagentStatus};
+
+use crate::codex_rollout::{IdentityPlan, IdentityRead, IdentityResult};
 
 /// `AgentStatus::detail` is cut to this many characters.
 pub const MAX_DETAIL_CHARS: usize = 120;
@@ -274,6 +276,8 @@ const KNOWN_CODEX_EVENTS: &[&str] = &[
     "PermissionRequest",
     "Stop",
     "Interrupt",
+    "SubagentStart",
+    "SubagentStop",
 ];
 
 /// The fields we use from a Codex hook payload (documented hook input fields only).
@@ -289,6 +293,11 @@ pub struct CodexHook {
     pub model: Option<String>,
     pub prompt: Option<String>,
     pub last_assistant_message: Option<String>,
+    /// Set when the event fired inside a subagent (trimmed, non-empty, <= 64 chars).
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
+    /// Rollout file of the agent that fired the event (a child's own rollout for child events).
+    pub transcript_path: Option<String>,
 }
 
 impl CodexHook {
@@ -321,6 +330,7 @@ pub fn parse_codex_payload(json: &str) -> Option<CodexHook> {
     let tool_name = get("tool_name");
     let input = obj.get("tool_input").and_then(|x| x.as_object());
     let tool_label = tool_name.as_deref().and_then(|t| codex_tool_label(t, input));
+    let nonempty = |k: &str| get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let description =
         input.and_then(|i| i.get("description")).and_then(|x| x.as_str()).and_then(|s| normalize_text(s, false));
     Some(CodexHook {
@@ -331,6 +341,9 @@ pub fn parse_codex_payload(json: &str) -> Option<CodexHook> {
         model: get("model").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         prompt: get("prompt").and_then(|s| normalize_text(&s, true)),
         last_assistant_message: get("last_assistant_message").and_then(|s| normalize_text(&s, false)),
+        agent_id: nonempty("agent_id").map(|s| s.chars().take(MAX_AGENT_ID_CHARS).collect::<String>()),
+        agent_type: nonempty("agent_type"),
+        transcript_path: get("transcript_path"),
     })
 }
 
@@ -639,8 +652,44 @@ fn apply_claude(
 fn apply_codex(prev: Option<AgentStatus>, h: &CodexHook, now: u64) -> Option<AgentStatus> {
     let kind = AgentKind::Codex;
     let tool = h.tool_label.as_ref().or(h.tool_name.as_ref()).map(|t| clip(t)).filter(|t| !t.is_empty());
+    if let Some(id) = h.agent_id.as_deref() {
+        // Events from inside a subagent never change the main status.
+        match h.event.as_str() {
+            "SubagentStart" | "PreToolUse" | "PostToolUse" | "PermissionRequest" => {
+                let mut p = prev?;
+                if let Some(sub) = upsert_sub(&mut p.subagents, id, now) {
+                    if let Some(a) = real_label(&h.agent_type) {
+                        sub.agent_type = Some(a);
+                    }
+                    match h.event.as_str() {
+                        "SubagentStart" => {
+                            sub.state = AgentState::Working;
+                            sub.detail = None;
+                        }
+                        "PermissionRequest" => {
+                            sub.state = AgentState::Waiting;
+                            sub.detail = non_empty(&h.description).or(tool);
+                        }
+                        _ => {
+                            sub.state = AgentState::Working;
+                            sub.detail = tool;
+                        }
+                    }
+                }
+                return Some(p);
+            }
+            "SubagentStop" | "Stop" => {
+                let mut p = prev?;
+                p.subagents.retain(|s| s.id != id);
+                return Some(p);
+            }
+            // Child SessionStart and anything else: ignored.
+            _ => return prev,
+        }
+    }
     let (state, unread, detail) = match h.event.as_str() {
         "SessionEnd" => return None,
+        "SubagentStart" | "SubagentStop" => return prev,
         "SessionStart" => (AgentState::Idle, false, None),
         "UserPromptSubmit" => (AgentState::Working, false, None),
         "PreToolUse" => (AgentState::Working, false, tool),
@@ -661,6 +710,11 @@ fn apply_codex(prev: Option<AgentStatus>, h: &CodexHook, now: u64) -> Option<Age
         _ => return prev,
     };
     let mut s = settle(prev, kind, state, unread, detail, now)?;
+    // New session / the turn ended or was cancelled: any child still listed is stale (Codex
+    // sometimes misses child stops).
+    if matches!(h.event.as_str(), "SessionStart" | "Stop" | "Interrupt") {
+        s.subagents.clear();
+    }
     if let Some(m) = &h.model {
         s.model = Some(m.clone());
     }
@@ -746,6 +800,29 @@ pub struct AgentTracker {
     hooks_seen: bool,
     /// Main-agent `Agent`/`Task` calls whose subagent has not started yet (oldest first).
     pending_spawns: VecDeque<SubagentSpawn>,
+    /// Codex subagent rollout identity bookkeeping (agent_id -> state); roster members only.
+    identities: HashMap<String, IdentityState>,
+}
+
+/// Where the rollout identity read of one Codex subagent stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityState {
+    /// The label was found: never read again.
+    Named,
+    /// A complete first line without identity for this path: never retried for it.
+    Missed(String),
+    /// Not readable yet at this file length: retried only when the length changes.
+    Pending(String, u64),
+    /// Other I/O error: retried no sooner than this time (unix ms).
+    Unreadable(u64),
+}
+
+/// Unreadable rollouts are retried no sooner than this.
+const IDENTITY_RETRY_MS: u64 = 5000;
+
+/// A `transcript_path` we may read: absolute and ending with `.jsonl`.
+fn valid_rollout_path(p: &str) -> bool {
+    std::path::Path::new(p).is_absolute() && p.to_ascii_lowercase().ends_with(".jsonl")
 }
 
 impl AgentTracker {
@@ -776,12 +853,76 @@ impl AgentTracker {
     }
 
     /// Returns true if the status changed.
+    #[cfg(test)]
     pub fn on_codex_hook(&mut self, h: &CodexHook, now: u64) -> bool {
+        self.on_codex_hook_with(h, now, None)
+    }
+
+    /// The rollout read (if any) a Codex child hook needs before it is applied. Cheap and pure:
+    /// the caller does the file read outside of any lock ([`crate::codex_rollout::execute`]).
+    pub fn identity_plan(&self, h: &CodexHook, now: u64) -> Option<IdentityPlan> {
+        let id = h.agent_id.as_deref()?;
+        if !matches!(h.event.as_str(), "SubagentStart" | "PreToolUse" | "PostToolUse" | "PermissionRequest") {
+            return None;
+        }
+        let path = h.transcript_path.as_deref().filter(|p| valid_rollout_path(p))?;
+        let status = self.status.as_ref().filter(|s| s.kind == AgentKind::Codex)?;
+        match status.subagents.iter().find(|s| s.id == id) {
+            Some(sub) if sub.description.is_some() => return None,
+            Some(_) => {}
+            None if status.subagents.len() >= MAX_SUBAGENTS => return None,
+            None => {}
+        }
+        let pending_len = match self.identities.get(id) {
+            None => None,
+            Some(IdentityState::Named) => return None,
+            Some(IdentityState::Missed(p)) if p == path => return None,
+            Some(IdentityState::Pending(p, len)) if p == path => Some(*len),
+            Some(IdentityState::Unreadable(retry_at)) if now < *retry_at => return None,
+            Some(_) => None,
+        };
+        Some(IdentityPlan { agent_id: id.to_string(), path: path.to_string(), pending_len })
+    }
+
+    /// Applies a Codex hook, then the identity read made for it (if any). True if the status
+    /// changed.
+    pub fn on_codex_hook_with(&mut self, h: &CodexHook, now: u64, ident: Option<IdentityResult>) -> bool {
         if !h.is_known() {
             return false;
         }
         self.hooks_seen = h.event != "SessionEnd";
-        self.update(|prev| apply(prev, AgentInput::Codex(h), now))
+        let mut changed = self.update(|prev| apply(prev, AgentInput::Codex(h), now));
+        if let Some(r) = ident {
+            changed |= self.apply_identity(r, now);
+        }
+        // Bookkeeping lives only as long as the subagent is on the roster.
+        let roster: Vec<&str> =
+            self.status.as_ref().map(|s| s.subagents.iter().map(|x| x.id.as_str()).collect()).unwrap_or_default();
+        self.identities.retain(|id, _| roster.contains(&id.as_str()));
+        changed
+    }
+
+    fn apply_identity(&mut self, r: IdentityResult, now: u64) -> bool {
+        let Some(sub) =
+            self.status.as_mut().and_then(|s| s.subagents.iter_mut().find(|x| x.id == r.agent_id))
+        else {
+            return false;
+        };
+        let (state, changed) = match r.read {
+            IdentityRead::Found(label) => {
+                let label = clip(&label);
+                let changed = !label.is_empty() && sub.description.as_deref() != Some(label.as_str());
+                if !label.is_empty() {
+                    sub.description = Some(label);
+                }
+                (IdentityState::Named, changed)
+            }
+            IdentityRead::Miss => (IdentityState::Missed(r.path), false),
+            IdentityRead::Pending => (IdentityState::Pending(r.path, r.len), false),
+            IdentityRead::Unreadable => (IdentityState::Unreadable(now + IDENTITY_RETRY_MS), false),
+        };
+        self.identities.insert(r.agent_id, state);
+        changed
     }
 
     pub fn on_title(&mut self, title: &str, now: u64) -> bool {
@@ -792,6 +933,7 @@ impl AgentTracker {
     pub fn on_exit(&mut self) -> bool {
         self.hooks_seen = false;
         self.pending_spawns.clear();
+        self.identities.clear();
         self.update(|prev| apply(prev, AgentInput::ProcessExit, 0))
     }
 
@@ -1453,6 +1595,286 @@ mod tests {
         assert!(!t.on_title("\u{2733} x", T0 + 2));
         assert!(t.on_codex_hook(&chook("SessionEnd", ""), T0 + 3));
         assert!(t.status().is_none());
+    }
+
+    // ---- Codex subagents ----
+
+    fn cchild(event: &str, id: &str, extra: &str) -> CodexHook {
+        chook(event, &format!(r#","agent_id":"{id}"{extra}"#))
+    }
+
+    fn crun_h(prev: Option<AgentStatus>, h: &CodexHook, now: u64) -> Option<AgentStatus> {
+        apply(prev, AgentInput::Codex(h), now)
+    }
+
+    /// A JSON-escaped absolute path string (with quotes) for a `.jsonl` file name.
+    fn abs_jsonl(name: &str) -> String {
+        serde_json::Value::String(std::env::temp_dir().join(name).display().to_string()).to_string()
+    }
+
+    fn working_main() -> Option<AgentStatus> {
+        let s = crun(None, "SessionStart", r#","model":"m1""#, T0);
+        crun(s, "UserPromptSubmit", r#","prompt":"p""#, T0 + 1)
+    }
+
+    #[test]
+    fn codex_parse_agent_fields() {
+        let h = chook("SubagentStart", r#","agent_id":"  a1  ","agent_type":" explorer ""#);
+        assert_eq!(h.agent_id.as_deref(), Some("a1"));
+        assert_eq!(h.agent_type.as_deref(), Some("explorer"));
+        assert_eq!(h.transcript_path.as_deref(), Some(r"C:\x\r.jsonl"));
+        assert!(h.is_known());
+        assert!(chook("SubagentStop", "").is_known());
+        let h = chook("PreToolUse", r#","agent_id":"   ","agent_type":"""#);
+        assert_eq!((h.agent_id, h.agent_type), (None, None));
+        let long = "x".repeat(100);
+        let h = chook("PreToolUse", &format!(r#","agent_id":"{long}""#));
+        assert_eq!(h.agent_id.as_deref().map(str::len), Some(64));
+        let h = chook("PreToolUse", r#","agent_id":5"#);
+        assert_eq!(h.agent_id, None);
+        let h = parse_codex_payload(r#"{"hook_event_name":"Stop"}"#).unwrap();
+        assert_eq!(h.transcript_path, None);
+    }
+
+    #[test]
+    fn codex_child_start_adds_subagent_and_keeps_main() {
+        let main = working_main();
+        let s = crun_h(main.clone(), &cchild("SubagentStart", "a1", r#","agent_type":"explorer""#), T0 + 5).unwrap();
+        let m = main.unwrap();
+        assert_eq!((s.state, s.since_unix_ms, &s.model, &s.prompt, &s.detail), (m.state, m.since_unix_ms, &m.model, &m.prompt, &m.detail));
+        assert_eq!(s.subagents.len(), 1);
+        let sub = &s.subagents[0];
+        assert_eq!((sub.id.as_str(), sub.state, sub.agent_type.as_deref()), ("a1", AgentState::Working, Some("explorer")));
+        assert_eq!((sub.detail.clone(), sub.description.clone(), sub.since_unix_ms), (None, None, T0 + 5));
+    }
+
+    #[test]
+    fn codex_child_events_without_main_status_create_nothing() {
+        for ev in ["SubagentStart", "PreToolUse", "PostToolUse", "PermissionRequest", "SubagentStop", "Stop"] {
+            assert_eq!(crun_h(None, &cchild(ev, "a1", r#","tool_name":"Bash""#), T0), None, "{ev}");
+        }
+    }
+
+    #[test]
+    fn codex_child_tool_events_are_working_with_label() {
+        let main = working_main();
+        for ev in ["PreToolUse", "PostToolUse"] {
+            let s = crun_h(main.clone(), &cchild(ev, "a1", r#","tool_name":"Bash","tool_input":{"command":"cargo  test"}"#), T0 + 5).unwrap();
+            assert_eq!(s.subagents.len(), 1, "{ev}");
+            assert_eq!(s.subagents[0].state, AgentState::Working);
+            assert_eq!(s.subagents[0].detail.as_deref(), Some("Bash: cargo test"));
+            assert_eq!(s.detail, None, "main detail untouched");
+            assert_eq!(s.state, AgentState::Working);
+        }
+        // The same subagent is updated, not duplicated.
+        let s = crun_h(main, &cchild("PreToolUse", "a1", r#","tool_name":"Bash""#), T0 + 5);
+        let s = crun_h(s, &cchild("PreToolUse", "a1", r#","tool_name":"apply_patch""#), T0 + 6).unwrap();
+        assert_eq!(s.subagents.len(), 1);
+        assert_eq!(s.subagents[0].detail.as_deref(), Some("apply_patch"));
+    }
+
+    #[test]
+    fn codex_child_permission_request_waits_without_touching_main() {
+        let main = working_main();
+        let s = crun_h(main.clone(), &cchild("PermissionRequest", "a1", r#","tool_name":"Bash","tool_input":{"command":"rm x"}"#), T0 + 5).unwrap();
+        assert_eq!(s.subagents[0].state, AgentState::Waiting);
+        assert_eq!(s.subagents[0].detail.as_deref(), Some("Bash: rm x"));
+        assert_eq!(s.state, AgentState::Working);
+        let s = crun_h(Some(s), &cchild("PermissionRequest", "a1", r#","tool_name":"Bash","tool_input":{"command":"rm x","description":"Delete  x"}"#), T0 + 6).unwrap();
+        assert_eq!(s.subagents[0].detail.as_deref(), Some("Delete x"));
+        // Working again after the next tool event.
+        let s = crun_h(Some(s), &cchild("PostToolUse", "a1", r#","tool_name":"Bash""#), T0 + 7).unwrap();
+        assert_eq!(s.subagents[0].state, AgentState::Working);
+    }
+
+    #[test]
+    fn codex_child_stop_removes_only_that_subagent_and_keeps_main_message() {
+        let main = crun(working_main(), "PreToolUse", r#","tool_name":"Bash""#, T0 + 2);
+        let s = crun_h(main, &cchild("SubagentStart", "a1", ""), T0 + 3);
+        let s = crun_h(s, &cchild("SubagentStart", "a2", ""), T0 + 4);
+        assert_eq!(s.as_ref().unwrap().subagents.len(), 2);
+        let before = s.clone().unwrap();
+        for ev in ["SubagentStop", "Stop"] {
+            let after = crun_h(s.clone(), &cchild(ev, "a1", r#","last_assistant_message":"child done""#), T0 + 9).unwrap();
+            assert_eq!(after.subagents.len(), 1, "{ev}");
+            assert_eq!(after.subagents[0].id, "a2");
+            assert_eq!(after.message, before.message, "main message unchanged");
+            assert_eq!((after.state, after.since_unix_ms, &after.detail), (before.state, before.since_unix_ms, &before.detail));
+        }
+        // Unknown id: nothing changes.
+        assert_eq!(crun_h(s.clone(), &cchild("SubagentStop", "zz", ""), T0 + 9), s);
+    }
+
+    #[test]
+    fn codex_child_other_events_are_ignored() {
+        let s = crun_h(working_main(), &cchild("SubagentStart", "a1", ""), T0 + 3);
+        for ev in ["SessionStart", "UserPromptSubmit", "Interrupt", "SessionEnd", "PreCompact"] {
+            assert_eq!(crun_h(s.clone(), &cchild(ev, "a1", r#","prompt":"x","model":"zz""#), T0 + 9), s, "{ev}");
+        }
+    }
+
+    #[test]
+    fn codex_root_subagent_events_without_agent_id_are_ignored() {
+        let s = crun_h(working_main(), &cchild("SubagentStart", "a1", ""), T0 + 3);
+        assert_eq!(crun(s.clone(), "SubagentStart", "", T0 + 4), s);
+        assert_eq!(crun(s.clone(), "SubagentStop", "", T0 + 4), s);
+        assert_eq!(crun(None, "SubagentStart", "", T0), None);
+    }
+
+    #[test]
+    fn codex_roster_is_cleared_by_root_events() {
+        let with_sub = || crun_h(working_main(), &cchild("SubagentStart", "a1", ""), T0 + 3);
+        // The roster survives a new prompt and tool events of the root.
+        let s = crun(with_sub(), "UserPromptSubmit", r#","prompt":"q""#, T0 + 4).unwrap();
+        assert_eq!(s.subagents.len(), 1);
+        let s = crun(Some(s), "PreToolUse", r#","tool_name":"Bash""#, T0 + 5).unwrap();
+        assert_eq!(s.subagents.len(), 1);
+        for ev in ["Stop", "Interrupt", "SessionStart"] {
+            let s = crun(with_sub(), ev, "", T0 + 9).unwrap();
+            assert!(s.subagents.is_empty(), "{ev}");
+        }
+        assert_eq!(crun(with_sub(), "SessionEnd", "", T0 + 9), None);
+        // Stop with a message still records it.
+        let s = crun(with_sub(), "Stop", r#","last_assistant_message":"fin""#, T0 + 9).unwrap();
+        assert_eq!((s.state, s.message.as_deref()), (AgentState::Done, Some("fin")));
+    }
+
+    #[test]
+    fn codex_placeholder_agent_type_is_ignored_and_roster_is_capped() {
+        let s = crun_h(working_main(), &cchild("SubagentStart", "a1", r#","agent_type":"default""#), T0 + 3).unwrap();
+        assert_eq!(s.subagents[0].agent_type.as_deref(), Some("default"));
+        let s = crun_h(Some(s), &cchild("PreToolUse", "a1", r#","agent_type":"Task""#), T0 + 4).unwrap();
+        assert_eq!(s.subagents[0].agent_type.as_deref(), Some("default"), "placeholder does not overwrite");
+        let mut s = working_main();
+        for i in 0..(MAX_SUBAGENTS + 4) {
+            s = crun_h(s, &cchild("SubagentStart", &format!("a{i}"), ""), T0 + 3);
+        }
+        assert_eq!(s.unwrap().subagents.len(), MAX_SUBAGENTS);
+    }
+
+    // ---- Codex subagent identity bookkeeping ----
+
+    fn tracker_with_child(path: &str) -> (AgentTracker, CodexHook) {
+        let mut t = AgentTracker::default();
+        t.on_codex_hook(&chook("UserPromptSubmit", ""), T0);
+        let start = cchild("SubagentStart", "a1", &format!(r#","transcript_path":{path}"#));
+        assert!(t.on_codex_hook(&start, T0 + 1));
+        (t, start)
+    }
+
+    fn res(path: &str, len: u64, read: IdentityRead) -> IdentityResult {
+        IdentityResult { agent_id: "a1".into(), path: serde_json::from_str::<String>(path).unwrap(), len, read }
+    }
+
+    fn tool_ev(path: &str) -> CodexHook {
+        cchild("PreToolUse", "a1", &format!(r#","tool_name":"Bash","transcript_path":{path}"#))
+    }
+
+    #[test]
+    fn identity_plan_requires_child_event_status_and_valid_path() {
+        let p = abs_jsonl("sich-id-a.jsonl");
+        let (t, start) = tracker_with_child(&p);
+        let plan = t.identity_plan(&start, T0 + 2).unwrap();
+        assert_eq!((plan.agent_id.as_str(), plan.pending_len), ("a1", None));
+        assert_eq!(plan.path, serde_json::from_str::<String>(&p).unwrap());
+        // Root events, stop events and unusable paths get no plan.
+        assert_eq!(t.identity_plan(&chook("PreToolUse", &format!(r#","transcript_path":{p}"#)), T0 + 2), None);
+        assert_eq!(t.identity_plan(&cchild("SubagentStop", "a1", &format!(r#","transcript_path":{p}"#)), T0 + 2), None);
+        assert_eq!(t.identity_plan(&cchild("SessionStart", "a1", &format!(r#","transcript_path":{p}"#)), T0 + 2), None);
+        for bad in [r#""rel/x.jsonl""#, r#""relative.jsonl""#] {
+            assert_eq!(t.identity_plan(&tool_ev(bad), T0 + 2), None, "{bad}");
+        }
+        let not_jsonl = serde_json::Value::String(std::env::temp_dir().join("x.txt").display().to_string()).to_string();
+        assert_eq!(t.identity_plan(&tool_ev(&not_jsonl), T0 + 2), None);
+        let no_path = cchild("PreToolUse", "a1", "");
+        let no_path = CodexHook { transcript_path: None, ..no_path };
+        assert_eq!(t.identity_plan(&no_path, T0 + 2), None);
+        // No main status: nothing to attach to.
+        assert_eq!(AgentTracker::default().identity_plan(&start, T0), None);
+    }
+
+    #[test]
+    fn identity_found_sets_description_and_is_never_read_again() {
+        let p = abs_jsonl("sich-id-b.jsonl");
+        let (mut t, start) = tracker_with_child(&p);
+        let changed = t.on_codex_hook_with(&tool_ev(&p), T0 + 2, Some(res(&p, 50, IdentityRead::Found("explorer".into()))));
+        assert!(changed);
+        assert_eq!(t.status().unwrap().subagents[0].description.as_deref(), Some("explorer"));
+        assert_eq!(t.identity_plan(&start, T0 + 100_000), None);
+        assert_eq!(t.identity_plan(&tool_ev(&p), T0 + 100_000), None);
+        // The label survives later child events.
+        t.on_codex_hook(&tool_ev(&p), T0 + 3);
+        assert_eq!(t.status().unwrap().subagents[0].description.as_deref(), Some("explorer"));
+    }
+
+    #[test]
+    fn identity_pending_keeps_the_known_length_for_retry() {
+        let p = abs_jsonl("sich-id-c.jsonl");
+        let (mut t, start) = tracker_with_child(&p);
+        t.on_codex_hook_with(&tool_ev(&p), T0 + 2, Some(res(&p, 10, IdentityRead::Pending)));
+        assert_eq!(t.identity_plan(&start, T0 + 3).unwrap().pending_len, Some(10));
+        t.on_codex_hook_with(&tool_ev(&p), T0 + 4, Some(res(&p, 25, IdentityRead::Pending)));
+        assert_eq!(t.identity_plan(&start, T0 + 5).unwrap().pending_len, Some(25));
+        assert_eq!(t.status().unwrap().subagents[0].description, None);
+        // A different path starts over.
+        let other = abs_jsonl("sich-id-c2.jsonl");
+        assert_eq!(t.identity_plan(&tool_ev(&other), T0 + 5).unwrap().pending_len, None);
+    }
+
+    #[test]
+    fn identity_miss_is_never_retried_for_the_same_path() {
+        let p = abs_jsonl("sich-id-d.jsonl");
+        let (mut t, start) = tracker_with_child(&p);
+        t.on_codex_hook_with(&tool_ev(&p), T0 + 2, Some(res(&p, 30, IdentityRead::Miss)));
+        assert!(t.status().unwrap().subagents[0].description.is_none());
+        assert_eq!(t.identity_plan(&start, T0 + 999_999), None);
+        let other = abs_jsonl("sich-id-d2.jsonl");
+        assert!(t.identity_plan(&tool_ev(&other), T0 + 3).is_some());
+    }
+
+    #[test]
+    fn identity_unreadable_retries_after_five_seconds() {
+        let p = abs_jsonl("sich-id-e.jsonl");
+        let (mut t, start) = tracker_with_child(&p);
+        t.on_codex_hook_with(&tool_ev(&p), T0 + 10, Some(res(&p, 0, IdentityRead::Unreadable)));
+        assert_eq!(t.identity_plan(&start, T0 + 10 + 4999), None);
+        let plan = t.identity_plan(&start, T0 + 10 + 5000).unwrap();
+        assert_eq!(plan.pending_len, None);
+    }
+
+    #[test]
+    fn identity_bookkeeping_is_dropped_with_the_roster_entry() {
+        let p = abs_jsonl("sich-id-f.jsonl");
+        // Subagent stop.
+        let (mut t, start) = tracker_with_child(&p);
+        t.on_codex_hook_with(&tool_ev(&p), T0 + 2, Some(res(&p, 5, IdentityRead::Miss)));
+        assert_eq!(t.identities.len(), 1);
+        t.on_codex_hook(&cchild("SubagentStop", "a1", ""), T0 + 3);
+        assert!(t.identities.is_empty());
+        // A new start with the same id is read afresh.
+        t.on_codex_hook(&start, T0 + 4);
+        assert!(t.identity_plan(&start, T0 + 5).is_some());
+        // Root Stop clears the roster and the bookkeeping.
+        t.on_codex_hook_with(&tool_ev(&p), T0 + 6, Some(res(&p, 5, IdentityRead::Pending)));
+        assert_eq!(t.identities.len(), 1);
+        t.on_codex_hook(&chook("Stop", ""), T0 + 7);
+        assert!(t.identities.is_empty());
+        // Process exit too.
+        t.on_codex_hook(&start, T0 + 8);
+        t.on_codex_hook_with(&tool_ev(&p), T0 + 9, Some(res(&p, 5, IdentityRead::Miss)));
+        t.on_exit();
+        assert!(t.identities.is_empty());
+    }
+
+    #[test]
+    fn identity_result_for_unknown_subagent_is_ignored() {
+        let p = abs_jsonl("sich-id-g.jsonl");
+        let (mut t, _) = tracker_with_child(&p);
+        let mut r = res(&p, 5, IdentityRead::Found("ghost".into()));
+        r.agent_id = "nobody".into();
+        assert!(!t.on_codex_hook_with(&chook("UserPromptSubmit", ""), T0 + 2, Some(r)));
+        assert!(t.identities.is_empty());
+        assert_eq!(t.status().unwrap().subagents[0].description, None);
     }
 
     #[test]
