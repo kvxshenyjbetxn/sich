@@ -785,7 +785,7 @@ impl AppView {
                 let (shown, hidden) = visible_subagents(&status.subagents, MAX_VISIBLE_SUBAGENTS);
                 let mut children: Vec<AnyElement> = shown
                     .iter()
-                    .map(|sub| self.render_subagent_row(key_for_sub.clone(), id, sub, indent + INDENT, lang, cx))
+                    .map(|sub| self.render_subagent_row(key_for_sub.clone(), id, sub, indent, lang, cx))
                     .collect();
                 if hidden > 0 {
                     children.push(
@@ -794,7 +794,7 @@ impl AppView {
                             .w_full()
                             .h(px(SUB_ROW_H))
                             .flex_shrink_0()
-                            .pl(px(8. + indent + INDENT + LEAD_SLOT_W + ROW_GAP))
+                            .pl(px(8. + indent + LEAD_SLOT_W + ROW_GAP))
                             .pr_2()
                             .items_center()
                             .text_size(px(11.5))
