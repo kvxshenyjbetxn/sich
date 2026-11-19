@@ -100,6 +100,10 @@ pub fn send_to_daemon(socket: &str, msgs: Vec<ClientMsg>) -> anyhow::Result<()> 
 
 /// `%LOCALAPPDATA%\sich\logs\hook.log` (or the platform equivalent).
 pub fn log_path() -> Option<PathBuf> {
+    // SICH_LOG_DIR lets tests keep the hook log out of the user's real data dir.
+    if let Some(d) = std::env::var_os("SICH_LOG_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(d).join("hook.log"));
+    }
     Some(dirs::data_local_dir()?.join("sich").join("logs").join("hook.log"))
 }
 

@@ -1,0 +1,301 @@
+//! Agent status badge shared by tabs and the sidebar, plus the pure logic around agent status:
+//! badge choice, roll-up, "mark seen" and "flash the taskbar" decisions.
+
+use std::time::Duration;
+
+use gpui_kit::assets::IconName as Ic;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme as _, Icon, Size, Sizable as _};
+use gpui_kit::{
+    Animation, AnimationExt as _, AnyElement, App, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement as _, StatefulInteractiveElement as _, Styled as _, Transformation, div,
+    percentage, px, rgb,
+};
+use sich_proto::{AgentState, AgentStatus};
+
+use crate::i18n::{self, Language, Tr, tr};
+use crate::settings;
+use crate::theme;
+
+/// Badge size in pixels.
+const BADGE_SIZE: f32 = 14.;
+/// One full turn of the spinner.
+const SPIN_PERIOD: Duration = Duration::from_millis(1000);
+
+/// What a badge shows. Declared in roll-up priority order (highest first).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BadgeKind {
+    Waiting,
+    Working,
+    Failed,
+    Done,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Badge {
+    pub kind: BadgeKind,
+    /// Tool name or notification message for the tooltip.
+    pub detail: Option<String>,
+}
+
+/// The badge of one terminal; `None` = nothing to show (Idle, or Done/Failed already seen).
+pub fn badge_for(status: &AgentStatus) -> Option<Badge> {
+    let kind = match status.state {
+        AgentState::Working => BadgeKind::Working,
+        AgentState::Waiting => BadgeKind::Waiting,
+        AgentState::Done if status.unread => BadgeKind::Done,
+        AgentState::Failed if status.unread => BadgeKind::Failed,
+        AgentState::Done | AgentState::Failed | AgentState::Idle => return None,
+    };
+    Some(Badge { kind, detail: status.detail.clone() })
+}
+
+/// The most important badge of a group: Waiting > Working > Failed > Done > none. Ties keep the
+/// first one.
+pub fn rollup<'a>(statuses: impl IntoIterator<Item = &'a AgentStatus>) -> Option<Badge> {
+    let mut best: Option<Badge> = None;
+    for badge in statuses.into_iter().filter_map(badge_for) {
+        if best.as_ref().is_none_or(|b| badge.kind < b.kind) {
+            best = Some(badge);
+        }
+    }
+    best
+}
+
+/// Badge kind of a terminal's optional status (for transition tracking).
+pub fn kind_of(status: Option<&AgentStatus>) -> Option<BadgeKind> {
+    status.and_then(badge_for).map(|b| b.kind)
+}
+
+/// True when the user has to be called: the terminal moved INTO Waiting, or into Done/Failed
+/// with unread, from anything else.
+pub fn should_flash(prev: Option<BadgeKind>, now: Option<BadgeKind>) -> bool {
+    matches!(now, Some(BadgeKind::Waiting | BadgeKind::Done | BadgeKind::Failed)) && prev != now
+}
+
+/// Whether the UI should tell the daemon that the user has seen this terminal.
+pub fn should_mark_seen(is_active_tab: bool, window_active: bool, status: Option<&AgentStatus>) -> bool {
+    is_active_tab && window_active && status.is_some_and(|s| s.unread)
+}
+
+/// Removes leading agent status glyphs (spinner frames, star, etc.) and the spaces after them.
+pub fn strip_status_glyphs(title: &str) -> &str {
+    let is_glyph = |c: char| {
+        matches!(c, '\u{2800}'..='\u{28FF}' | '\u{25D0}' | '\u{25D3}' | '\u{25D1}' | '\u{25D2}'
+            | '\u{2733}' | '\u{2726}' | '\u{23F2}' | '\u{25C7}' | '\u{270B}')
+    };
+    let trimmed = title.trim_start();
+    let mut chars = trimmed.chars();
+    match chars.next() {
+        Some(c) if is_glyph(c) => {
+            // Skip any run of glyphs, then the separating whitespace.
+            trimmed.trim_start_matches(is_glyph).trim_start()
+        }
+        _ => title,
+    }
+}
+
+fn badge_color(kind: BadgeKind, cx: &App) -> Hsla {
+    let p = theme::palette(settings::get(cx).theme);
+    match kind {
+        BadgeKind::Working => cx.theme().primary,
+        BadgeKind::Waiting => rgb(p.agent_waiting).into(),
+        BadgeKind::Done => rgb(p.agent_done).into(),
+        BadgeKind::Failed => rgb(p.agent_failed).into(),
+    }
+}
+
+fn tooltip_text(lang: Language, badge: &Badge) -> String {
+    let label = tr(
+        lang,
+        match badge.kind {
+            BadgeKind::Working => Tr::AgentWorking,
+            BadgeKind::Waiting => Tr::AgentWaiting,
+            BadgeKind::Done => Tr::AgentDone,
+            BadgeKind::Failed => Tr::AgentFailed,
+        },
+    );
+    // "Finished" has nothing useful to add.
+    let detail = if badge.kind == BadgeKind::Done { None } else { badge.detail.as_deref() };
+    i18n::agent_tooltip(label, detail)
+}
+
+/// The 14px icon with a tooltip. `id` must be unique among siblings.
+pub fn badge_element(
+    badge: &Badge,
+    lang: Language,
+    id: impl Into<gpui_kit::ElementId>,
+    cx: &App,
+) -> AnyElement {
+    let color = badge_color(badge.kind, cx);
+    let size = Size::Size(px(BADGE_SIZE));
+    let text = tooltip_text(lang, badge);
+    let id: gpui_kit::ElementId = id.into();
+    let icon = match badge.kind {
+        BadgeKind::Working => Icon::new(Ic::LoaderCircle)
+            .with_size(size)
+            .text_color(color)
+            .with_animation(
+                "agent-spin",
+                Animation::new(SPIN_PERIOD).repeat(),
+                |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+            )
+            .into_any_element(),
+        BadgeKind::Waiting => Icon::new(Ic::CircleAlert).with_size(size).text_color(color).into_any_element(),
+        BadgeKind::Done => Icon::new(Ic::CircleCheck).with_size(size).text_color(color).into_any_element(),
+        BadgeKind::Failed => Icon::new(Ic::CircleX).with_size(size).text_color(color).into_any_element(),
+    };
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .size(px(BADGE_SIZE))
+        .tooltip(move |window, cx| Tooltip::new(text.clone()).build(window, cx))
+        .child(icon)
+        .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sich_proto::AgentKind;
+
+    fn st(state: AgentState, unread: bool, detail: Option<&str>) -> AgentStatus {
+        AgentStatus {
+            kind: AgentKind::Claude,
+            state,
+            unread,
+            since_unix_ms: 1,
+            detail: detail.map(String::from),
+        }
+    }
+
+    fn kind(s: &AgentStatus) -> Option<BadgeKind> {
+        badge_for(s).map(|b| b.kind)
+    }
+
+    #[test]
+    fn badge_per_state() {
+        assert_eq!(kind(&st(AgentState::Working, false, None)), Some(BadgeKind::Working));
+        assert_eq!(kind(&st(AgentState::Waiting, false, None)), Some(BadgeKind::Waiting));
+        assert_eq!(kind(&st(AgentState::Done, true, None)), Some(BadgeKind::Done));
+        assert_eq!(kind(&st(AgentState::Failed, true, None)), Some(BadgeKind::Failed));
+    }
+
+    #[test]
+    fn read_or_idle_has_no_badge() {
+        assert_eq!(kind(&st(AgentState::Idle, false, None)), None);
+        assert_eq!(kind(&st(AgentState::Idle, true, None)), None);
+        assert_eq!(kind(&st(AgentState::Done, false, None)), None);
+        assert_eq!(kind(&st(AgentState::Failed, false, None)), None);
+    }
+
+    #[test]
+    fn badge_keeps_detail() {
+        let b = badge_for(&st(AgentState::Waiting, false, Some("Allow Bash?"))).unwrap();
+        assert_eq!(b.detail.as_deref(), Some("Allow Bash?"));
+    }
+
+    #[test]
+    fn rollup_priority() {
+        let waiting = st(AgentState::Waiting, false, None);
+        let working = st(AgentState::Working, false, None);
+        let failed = st(AgentState::Failed, true, None);
+        let done = st(AgentState::Done, true, None);
+        let idle = st(AgentState::Idle, false, None);
+        let k = |v: Vec<&AgentStatus>| rollup(v).map(|b| b.kind);
+        assert_eq!(k(vec![&done, &failed, &working, &waiting, &idle]), Some(BadgeKind::Waiting));
+        assert_eq!(k(vec![&done, &failed, &working, &idle]), Some(BadgeKind::Working));
+        assert_eq!(k(vec![&done, &failed, &idle]), Some(BadgeKind::Failed));
+        assert_eq!(k(vec![&idle, &done]), Some(BadgeKind::Done));
+        assert_eq!(k(vec![&idle]), None);
+        assert_eq!(k(vec![]), None);
+    }
+
+    #[test]
+    fn rollup_ignores_read_results() {
+        let read_failed = st(AgentState::Failed, false, None);
+        let read_done = st(AgentState::Done, false, None);
+        assert_eq!(rollup([&read_failed, &read_done]), None);
+    }
+
+    #[test]
+    fn rollup_ties_keep_first_detail() {
+        let a = st(AgentState::Working, false, Some("Bash"));
+        let b = st(AgentState::Working, false, Some("Edit"));
+        assert_eq!(rollup([&a, &b]).unwrap().detail.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn mark_seen_decision() {
+        let unread = st(AgentState::Done, true, None);
+        let read = st(AgentState::Done, false, None);
+        assert!(should_mark_seen(true, true, Some(&unread)));
+        assert!(!should_mark_seen(false, true, Some(&unread)));
+        assert!(!should_mark_seen(true, false, Some(&unread)));
+        assert!(!should_mark_seen(true, true, Some(&read)));
+        assert!(!should_mark_seen(true, true, None));
+    }
+
+    #[test]
+    fn flash_only_on_transition_into_attention() {
+        use BadgeKind::*;
+        assert!(should_flash(None, Some(Waiting)));
+        assert!(should_flash(Some(Working), Some(Waiting)));
+        assert!(should_flash(Some(Working), Some(Done)));
+        assert!(should_flash(Some(Working), Some(Failed)));
+        assert!(should_flash(Some(Waiting), Some(Done)));
+        // No change, or moving to something that does not need the user.
+        assert!(!should_flash(Some(Waiting), Some(Waiting)));
+        assert!(!should_flash(Some(Done), Some(Done)));
+        assert!(!should_flash(Some(Waiting), Some(Working)));
+        assert!(!should_flash(Some(Done), None));
+        assert!(!should_flash(None, None));
+        assert!(!should_flash(None, Some(Working)));
+    }
+
+    #[test]
+    fn kind_of_matches_badge() {
+        assert_eq!(kind_of(None), None);
+        assert_eq!(kind_of(Some(&st(AgentState::Done, true, None))), Some(BadgeKind::Done));
+        assert_eq!(kind_of(Some(&st(AgentState::Done, false, None))), None);
+    }
+
+    #[test]
+    fn strips_status_glyphs() {
+        assert_eq!(strip_status_glyphs("\u{2810} Fix bug"), "Fix bug");
+        assert_eq!(strip_status_glyphs("\u{2733} Claude Code"), "Claude Code");
+        assert_eq!(strip_status_glyphs("\u{25D0} task"), "task");
+        assert_eq!(strip_status_glyphs("\u{25D3}\u{25D1}  x"), "x");
+        assert_eq!(strip_status_glyphs("\u{2726} gemini"), "gemini");
+        assert_eq!(strip_status_glyphs("\u{23F2} wait"), "wait");
+        assert_eq!(strip_status_glyphs("\u{25C7} ready"), "ready");
+        assert_eq!(strip_status_glyphs("\u{270B} action"), "action");
+        assert_eq!(strip_status_glyphs("\u{2800}\u{28FF} y"), "y");
+    }
+
+    #[test]
+    fn plain_titles_are_untouched() {
+        assert_eq!(strip_status_glyphs("cargo build"), "cargo build");
+        assert_eq!(strip_status_glyphs(""), "");
+        assert_eq!(strip_status_glyphs("pwsh \u{2733} x"), "pwsh \u{2733} x");
+        assert_eq!(strip_status_glyphs("  spaced"), "  spaced");
+    }
+
+    #[test]
+    fn glyph_only_title_becomes_empty() {
+        assert_eq!(strip_status_glyphs("\u{2733}"), "");
+        assert_eq!(strip_status_glyphs("\u{2733} "), "");
+    }
+
+    #[test]
+    fn tooltips_are_translated_with_detail() {
+        let working = Badge { kind: BadgeKind::Working, detail: Some("Bash".into()) };
+        assert_eq!(tooltip_text(Language::En, &working), "Working: Bash");
+        let waiting = Badge { kind: BadgeKind::Waiting, detail: Some("Allow?".into()) };
+        assert_eq!(tooltip_text(Language::Uk, &waiting), "Чекає на вас: Allow?");
+        let done = Badge { kind: BadgeKind::Done, detail: Some("x".into()) };
+        assert_eq!(tooltip_text(Language::En, &done), "Finished");
+        let failed = Badge { kind: BadgeKind::Failed, detail: None };
+        assert_eq!(tooltip_text(Language::Ru, &failed), "Ошибка");
+    }
+}

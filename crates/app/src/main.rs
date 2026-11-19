@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent_badge;
+mod agent_hooks;
 mod app_view;
 mod assets;
 mod cli;
@@ -21,6 +23,7 @@ mod term_settings;
 mod theme;
 mod view;
 mod win_caret;
+mod win_flash;
 mod workspace;
 mod worktree_dialogs;
 
@@ -74,6 +77,7 @@ fn run_ui(socket: String) -> anyhow::Result<()> {
         term_settings::init(cx);
         settings::init(cx);
         theme::apply(cx);
+        agent_hooks::startup(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -90,8 +94,12 @@ fn run_ui(socket: String) -> anyhow::Result<()> {
             }),
             ..Default::default()
         };
-        gpui_kit::open_window(options, cx, |_window, cx| {
-            cx.new(|cx| AppView::new(handle, socket, cx))
+        gpui_kit::open_window(options, cx, |window, cx| {
+            cx.new(|cx| {
+                let mut view = AppView::new(handle, socket, cx);
+                view.watch_window(window, cx);
+                view
+            })
         })
         .expect("failed to open window");
         cx.activate(true);

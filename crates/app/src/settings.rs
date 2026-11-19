@@ -15,6 +15,8 @@ pub struct AppSettings {
     pub theme: ThemeKind,
     /// Selected worktree path; `None` = Home.
     pub last_workspace: Option<PathBuf>,
+    /// Track Claude Code status through hooks in `~/.claude/settings.json`.
+    pub agent_hooks: bool,
 }
 
 impl Default for AppSettings {
@@ -23,6 +25,7 @@ impl Default for AppSettings {
             language: Language::from_locale(sys_locale::get_locale().as_deref()),
             theme: ThemeKind::Gray,
             last_workspace: None,
+            agent_hooks: true,
         }
     }
 }
@@ -102,6 +105,15 @@ pub fn set_language(language: Language, cx: &mut App) {
     cx.refresh_windows();
 }
 
+pub fn set_agent_hooks(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.agent_hooks == enabled {
+        return;
+    }
+    s.agent_hooks = enabled;
+    store(s, cx);
+}
+
 pub fn set_theme(kind: ThemeKind, cx: &mut App) {
     let mut s = get(cx);
     if s.theme == kind {
@@ -136,5 +148,23 @@ mod tests {
         let s = AppSettings { last_workspace: Some(PathBuf::from("C:/work/app")), ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back.last_workspace, Some(PathBuf::from("C:/work/app")));
+    }
+
+    #[test]
+    fn agent_hooks_defaults_to_true_for_old_files() {
+        let s: AppSettings = serde_json::from_str(r#"{"language":"uk","theme":"gray"}"#).unwrap();
+        assert!(s.agent_hooks);
+        let s: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.agent_hooks);
+        assert!(AppSettings::default().agent_hooks);
+    }
+
+    #[test]
+    fn agent_hooks_false_round_trips() {
+        let s = AppSettings { agent_hooks: false, ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!back.agent_hooks);
+        let parsed: AppSettings = serde_json::from_str(r#"{"agent_hooks":false}"#).unwrap();
+        assert!(!parsed.agent_hooks);
     }
 }

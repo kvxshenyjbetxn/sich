@@ -64,8 +64,6 @@ struct Shared {
     /// End offset of the daemon stream already fed (bytes below it are dropped as duplicates).
     seen_end: Mutex<u64>,
     dirty: AtomicBool,
-    /// When new output bytes last arrived (`None` = never).
-    last_output: Mutex<Option<Instant>>,
     /// Text a program asked to put into the system clipboard (OSC 52); last write wins.
     clipboard: Mutex<Option<String>>,
     wake: Box<dyn Fn() + Send + Sync>,
@@ -150,7 +148,6 @@ impl TermSession {
             size: Mutex::new(Size { cols, rows, cell_w: 0, cell_h: 0 }),
             seen_end: Mutex::new(0),
             dirty: AtomicBool::new(true),
-            last_output: Mutex::new(None),
             clipboard: Mutex::new(None),
             wake: Box::new(wake),
         });
@@ -184,7 +181,6 @@ impl TermSession {
             *end = chunk_end;
             &bytes[skip..]
         };
-        *self.shared.last_output.lock() = Some(Instant::now());
         {
             let mut proc = self.processor.lock();
             {
@@ -199,11 +195,6 @@ impl TermSession {
             }
         }
         self.shared.mark();
-    }
-
-    /// When new output bytes last arrived (`None` if none yet).
-    pub fn last_output(&self) -> Option<Instant> {
-        *self.shared.last_output.lock()
     }
 
     /// End offset of the stream fed so far; use as `resume_from_seq` after a reconnect.
@@ -375,33 +366,21 @@ impl TermSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn session(rt: &tokio::runtime::Runtime) -> TermSession {
         TermSession::new(rt.handle(), 80, 24, Arc::new(|_| {}), Arc::new(|_, _| {}), || {})
     }
 
     #[test]
-    fn last_output_is_none_until_bytes_arrive() {
+    fn duplicate_bytes_are_dropped() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let s = session(&rt);
-        assert!(s.last_output().is_none());
-        let before = Instant::now();
+        assert_eq!(s.last_seq(), 0);
         s.feed(0, b"hello");
-        let at = s.last_output().expect("set by feed");
-        assert!(at >= before && at.elapsed() < Duration::from_secs(5));
-    }
-
-    #[test]
-    fn duplicate_bytes_do_not_count_as_output() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let s = session(&rt);
-        s.feed(0, b"hello");
-        let first = s.last_output().unwrap();
-        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(s.last_seq(), 5);
         s.feed(0, b"hello"); // replay after a reconnect
-        assert_eq!(s.last_output(), Some(first));
+        assert_eq!(s.last_seq(), 5);
         s.feed(5, b"!");
-        assert!(s.last_output().unwrap() > first);
+        assert_eq!(s.last_seq(), 6);
     }
 }

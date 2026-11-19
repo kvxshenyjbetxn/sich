@@ -10,15 +10,17 @@ use gpui_kit::{
 };
 use sich_proto::TermId;
 
+use crate::agent_badge::{badge_element, badge_for, strip_status_glyphs};
 use crate::app_view::AppView;
 use crate::daemon_client::{Snapshot, TermEntry};
 use crate::i18n::{self, Language, Tr, tr};
 
 pub const TAB_BAR_H: f32 = 34.;
 
-/// Tab title: the OSC title (absolute exe paths shortened to the program name), else
-/// "shell — folder".
+/// Tab title: the live title (leading agent status glyphs removed, absolute exe paths shortened
+/// to the program name), else "shell — folder".
 pub fn tab_title(osc_title: &str, shell_title: &str, cwd: &Path) -> String {
+    let osc_title = strip_status_glyphs(osc_title);
     if !osc_title.is_empty() {
         // Shells like pwsh set the title to their full exe path; show just the name.
         let path = Path::new(osc_title.trim());
@@ -33,7 +35,7 @@ pub fn tab_title(osc_title: &str, shell_title: &str, cwd: &Path) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| cwd.display().to_string());
-    format!("{shell_title} \u{2014} {dir}")
+    if shell_title.is_empty() { dir } else { format!("{shell_title} \u{2014} {dir}") }
 }
 
 /// Text shown on the tab (exited terminals get a translated marker).
@@ -42,7 +44,8 @@ pub fn tab_label(lang: Language, title: String, exited: bool) -> String {
 }
 
 fn entry_title(entry: &TermEntry) -> String {
-    tab_title(&entry.session.title(), &entry.info.title, &entry.info.cwd)
+    // The daemon's live title (OSC title, else the shell name).
+    tab_title(&entry.info.title, &entry.session.title(), &entry.info.cwd)
 }
 
 impl AppView {
@@ -61,6 +64,12 @@ impl AppView {
             let is_active = active == Some(id);
             let group = SharedString::from(format!("tab-{id}"));
             let label = tab_label(lang, entry_title(entry), exited);
+            let badge = entry
+                .info
+                .agent
+                .as_ref()
+                .and_then(badge_for)
+                .map(|b| badge_element(&b, lang, ("tab-badge", id), cx));
             let close = Button::new(("tab-close", id))
                 .ghost()
                 .xsmall()
@@ -102,6 +111,7 @@ impl AppView {
                             cx.stop_propagation();
                         }),
                     )
+                    .children(badge)
                     .child(
                         div()
                             .min_w_0()
@@ -176,6 +186,23 @@ mod tests {
     #[test]
     fn empty_title_falls_back_to_shell_and_folder() {
         assert_eq!(tab_title("", "pwsh", &PathBuf::from("/work/app")), "pwsh \u{2014} app");
+    }
+
+    #[test]
+    fn agent_status_glyphs_are_removed_from_titles() {
+        assert_eq!(tab_title("\u{2810} Fix the bug", "pwsh", Path::new("/w")), "Fix the bug");
+        assert_eq!(tab_title("\u{2733} Claude Code", "pwsh", Path::new("/w")), "Claude Code");
+        assert_eq!(tab_title("\u{2726} gemini", "pwsh", Path::new("/w")), "gemini");
+    }
+
+    #[test]
+    fn glyph_only_title_falls_back_to_shell_and_folder() {
+        assert_eq!(tab_title("\u{2733}", "pwsh", &PathBuf::from("/work/app")), "pwsh \u{2014} app");
+    }
+
+    #[test]
+    fn missing_shell_title_falls_back_to_folder() {
+        assert_eq!(tab_title("", "", &PathBuf::from("/work/app")), "app");
     }
 
     #[test]

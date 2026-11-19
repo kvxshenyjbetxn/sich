@@ -1,7 +1,6 @@
 //! Left sidebar: Home and the project/worktree tree.
 
 use std::path::PathBuf;
-use std::time::Instant;
 
 use gpui_kit::assets::IconName as Ic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -15,11 +14,11 @@ use gpui_kit::{
 };
 use sich_proto::{ProjectId, ProjectInfo, TerminalInfo, WorktreeInfo};
 
+use crate::agent_badge::{Badge, badge_element, rollup};
 use crate::app_view::AppView;
-use crate::daemon_client::Snapshot;
 use crate::i18n::{Language, Tr, tr};
 use crate::os;
-use crate::workspace::{ACTIVITY_WINDOW, WorkspaceKey, count_in, is_recent, same_path};
+use crate::workspace::{WorkspaceKey, count_in, same_path};
 use crate::worktree_dialogs::{self, WorktreeRef};
 
 pub const SIDEBAR_W: f32 = 260.;
@@ -38,12 +37,28 @@ pub fn worktree_label(w: &WorktreeInfo) -> String {
     }
 }
 
-/// True if any terminal of the worktree at `path` received output within the activity window.
-pub fn worktree_is_active(path: &std::path::Path, snap: &Snapshot, now: Instant) -> bool {
-    snap.terminals.iter().any(|t| {
-        t.info.worktree.as_deref().is_some_and(|w| same_path(w, path))
-            && is_recent(t.session.last_output(), now, ACTIVITY_WINDOW)
-    })
+/// Roll-up badge of the terminals in `key` (Home or a worktree).
+pub fn workspace_badge(key: &WorkspaceKey, infos: &[TerminalInfo]) -> Option<Badge> {
+    rollup(
+        infos
+            .iter()
+            .filter(|t| key.contains(t.worktree.as_deref()))
+            .filter_map(|t| t.agent.as_ref()),
+    )
+}
+
+/// Roll-up badge of every worktree of a project (shown when the project row is collapsed).
+pub fn project_badge(project: &ProjectInfo, infos: &[TerminalInfo]) -> Option<Badge> {
+    rollup(
+        infos
+            .iter()
+            .filter(|t| {
+                t.worktree
+                    .as_deref()
+                    .is_some_and(|w| project.worktrees.iter().any(|pw| same_path(&pw.path, w)))
+            })
+            .filter_map(|t| t.agent.as_ref()),
+    )
 }
 
 #[derive(Clone)]
@@ -176,7 +191,6 @@ impl AppView {
 
     pub(crate) fn render_sidebar(
         &self,
-        snap: &Snapshot,
         infos: &[TerminalInfo],
         lang: Language,
         cx: &mut Context<Self>,
@@ -184,7 +198,6 @@ impl AppView {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let app = cx.entity();
-        let now = Instant::now();
 
         let header = h_flex()
             .h(px(36.))
@@ -227,6 +240,7 @@ impl AppView {
             }))
             .child(Icon::new(Ic::House).small().text_color(muted))
             .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(tr(lang, Tr::Home)))
+            .children(workspace_badge(&WorkspaceKey::Home, infos).map(|b| badge_element(&b, lang, "home-agent", cx)))
             .children((home_count > 0).then(|| count_badge(home_count, theme.muted, muted)));
 
         let mut body = v_flex().id("sidebar-body").flex_1().min_h_0().overflow_y_scroll().child(home);
@@ -249,7 +263,7 @@ impl AppView {
         }
 
         for project in &self.projects {
-            body = body.child(self.render_project(project, snap, infos, lang, now, &app, cx));
+            body = body.child(self.render_project(project, infos, lang, &app, cx));
         }
 
         v_flex()
@@ -268,10 +282,8 @@ impl AppView {
     fn render_project(
         &self,
         project: &ProjectInfo,
-        snap: &Snapshot,
         infos: &[TerminalInfo],
         lang: Language,
-        now: Instant,
         app: &Entity<AppView>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -307,6 +319,7 @@ impl AppView {
                 .dropdown_menu(move |menu, _w, _cx| project_menu(menu, &menu_app, &menu_p, lang)),
         );
 
+        let collapsed_badge = if expanded { None } else { project_badge(project, infos) };
         let (ctx_app, ctx_p) = (app.clone(), pref.clone());
         let row = row_base(("proj", pid), false, 0., &theme)
             .group(group)
@@ -331,6 +344,7 @@ impl AppView {
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child(project.name.clone()),
             )
+            .children(collapsed_badge.map(|b| badge_element(&b, lang, ("proj-agent", pid), cx)))
             .child(actions)
             .context_menu(move |menu, _w, _cx| project_menu(menu, &ctx_app, &ctx_p, lang));
 
@@ -347,7 +361,7 @@ impl AppView {
             );
         } else if expanded {
             for w in &project.worktrees {
-                col = col.child(self.render_worktree(pid, w, snap, infos, lang, now, app, cx));
+                col = col.child(self.render_worktree(pid, w, infos, lang, app, cx));
             }
         }
         col
@@ -358,10 +372,8 @@ impl AppView {
         &self,
         project_id: ProjectId,
         w: &WorktreeInfo,
-        snap: &Snapshot,
         infos: &[TerminalInfo],
         lang: Language,
-        now: Instant,
         app: &Entity<AppView>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -370,7 +382,7 @@ impl AppView {
         let key = WorkspaceKey::Worktree(w.path.clone());
         let selected = self.ws.selected == key;
         let count = count_in(&key, infos);
-        let active = worktree_is_active(&w.path, snap, now);
+        let agent = workspace_badge(&key, infos);
         let label = worktree_label(w);
         let group = SharedString::from(format!("wt-{}", crate::workspace::normalize_path(&w.path)));
         let wref = WorktreeRef {
@@ -405,8 +417,8 @@ impl AppView {
                     .tooltip(move |window, cx| Tooltip::new(text).build(window, cx)),
             );
         }
-        if active {
-            row = row.child(dot(SharedString::from(format!("wt-active:{uid}")), theme.success));
+        if let Some(b) = agent {
+            row = row.child(badge_element(&b, lang, SharedString::from(format!("wt-agent:{uid}")), cx));
         }
         if count > 0 {
             row = row.child(count_badge(count, theme.muted, muted));
@@ -435,6 +447,8 @@ impl AppView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_badge::BadgeKind;
+    use sich_proto::{AgentKind, AgentState, AgentStatus};
 
     fn wt(path: &str, branch: Option<&str>) -> WorktreeInfo {
         WorktreeInfo {
@@ -455,5 +469,67 @@ mod tests {
     fn label_falls_back_to_folder_name() {
         assert_eq!(worktree_label(&wt("/w/app-x", None)), "app-x");
         assert_eq!(worktree_label(&wt("/w/app-x", Some(""))), "app-x");
+    }
+
+    fn term(id: u64, worktree: Option<&str>, state: Option<(AgentState, bool)>) -> TerminalInfo {
+        TerminalInfo {
+            id,
+            title: String::new(),
+            cwd: PathBuf::new(),
+            cols: 80,
+            rows: 24,
+            exited: None,
+            created_unix_ms: id,
+            worktree: worktree.map(PathBuf::from),
+            agent: state.map(|(state, unread)| AgentStatus {
+                kind: AgentKind::Claude,
+                state,
+                unread,
+                since_unix_ms: 1,
+                detail: None,
+            }),
+        }
+    }
+
+    fn kind(b: Option<Badge>) -> Option<BadgeKind> {
+        b.map(|b| b.kind)
+    }
+
+    #[test]
+    fn workspace_badge_rolls_up_only_its_terminals() {
+        let infos = vec![
+            term(1, Some("/w/a"), Some((AgentState::Working, false))),
+            term(2, Some("/w/a/"), Some((AgentState::Waiting, false))),
+            term(3, Some("/w/b"), Some((AgentState::Done, true))),
+            term(4, None, Some((AgentState::Failed, true))),
+            term(5, None, None),
+        ];
+        let a = WorkspaceKey::Worktree("/w/a".into());
+        let b = WorkspaceKey::Worktree("/w/b".into());
+        let c = WorkspaceKey::Worktree("/w/c".into());
+        assert_eq!(kind(workspace_badge(&a, &infos)), Some(BadgeKind::Waiting));
+        assert_eq!(kind(workspace_badge(&b, &infos)), Some(BadgeKind::Done));
+        assert_eq!(kind(workspace_badge(&WorkspaceKey::Home, &infos)), Some(BadgeKind::Failed));
+        assert_eq!(kind(workspace_badge(&c, &infos)), None);
+    }
+
+    #[test]
+    fn project_badge_covers_all_its_worktrees() {
+        let project = ProjectInfo {
+            id: 1,
+            name: "p".into(),
+            path: PathBuf::from("/w/a"),
+            is_git: true,
+            worktrees: vec![wt("/w/a", None), wt("/w/a-x", None)],
+            error: None,
+        };
+        let infos = vec![
+            term(1, Some("/w/a"), Some((AgentState::Done, true))),
+            term(2, Some("/w/a-x"), Some((AgentState::Working, false))),
+            term(3, Some("/w/other"), Some((AgentState::Waiting, false))),
+            term(4, None, Some((AgentState::Waiting, false))),
+        ];
+        assert_eq!(kind(project_badge(&project, &infos)), Some(BadgeKind::Working));
+        assert_eq!(kind(project_badge(&project, &infos[2..])), None);
     }
 }

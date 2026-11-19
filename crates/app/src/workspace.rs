@@ -4,14 +4,8 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use sich_proto::{ProjectId, ProjectInfo, TermId, TerminalInfo};
-
-/// A terminal counts as "active" in the sidebar for this long after its last output.
-pub const ACTIVITY_WINDOW: Duration = Duration::from_secs(2);
-/// The UI timer keeps ticking this long after the last output so the dots can fade out.
-pub const ACTIVITY_TIMER_WINDOW: Duration = Duration::from_millis(2500);
 
 /// Normalizes a path for comparison: case-insensitive with `\` separators on Windows,
 /// without trailing separators and without the `\\?\` prefix.
@@ -187,11 +181,6 @@ pub fn match_pending_worktree(pending: &PendingWorktree, projects: &[ProjectInfo
         .map(|w| w.path.clone())
 }
 
-/// Whether a terminal with this last output time counts as active at `now`.
-pub fn is_recent(last: Option<Instant>, now: Instant, window: Duration) -> bool {
-    last.is_some_and(|t| now.saturating_duration_since(t) < window)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,17 +293,5 @@ mod tests {
         // The main worktree is never the new one.
         let main = vec![project(7, vec![wt("/w/feature-x", true)])];
         assert_eq!(match_pending_worktree(&pending, &main), None);
-    }
-
-    #[test]
-    fn activity_window() {
-        let now = Instant::now();
-        assert!(!is_recent(None, now, ACTIVITY_WINDOW));
-        assert!(is_recent(Some(now), now, ACTIVITY_WINDOW));
-        let old = now.checked_sub(Duration::from_secs(3));
-        if let Some(old) = old {
-            assert!(!is_recent(Some(old), now, ACTIVITY_WINDOW));
-            assert!(!is_recent(Some(old), now, ACTIVITY_TIMER_WINDOW));
-        }
     }
 }

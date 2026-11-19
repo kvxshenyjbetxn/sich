@@ -120,11 +120,6 @@ impl DaemonClient {
         (st.projects_rev, st.projects.clone())
     }
 
-    /// Most recent output time over all terminals.
-    pub fn latest_output(&self) -> Option<Instant> {
-        self.state.lock().terminals.iter().filter_map(|t| t.session.last_output()).max()
-    }
-
     /// Kills the incompatible daemon (by `pid`, else by scanning processes), starts a new one
     /// and resumes connecting.
     pub fn restart_daemon(&self, pid: Option<u32>) {
@@ -178,7 +173,6 @@ impl DaemonClient {
     }
 
     /// Tells the daemon the user has looked at the terminal (clears its `unread`).
-    #[allow(dead_code)] // wired to the UI separately
     pub fn mark_seen(&self, id: TermId) {
         let _ = self.cmd_tx.send(Cmd::MarkSeen(id));
     }

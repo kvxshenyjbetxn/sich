@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -14,6 +14,7 @@ use gpui_kit::{
 };
 use sich_proto::{PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
+use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, Snapshot};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
@@ -21,9 +22,10 @@ use crate::settings;
 use crate::settings_dialog;
 use crate::view::TerminalView;
 use crate::workspace::{
-    ACTIVITY_TIMER_WINDOW, PendingWorktree, WorkspaceKey, Workspaces, cycle_id,
+    PendingWorktree, WorkspaceKey, Workspaces, cycle_id,
     match_pending_worktree, restore_selection, terminals_in, workspace_exists,
 };
+use crate::win_flash;
 use crate::worktree_dialogs;
 
 /// Upper bound for creations waiting to be matched with a `TerminalCreated`.
@@ -45,7 +47,14 @@ pub struct AppView {
     shown_error: Option<Instant>,
     /// Terminal that last received keyboard focus.
     focused: Option<TermId>,
-    activity_timer: bool,
+    /// Whether the window has focus (kept by the activation observer and `sync`).
+    window_active: bool,
+    /// Native window handle for the taskbar flash (Windows).
+    hwnd: Option<isize>,
+    /// Last badge kind seen per terminal, to detect transitions into "needs the user".
+    attention: HashMap<TermId, Option<BadgeKind>>,
+    /// `since_unix_ms` of the status for which `mark_seen` was already sent, per terminal.
+    seen_sent: HashMap<TermId, u64>,
 }
 
 impl AppView {
@@ -81,7 +90,10 @@ impl AppView {
             seen_projects_rev: 0,
             shown_error: None,
             focused: None,
-            activity_timer: false,
+            window_active: false,
+            hwnd: None,
+            attention: HashMap::new(),
+            seen_sent: HashMap::new(),
         }
     }
 
@@ -89,38 +101,56 @@ impl AppView {
         for view in self.views.values() {
             view.update(cx, |v, cx| v.refresh(cx));
         }
-        self.ensure_activity_timer(cx);
+        let snap = self.client.snapshot();
+        self.track_agents(&snap);
         cx.notify();
     }
 
-    fn recent_output(&self) -> bool {
-        self.client.latest_output().is_some_and(|t| t.elapsed() < ACTIVITY_TIMER_WINDOW)
-    }
-
-    /// While any terminal produced output recently, repaints every 500 ms so the sidebar
-    /// activity dots fade out. Does nothing when idle.
-    fn ensure_activity_timer(&mut self, cx: &mut Context<Self>) {
-        if self.activity_timer || !self.recent_output() {
-            return;
-        }
-        self.activity_timer = true;
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(500)).await;
-                let keep = this.update(cx, |this, cx| {
-                    cx.notify();
-                    let keep = this.recent_output();
-                    if !keep {
-                        this.activity_timer = false;
-                    }
-                    keep
-                });
-                if !matches!(keep, Ok(true)) {
-                    break;
-                }
-            }
+    /// Hooks the window up: focus tracking (mark seen on focus, flash only in the background)
+    /// and the native handle for the taskbar flash.
+    pub fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_active = window.is_window_active();
+        self.hwnd = win_flash::hwnd_of(window);
+        cx.observe_window_activation(window, |this, window, cx| {
+            this.window_active = window.is_window_active();
+            let snap = this.client.snapshot();
+            this.track_agents(&snap);
+            cx.notify();
         })
         .detach();
+    }
+
+    /// Agent status side effects: taskbar flash on a transition into "needs the user" while the
+    /// window is in the background, and `mark_seen` for the visible terminal.
+    fn track_agents(&mut self, snap: &Snapshot) {
+        let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
+        let ws_ids = self.workspace_ids(&infos);
+        let active = self.ws.active_in(&self.ws.selected, &ws_ids);
+        let mut flash = false;
+        for t in &snap.terminals {
+            let id = t.info.id;
+            let status = t.info.agent.as_ref();
+            let now = kind_of(status);
+            // A terminal seen for the first time only seeds the state (no flash at startup).
+            if let Some(prev) = self.attention.insert(id, now) {
+                flash |= !self.window_active && should_flash(prev, now);
+            }
+            if should_mark_seen(active == Some(id), self.window_active, status) {
+                let since = status.map_or(0, |s| s.since_unix_ms);
+                if self.seen_sent.get(&id) != Some(&since) {
+                    self.seen_sent.insert(id, since);
+                    self.client.mark_seen(id);
+                }
+            }
+        }
+        let alive: Vec<TermId> = infos.iter().map(|t| t.id).collect();
+        self.attention.retain(|id, _| alive.contains(id));
+        self.seen_sent.retain(|id, _| alive.contains(id));
+        if flash {
+            if let Some(hwnd) = self.hwnd {
+                win_flash::flash(hwnd);
+            }
+        }
     }
 
     // ---- selection -------------------------------------------------------------------------
@@ -244,6 +274,7 @@ impl AppView {
         let ids: Vec<TermId> = infos.iter().map(|t| t.id).collect();
         self.views.retain(|id, _| ids.contains(id));
         self.ws.prune(&ids);
+        self.window_active = window.is_window_active();
 
         let (rev, projects) = self.client.projects_with_rev();
         if rev != self.seen_projects_rev {
@@ -260,6 +291,7 @@ impl AppView {
                 view.update(cx, |v, cx| v.focus(window, cx));
             }
         }
+        self.track_agents(snap);
     }
 
     fn on_projects_changed(&mut self, cx: &mut Context<Self>) {
@@ -377,7 +409,7 @@ impl Render for AppView {
             cx.defer_in(window, move |_, window, cx| notifications::show_error(msg, window, cx));
         }
 
-        let sidebar = self.render_sidebar(&snap, &infos, lang, cx);
+        let sidebar = self.render_sidebar(&infos, lang, cx);
         let main = self.render_main(&snap, &infos, lang, cx);
         let status_bar = self.render_status_bar(snap.status, lang, cx);
 

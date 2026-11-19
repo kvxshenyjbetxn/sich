@@ -17,6 +17,10 @@ gpui_kit::assets::icon_assets!(ExtraIcons, [
     ChevronRight,
     ChevronDown,
     Terminal,
+    LoaderCircle,
+    CircleAlert,
+    CircleCheck,
+    CircleX,
 ]);
 
 pub struct AppAssets;

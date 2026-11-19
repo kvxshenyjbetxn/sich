@@ -1,11 +1,14 @@
-//! Settings dialog: language and theme, applied immediately.
+//! Settings dialog: language, theme and agent tracking, applied immediately.
 
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
     App, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px, rgb,
 };
 
+use crate::agent_hooks;
 use crate::i18n::{Language, Tr, tr};
 use crate::settings;
 use crate::theme::{self, ThemeKind};
@@ -25,7 +28,8 @@ pub fn open(window: &mut Window, cx: &mut App) {
                     .gap_5()
                     .pb_2()
                     .child(section(tr(lang, Tr::Language), language_picker(lang, cx), cx))
-                    .child(section(tr(lang, Tr::Theme), theme_cards(lang, cx), cx)),
+                    .child(section(tr(lang, Tr::Theme), theme_cards(lang, cx), cx))
+                    .child(section(tr(lang, Tr::AgentsSection), agents_section(lang, cx), cx)),
             )
     });
 }
@@ -35,6 +39,35 @@ fn section(title: &'static str, body: impl IntoElement, cx: &App) -> impl IntoEl
         .gap_2()
         .child(div().text_sm().text_color(cx.theme().muted_foreground).child(title))
         .child(body)
+}
+
+fn agents_section(lang: Language, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let enabled = settings::get(cx).agent_hooks;
+    let hooks = agent_hooks::state(cx);
+    let (status, is_error) = if hooks.busy {
+        (tr(lang, Tr::HooksWorking).to_string(), false)
+    } else {
+        agent_hooks::status_text(lang, &hooks.status)
+    };
+    v_flex()
+        .gap_1p5()
+        .child(
+            Switch::new("agent-hooks")
+                .checked(enabled)
+                .disabled(hooks.busy)
+                .label(tr(lang, Tr::TrackClaudeHooks))
+                .on_click(|checked, window, cx| {
+                    settings::set_agent_hooks(*checked, cx);
+                    agent_hooks::apply(*checked, Some(window), cx);
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(if is_error { theme.danger } else { theme.muted_foreground })
+                .child(status),
+        )
 }
 
 fn language_picker(current: Language, cx: &App) -> impl IntoElement {

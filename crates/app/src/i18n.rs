@@ -78,6 +78,14 @@ pub enum Tr {
     RestartDaemon,
     RestartDaemonWarning,
     Restart,
+    AgentWorking,
+    AgentWaiting,
+    AgentDone,
+    AgentFailed,
+    AgentsSection,
+    TrackClaudeHooks,
+    HooksNotInstalled,
+    HooksWorking,
 }
 
 impl Tr {
@@ -120,6 +128,14 @@ impl Tr {
         Tr::RestartDaemon,
         Tr::RestartDaemonWarning,
         Tr::Restart,
+        Tr::AgentWorking,
+        Tr::AgentWaiting,
+        Tr::AgentDone,
+        Tr::AgentFailed,
+        Tr::AgentsSection,
+        Tr::TrackClaudeHooks,
+        Tr::HooksNotInstalled,
+        Tr::HooksWorking,
     ];
 }
 
@@ -306,7 +322,76 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "Перезапустить",
             En => "Restart",
         },
+        Tr::AgentWorking => match lang {
+            Uk => "Працює",
+            Ru => "Работает",
+            En => "Working",
+        },
+        Tr::AgentWaiting => match lang {
+            Uk => "Чекає на вас",
+            Ru => "Ждёт вас",
+            En => "Waiting for you",
+        },
+        Tr::AgentDone => match lang {
+            Uk => "Завершив",
+            Ru => "Завершил",
+            En => "Finished",
+        },
+        Tr::AgentFailed => match lang {
+            Uk => "Помилка",
+            Ru => "Ошибка",
+            En => "Failed",
+        },
+        Tr::AgentsSection => match lang {
+            Uk => "Агенти",
+            Ru => "Агенты",
+            En => "Agents",
+        },
+        Tr::TrackClaudeHooks => match lang {
+            Uk => "Відстежувати стан Claude Code (додає хуки в ~/.claude/settings.json)",
+            Ru => "Отслеживать состояние Claude Code (добавляет хуки в ~/.claude/settings.json)",
+            En => "Track Claude Code status (installs hooks into ~/.claude/settings.json)",
+        },
+        Tr::HooksNotInstalled => match lang {
+            Uk => "Не встановлено",
+            Ru => "Не установлено",
+            En => "Not installed",
+        },
+        Tr::HooksWorking => match lang {
+            Uk => "Оновлення\u{2026}",
+            Ru => "Обновление\u{2026}",
+            En => "Updating\u{2026}",
+        },
     }
+}
+
+/// Tooltip of an agent badge: `label`, plus `: detail` when there is one.
+pub fn agent_tooltip(label: &str, detail: Option<&str>) -> String {
+    match detail.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => format!("{label}: {d}"),
+        None => label.to_string(),
+    }
+}
+
+/// Status line under the hooks switch when hooks are installed.
+pub fn hooks_installed(lang: Language, events: Option<usize>, claude_version: Option<&str>) -> String {
+    let head = match lang {
+        Language::Uk => "Хуки встановлено",
+        Language::Ru => "Хуки установлены",
+        Language::En => "Hooks installed",
+    };
+    let mut parts = Vec::new();
+    if let Some(n) = events {
+        parts.push(match lang {
+            Language::Uk => format!("подій: {n}"),
+            Language::Ru => format!("событий: {n}"),
+            Language::En => format!("{n} events"),
+        });
+    }
+    if let Some(v) = claude_version {
+        parts.push(format!("Claude v{v}"));
+    }
+    if parts.is_empty() { head.to_string() } else { format!("{head} ({})", parts.join(", ")) }
 }
 
 pub fn connected(lang: Language, pid: u32) -> String {
@@ -406,6 +491,16 @@ mod tests {
             assert!(daemon_incompatible(lang, Some(1), 2).contains("v1"));
             assert!(daemon_incompatible(lang, None, 2).contains("v2"));
             assert!(exited_tab(lang, "pwsh").starts_with("pwsh ("));
+            assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains('9'));
+            assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains("v2.1.3"));
+            assert!(!hooks_installed(lang, None, None).contains('('));
         }
+    }
+
+    #[test]
+    fn agent_tooltip_appends_detail() {
+        assert_eq!(agent_tooltip("Working", Some("Bash")), "Working: Bash");
+        assert_eq!(agent_tooltip("Working", None), "Working");
+        assert_eq!(agent_tooltip("Working", Some("  ")), "Working");
     }
 }

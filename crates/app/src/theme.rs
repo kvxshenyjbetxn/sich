@@ -35,6 +35,10 @@ pub struct Palette {
     pub muted: u32,
     pub accent: u32,
     pub accent_text: u32,
+    /// Agent badge colors: waiting for the user, finished, failed.
+    pub agent_waiting: u32,
+    pub agent_done: u32,
+    pub agent_failed: u32,
 }
 
 pub fn palette(kind: ThemeKind) -> Palette {
@@ -49,6 +53,9 @@ pub fn palette(kind: ThemeKind) -> Palette {
             muted: 0x868a91,
             accent: 0x3574f0,
             accent_text: 0xffffff,
+            agent_waiting: 0xe0af68,
+            agent_done: 0x4ec96b,
+            agent_failed: 0xf7768e,
         },
         ThemeKind::Amoled => Palette {
             bg: 0x000000,
@@ -60,6 +67,9 @@ pub fn palette(kind: ThemeKind) -> Palette {
             muted: 0x7a7a7a,
             accent: 0x3574f0,
             accent_text: 0xffffff,
+            agent_waiting: 0xe0af68,
+            agent_done: 0x4ec96b,
+            agent_failed: 0xf7768e,
         },
     }
 }
