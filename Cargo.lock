@@ -3012,6 +3012,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "icongen"
+version = "0.0.1"
+dependencies = [
+ "resvg 0.46.0",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
