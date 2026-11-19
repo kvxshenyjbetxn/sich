@@ -9,6 +9,7 @@ mod daemon_conn;
 mod daemon_kill;
 mod element;
 mod i18n;
+mod input;
 mod links;
 mod notifications;
 mod os;
@@ -19,6 +20,7 @@ mod tab_bar;
 mod term_settings;
 mod theme;
 mod view;
+mod win_caret;
 mod workspace;
 mod worktree_dialogs;
 

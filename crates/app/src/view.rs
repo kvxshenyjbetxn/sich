@@ -1,12 +1,13 @@
 //! TerminalView: owns the session, handles input, renders the grid plus a status overlay.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::ops::Range;
 use std::rc::Rc;
 
 use gpui_kit::{
-    App, ClipboardItem, Context, Div, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    App, Bounds, ClipboardItem, Context, Div, EntityInputHandler, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Pixels, Point as PxPoint, Render, ScrollDelta, ScrollEvent, Styled, Subscription, Window,
+    Pixels, Point as PxPoint, Render, ScrollDelta, ScrollEvent, Styled, Subscription, UTF16Selection, Window,
     div, px, Hsla,
 };
 use gpui_kit::component::ActiveTheme as _;
@@ -19,9 +20,11 @@ use sich_term::{
 };
 
 use crate::colors;
-use crate::element::{SharedGeometry, TerminalElement};
+use crate::element::{SharedCaret, SharedGeometry, TerminalElement};
+use crate::input::{Route, route_keystroke};
 use crate::links::Link;
 use crate::term_settings;
+use crate::win_caret::Caret;
 
 pub struct TerminalView {
     session: TermSession,
@@ -35,6 +38,9 @@ pub struct TerminalView {
     last_cell: Option<(usize, usize)>,
     /// Link under the pointer while Ctrl is held.
     hover_link: Option<Link>,
+    /// IME composition text (not yet sent to the PTY).
+    marked: Option<String>,
+    caret: SharedCaret,
     _subs: Vec<Subscription>,
 }
 
@@ -54,6 +60,8 @@ impl TerminalView {
             reported_btn: None,
             last_cell: None,
             hover_link: None,
+            marked: None,
+            caret: Rc::new(RefCell::new(Caret::new())),
             _subs: subs,
         }
     }
@@ -76,6 +84,11 @@ impl TerminalView {
         let ks = &ev.keystroke;
         let m = ks.modifiers;
         if m.platform {
+            return;
+        }
+        // Plain text is left unhandled: Windows then posts WM_CHAR, which reaches our input
+        // handler (injected text, dead keys, IME, emoji). See `input::route_keystroke`.
+        if route_keystroke(ks, cfg!(windows)) == Route::LetInputHandler {
             return;
         }
         let session = self.session.clone();
@@ -127,6 +140,18 @@ impl TerminalView {
             if session.clear_selection() {
                 cx.notify();
             }
+        }
+    }
+
+    /// Sends committed text to the PTY like typed input.
+    fn commit_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if text.is_empty() {
+            return;
+        }
+        self.session.scroll_to_bottom();
+        self.session.write(text.as_bytes().to_vec());
+        if self.session.clear_selection() {
+            cx.notify();
         }
     }
 
@@ -441,6 +466,101 @@ impl TerminalView {
     }
 }
 
+/// Pixel rect of a grid cell in window coordinates.
+pub(crate) fn cell_rect(
+    origin: PxPoint<Pixels>,
+    cell_w: Pixels,
+    line_h: Pixels,
+    row: usize,
+    col: usize,
+) -> Bounds<Pixels> {
+    Bounds::new(
+        PxPoint { x: origin.x + cell_w * col as f32, y: origin.y + line_h * row as f32 },
+        gpui_kit::size(cell_w, line_h),
+    )
+}
+
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        _range: Range<usize>,
+        _adjusted: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection { range: 0..0, reversed: false })
+    }
+
+    fn marked_text_range(&self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<Range<usize>> {
+        self.marked.as_ref().map(|t| 0..utf16_len(t))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.marked.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.marked.take().is_some() {
+            cx.notify();
+        }
+        self.commit_text(text, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked = if new_text.is_empty() { None } else { Some(new_text.to_string()) };
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let Some(g) = self.geometry.get() else { return Some(element_bounds) };
+        let (row, col) = g.cursor.unwrap_or((0, 0));
+        Some(cell_rect(g.origin, g.cell_w, g.line_h, row, col))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: PxPoint<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 impl Focusable for TerminalView {
     fn focus_handle(&self, _cx: &gpui_kit::App) -> FocusHandle {
         self.focus.clone()
@@ -507,6 +627,9 @@ impl Render for TerminalView {
                 self.geometry.clone(),
                 on_move,
                 link.map(|l| l.spans).unwrap_or_default(),
+                cx.entity(),
+                self.marked.clone(),
+                self.caret.clone(),
             ));
 
         if let Some(code) = session.exited() {
@@ -515,5 +638,26 @@ impl Render for TerminalView {
             root = root.child(overlay(text, theme.warning, theme.popover));
         }
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cell_rect_is_offset_by_cell_size() {
+        let r = cell_rect(PxPoint { x: px(10.), y: px(20.) }, px(8.), px(16.), 2, 3);
+        assert_eq!(f32::from(r.origin.x), 34.0);
+        assert_eq!(f32::from(r.origin.y), 52.0);
+        assert_eq!(f32::from(r.size.width), 8.0);
+        assert_eq!(f32::from(r.size.height), 16.0);
+    }
+
+    #[test]
+    fn utf16_len_counts_surrogates() {
+        assert_eq!(utf16_len("abc"), 3);
+        assert_eq!(utf16_len("\u{444}"), 1);
+        assert_eq!(utf16_len("\u{1F600}"), 2);
     }
 }
