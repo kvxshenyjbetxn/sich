@@ -121,7 +121,10 @@ pub fn append_log(path: &Path, line: &str) {
         } else {
             opts.append(true);
         }
-        writeln!(opts.open(path)?, "{line}")
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        writeln!(opts.open(path)?, "[{ts}] {line}")
     })();
 }
 
@@ -277,9 +280,18 @@ mod tests {
         let path = dir.path().join("logs").join("hook.log");
         append_log(&path, "one");
         append_log(&path, "two");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\n");
+        // Lines are "[<unix secs>] <text>".
+        let strip = |s: String| -> Vec<String> {
+            s.lines()
+                .map(|l| {
+                    assert!(l.starts_with('['), "missing timestamp: {l}");
+                    l.split_once("] ").map(|(_, t)| t.to_string()).unwrap_or_default()
+                })
+                .collect()
+        };
+        assert_eq!(strip(std::fs::read_to_string(&path).unwrap()), ["one", "two"]);
         std::fs::write(&path, vec![b'x'; (MAX_LOG_BYTES + 1) as usize]).unwrap();
         append_log(&path, "fresh");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fresh\n");
+        assert_eq!(strip(std::fs::read_to_string(&path).unwrap()), ["fresh"]);
     }
 }

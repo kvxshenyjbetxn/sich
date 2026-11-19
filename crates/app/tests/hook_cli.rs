@@ -22,6 +22,8 @@ fn run_hook_bin(env: &[(&str, String)], stdin: &str) -> (Option<i32>, Vec<u8>, D
     cmd.args(["hook", "claude"])
         .env_remove("SICH_TERM_ID")
         .env_remove("SICH_SOCKET")
+        // Keep the hook log out of the user's real data dir.
+        .env("SICH_LOG_DIR", std::env::temp_dir().join("sich-test-hook-logs"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
