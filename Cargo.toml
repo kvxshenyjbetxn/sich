@@ -32,6 +32,7 @@ sich-daemon = { path = "crates/daemon" }
 sich-term = { path = "crates/term" }
 sich-hooks = { path = "crates/hooks" }
 sich-git = { path = "crates/git" }
+sich-orch = { path = "crates/orch" }
 
 [profile.release]
 opt-level = 3

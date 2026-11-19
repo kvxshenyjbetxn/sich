@@ -28,6 +28,7 @@ use crate::diff_view::DiffView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
+use crate::orch_watch;
 use crate::sidebar::{DEFAULT_SIDEBAR_W, clamp_sidebar_w};
 use crate::session::{self, RightPanelState, RightTab, SavedWindow, Session, SessionInput};
 use crate::settings;
@@ -112,6 +113,8 @@ pub struct AppView {
     save_scheduled: bool,
     restarting_daemon: bool,
     restart_dialog_shown: bool,
+    /// Orchestration data for the sidebar, refreshed by the watcher (never queried in render).
+    pub(crate) orch: sich_orch::OrchSnapshot,
     /// Sidebar width in logical pixels (drag the handle on its right edge).
     pub(crate) sidebar_w: f32,
     /// The sidebar handle is being dragged.
@@ -175,6 +178,35 @@ impl AppView {
         })
         .detach();
 
+        // Orchestration watcher: wakes idle agents that have mail, raises escalations and keeps
+        // the sidebar data fresh. Cheap while the database does not exist.
+        cx.spawn(async move |this, cx| {
+            let mut watcher = Some(sich_orch::watch::Watcher::new(sich_orch::paths::db_path()));
+            loop {
+                cx.background_executor().timer(orch_watch::TICK).await;
+                let Ok(data) = this.update(cx, |this, _| this.orch_tick_data()) else { break };
+                let Some(mut w) = watcher.take() else { break };
+                let (w, out) = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let input = sich_orch::watch::TickInput {
+                            terms: &data.terms,
+                            synced: data.synced,
+                            now_ms: data.now_ms,
+                            exe: &data.exe,
+                        };
+                        let out = w.tick(&input);
+                        (w, out)
+                    })
+                    .await;
+                watcher = Some(w);
+                if this.update(cx, |this, cx| this.apply_orch(out, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         Self {
             client,
             views: HashMap::new(),
@@ -217,12 +249,38 @@ impl AppView {
             save_scheduled: false,
             restarting_daemon: false,
             restart_dialog_shown: false,
+            orch: sich_orch::OrchSnapshot::default(),
             sidebar_w,
             sidebar_dragging: false,
             git_panel,
             right_panel,
             right_dragging: false,
             hidden_to_tray: false,
+        }
+    }
+
+    fn orch_tick_data(&self) -> orch_watch::TickData {
+        let snap = self.client.snapshot();
+        let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
+        let exe = crate::daemon_host::launcher_exe().map_or_else(|| "sich".to_string(), |p| p.to_string_lossy().into_owned());
+        orch_watch::tick_data(&infos, self.client.terminals_synced(), sich_orch::paths::now_ms(), exe, Instant::now())
+    }
+
+    /// Applies one watcher result: sidebar data, and wake-up pointers typed like a user would
+    /// (a bracketed paste, then Enter a moment later).
+    fn apply_orch(&mut self, out: sich_orch::watch::TickOutput, cx: &mut Context<Self>) {
+        if let Some(snapshot) = out.snapshot {
+            self.orch = snapshot;
+            cx.notify();
+        }
+        for pointer in out.pointers {
+            self.client.send_input(pointer.term, orch_watch::bracketed_paste(&pointer.text));
+            let (client, term) = (self.client.clone(), pointer.term);
+            cx.spawn(async move |_, cx| {
+                cx.background_executor().timer(orch_watch::ENTER_DELAY).await;
+                client.send_input(term, b"\r".to_vec());
+            })
+            .detach();
         }
     }
 
@@ -854,7 +912,7 @@ impl AppView {
                 continue;
             }
             let session = entry.session.clone();
-            let view = cx.new(|cx| TerminalView::new(session, window, cx));
+            let view = cx.new(|cx| TerminalView::new(session, id, window, cx));
             self.views.insert(id, view);
             // A terminal this window asked for: show its workspace and activate it.
             let key = WorkspaceKey::of(entry.info.worktree.as_deref());

@@ -27,6 +27,8 @@ pub struct AppSettings {
     pub agent_hooks: bool,
     /// Track Codex status through hooks in `~/.codex/hooks.json`.
     pub codex_hooks: bool,
+    /// Install the Claude Code skill that teaches a coordinator agent `sich orch`.
+    pub orchestration_skill: bool,
     /// Closing the window hides it to the system tray instead of quitting.
     pub close_to_tray: bool,
     pub resume_agents_on_restore: bool,
@@ -42,6 +44,7 @@ impl Default for AppSettings {
             last_workspace: None,
             agent_hooks: true,
             codex_hooks: true,
+            orchestration_skill: true,
             close_to_tray: true,
             resume_agents_on_restore: true,
             diff_mode: DiffMode::default(),
@@ -145,6 +148,15 @@ pub fn set_codex_hooks(enabled: bool, cx: &mut App) {
         return;
     }
     s.codex_hooks = enabled;
+    store(s, cx);
+}
+
+pub fn set_orchestration_skill(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.orchestration_skill == enabled {
+        return;
+    }
+    s.orchestration_skill = enabled;
     store(s, cx);
 }
 
@@ -262,6 +274,16 @@ mod tests {
         let s = AppSettings { codex_hooks: false, ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(!back.codex_hooks);
+    }
+
+    #[test]
+    fn orchestration_skill_defaults_to_true_and_round_trips() {
+        let old: AppSettings = serde_json::from_str(r#"{"language":"uk"}"#).unwrap();
+        assert!(old.orchestration_skill);
+        assert!(AppSettings::default().orchestration_skill);
+        let off = AppSettings { orchestration_skill: false, ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.orchestration_skill);
     }
 
     #[test]

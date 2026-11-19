@@ -252,6 +252,21 @@ fn worktree_menu(
 }
 
 /// Expand/collapse indicator, shown at the right end of group and project rows.
+/// Small muted "coord" chip shown next to the title of an orchestration coordinator terminal.
+fn coord_chip(show: bool, lang: Language, theme: &gpui_kit::component::Theme) -> Option<Div> {
+    show.then(|| {
+        div()
+            .flex_shrink_0()
+            .px(px(4.))
+            .rounded(px(3.))
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(10.))
+            .text_color(theme.muted_foreground)
+            .child(tr(lang, Tr::OrchCoordinator))
+    })
+}
+
 fn chevron(expanded: bool, color: Hsla) -> Icon {
     Icon::new(if expanded { Ic::ChevronDown } else { Ic::ChevronRight }).small().text_color(color)
 }
@@ -713,6 +728,7 @@ impl AppView {
                     return Some(
                         row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
                             .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
+                            .children(coord_chip(self.orch.is_coordinator(id), lang, &theme))
                             .children(badge)
                             .child(close)
                             .into_any_element(),
@@ -748,6 +764,7 @@ impl AppView {
                             .font_weight(gpui_kit::FontWeight::MEDIUM)
                             .child(title),
                     )
+                    .children(coord_chip(self.orch.is_coordinator(id), lang, &theme))
                     .children(model.map(|m| {
                         div()
                             .flex_shrink_0()
@@ -765,7 +782,8 @@ impl AppView {
                     )
                     .child(close);
                 // No preview -> keep the plain single-line height.
-                let line2 = agent_preview(status).map(|text| {
+                let preview = crate::orch_watch::worker_preview(&self.orch, id, lang, agent_preview(status));
+                let line2 = preview.map(|text| {
                     div()
                         .w_full()
                         .pl(px(PREVIEW_INDENT))

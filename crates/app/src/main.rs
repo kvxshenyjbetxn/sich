@@ -21,6 +21,9 @@ mod i18n;
 mod input;
 mod links;
 mod notifications;
+mod orch_cli;
+mod orch_skill;
+mod orch_watch;
 mod os;
 mod settings;
 mod session;
@@ -54,6 +57,10 @@ fn main() -> anyhow::Result<()> {
     if args.first().is_some_and(|a| a == "hook") {
         sich_hooks::hook_main(args.get(1).map_or("", String::as_str));
     }
+    // `sich orch <cmd>`: the orchestration CLI. Runs in place, never starts the GUI.
+    if args.first().is_some_and(|a| a == "orch") {
+        std::process::exit(orch_cli::run(&args[1..]));
+    }
     // The GUI runs from a private copy so rebuilding the user-facing exe never hits a lock.
     if daemon_host::relocate_gui(&args) {
         return Ok(());
@@ -66,7 +73,7 @@ fn main() -> anyhow::Result<()> {
         ["daemon", "start"] => cli::start_daemon(&socket),
         ["daemon", "stop"] => cli::stop_daemon(&socket),
         _ => {
-            eprintln!("usage: sich [daemon [start|stop]]");
+            eprintln!("usage: sich [daemon [start|stop] | orch <cmd>]");
             std::process::exit(2);
         }
     }
@@ -110,6 +117,7 @@ fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
         theme::apply(cx);
         agent_hooks::startup(cx);
         codex_hooks::startup(cx);
+        orch_skill::startup(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

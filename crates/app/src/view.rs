@@ -14,6 +14,7 @@ use gpui_kit::component::ActiveTheme as _;
 use sich_term::alacritty_terminal::index::{Column, Line, Point, Side};
 use sich_term::alacritty_terminal::selection::SelectionType;
 use sich_term::alacritty_terminal::term::TermMode;
+use sich_proto::TermId;
 use sich_term::{
     KeyMods, MouseAction, MouseButton as TermButton, MouseMods, TermSession,
     key_to_bytes, mouse_report,
@@ -28,6 +29,7 @@ use crate::win_caret::Caret;
 
 pub struct TerminalView {
     session: TermSession,
+    term_id: TermId,
     focus: FocusHandle,
     scroll_rem: f32,
     geometry: SharedGeometry,
@@ -45,7 +47,7 @@ pub struct TerminalView {
 }
 
 impl TerminalView {
-    pub fn new(session: TermSession, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(session: TermSession, term_id: TermId, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         let subs = vec![
             cx.on_focus_in(&focus, window, |this, _w, _cx| this.send_focus(true)),
@@ -53,6 +55,7 @@ impl TerminalView {
         ];
         Self {
             session,
+            term_id,
             focus,
             scroll_rem: 0.0,
             geometry: Rc::new(Cell::new(None)),
@@ -93,6 +96,8 @@ impl TerminalView {
         }
         let session = self.session.clone();
         cx.stop_propagation();
+        // Orchestration must not type a pointer into a terminal the user is typing in.
+        crate::orch_watch::note_user_input(self.term_id);
 
         if m.control && !m.alt {
             let zoom = match ks.key.as_str() {
@@ -148,6 +153,7 @@ impl TerminalView {
         if text.is_empty() {
             return;
         }
+        crate::orch_watch::note_user_input(self.term_id);
         self.session.scroll_to_bottom();
         self.session.write(text.as_bytes().to_vec());
         if self.session.clear_selection() {
@@ -408,6 +414,7 @@ impl TerminalView {
             Self::copy_selection(&session, cx);
             session.clear_selection();
         } else {
+            crate::orch_watch::note_user_input(self.term_id);
             Self::paste_clipboard(&session, cx);
         }
         cx.notify();

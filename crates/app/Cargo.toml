@@ -13,6 +13,7 @@ sich-daemon.workspace = true
 sich-term.workspace = true
 sich-hooks.workspace = true
 sich-git.workspace = true
+sich-orch.workspace = true
 gpui-kit.workspace = true
 alacritty_terminal.workspace = true
 tokio.workspace = true

@@ -11,6 +11,7 @@ use gpui_kit::{
 use crate::agent_hooks;
 use crate::codex_hooks::{self, CodexStatus};
 use crate::i18n::{Language, Tr, tr};
+use crate::orch_skill;
 use crate::settings;
 use crate::theme::{self, ThemeKind};
 
@@ -36,6 +37,15 @@ pub fn open(window: &mut Window, cx: &mut App) {
                             .checked(settings::get(cx).resume_agents_on_restore)
                             .label(tr(lang, Tr::ResumeAgentsOnRestore))
                             .on_click(|checked, _, cx| settings::set_resume_agents_on_restore(*checked, cx)),
+                    )
+                    .child(
+                        Switch::new("orchestration-skill")
+                            .checked(settings::get(cx).orchestration_skill)
+                            .label(tr(lang, Tr::OrchestrationSkill))
+                            .on_click(|checked, _, cx| {
+                                settings::set_orchestration_skill(*checked, cx);
+                                orch_skill::apply(*checked);
+                            }),
                     )
                     .child(
                         Switch::new("close-to-tray")

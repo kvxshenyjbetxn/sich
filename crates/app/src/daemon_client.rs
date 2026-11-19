@@ -220,6 +220,17 @@ impl DaemonClient {
         let _ = self.cmd_tx.send(Cmd::Kill(id));
     }
 
+    /// Types bytes into a terminal (orchestration pointers).
+    pub fn send_input(&self, id: TermId, bytes: Vec<u8>) {
+        let _ = self.cmd_tx.send(Cmd::Input(id, bytes));
+    }
+
+    /// Whether the first terminal list arrived (the list is complete from then on).
+    pub fn terminals_synced(&self) -> bool {
+        let st = self.state.lock();
+        st.synced && matches!(st.status, ConnStatus::Connected { .. })
+    }
+
     /// Tells the daemon the user has looked at the terminal (clears its `unread`).
     pub fn mark_seen(&self, id: TermId) {
         let _ = self.cmd_tx.send(Cmd::MarkSeen(id));
