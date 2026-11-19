@@ -393,3 +393,13 @@ fn a_staged_rename_uses_its_original_blob_until_the_path_is_unstaged() {
         "",
     );
 }
+
+#[test]
+fn longest_line_measures_both_sides_after_tab_expansion_and_control_filtering() {
+    let result = text_model("short\n\tπ\x1b界\r\n", "12345\n");
+    assert_eq!(result.longest_line_columns(), 6);
+    assert_eq!(
+        text_model("", &"x".repeat(5000)).longest_line_columns(),
+        5000
+    );
+}

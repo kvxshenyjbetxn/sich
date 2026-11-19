@@ -148,6 +148,7 @@ pub enum Tr {
     DiffTheirs,
     DiffSideBySide,
     DiffInline,
+    DiffWrapLines,
     DiffPrevious,
     DiffNext,
     DiffBinary,
@@ -268,6 +269,7 @@ impl Tr {
         Tr::DiffTheirs,
         Tr::DiffSideBySide,
         Tr::DiffInline,
+        Tr::DiffWrapLines,
         Tr::DiffPrevious,
         Tr::DiffNext,
         Tr::DiffBinary,
@@ -477,6 +479,11 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Uk => "Поруч",
             Ru => "Рядом",
             En => "Side-by-side",
+        },
+        Tr::DiffWrapLines => match lang {
+            Uk => "Переносити рядки",
+            Ru => "Переносить строки",
+            En => "Wrap lines",
         },
         Tr::DiffInline => match lang {
             Uk => "В одному стовпці",

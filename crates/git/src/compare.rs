@@ -7,7 +7,7 @@ use std::path::Path;
 
 pub use model::{
     Comparison, DiffLineView, Fold, LineEndings, LineKind, Projection, Row, VisibleRow,
-    compare_text,
+    compare_text, display_columns,
 };
 
 use crate::runner::{empty_head, literal_path, text};

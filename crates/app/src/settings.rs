@@ -30,6 +30,7 @@ pub struct AppSettings {
     /// Closing the window hides it to the system tray instead of quitting.
     pub close_to_tray: bool,
     pub(crate) diff_mode: DiffMode,
+    pub(crate) diff_wrap_lines: bool,
 }
 
 impl Default for AppSettings {
@@ -42,6 +43,7 @@ impl Default for AppSettings {
             codex_hooks: true,
             close_to_tray: true,
             diff_mode: DiffMode::default(),
+            diff_wrap_lines: false,
         }
     }
 }
@@ -162,6 +164,14 @@ pub(crate) fn set_diff_mode(mode: DiffMode, cx: &mut App) {
     }
 }
 
+pub(crate) fn set_diff_wrap_lines(wrap: bool, cx: &mut App) {
+    let mut settings = get(cx);
+    if settings.diff_wrap_lines != wrap {
+        settings.diff_wrap_lines = wrap;
+        store(settings, cx);
+    }
+}
+
 pub fn set_theme(kind: ThemeKind, cx: &mut App) {
     let mut s = get(cx);
     if s.theme == kind {
@@ -175,6 +185,15 @@ pub fn set_theme(kind: ThemeKind, cx: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_wrapping_defaults_to_off_and_round_trips() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!old.diff_wrap_lines);
+        let saved = AppSettings { diff_wrap_lines: true, ..old };
+        let text = serde_json::to_string(&saved).unwrap();
+        assert!(serde_json::from_str::<AppSettings>(&text).unwrap().diff_wrap_lines);
+    }
 
     #[test]
     fn diff_mode_defaults_to_side_by_side_and_persists_inline() {

@@ -1,6 +1,7 @@
 //! Background comparison state and virtualized side-by-side and inline views.
 
 mod render;
+mod scroll;
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -8,13 +9,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, ScrollStrategy, UniformListScrollHandle, Window,
+    AppContext as _, Context, Entity, FocusHandle, ListAlignment, ListOffset, ListState,
+    ScrollStrategy, UniformListScrollHandle, Window, point, px,
 };
 use sich_git::compare::{
-    CompareContent, CompareKey, CompareSource, DiffLineView, Fold, Projection,
+    CompareContent, CompareKey, CompareSource, DiffLineView, Fold, Projection, display_columns,
 };
 use sich_git::{GitError, Repo};
 
+use self::scroll::{HorizontalGeometry, ScrollDrag};
 use crate::git_panel::GitPanel;
 use crate::i18n::{Language, Tr, tr};
 use crate::settings::{self, DiffMode};
@@ -28,6 +31,11 @@ pub(crate) struct DiffView {
     panel: Entity<GitPanel>,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
+    wrapped_scroll: Option<ListState>,
+    horizontal_offset: f32,
+    drag: Option<ScrollDrag>,
+    body_width: f32,
+    advance: Option<f32>,
     expanded: HashSet<Fold>,
     projection: Arc<Projection>,
     mode: DiffMode,
@@ -82,6 +90,7 @@ impl DiffView {
             })
             .detach();
         }
+        let settings = settings::get(cx);
         Self {
             id,
             worktree,
@@ -91,9 +100,14 @@ impl DiffView {
             panel,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
+            wrapped_scroll: settings.diff_wrap_lines.then(|| wrapped_list(0)),
+            horizontal_offset: 0.,
+            drag: None,
+            body_width: 0.,
+            advance: None,
             expanded: HashSet::new(),
             projection: Arc::default(),
-            mode: settings::get(cx).diff_mode,
+            mode: settings.diff_mode,
             comparison: None,
             loading: Reload::default(),
             busy,
@@ -124,13 +138,14 @@ impl DiffView {
             let (content, projection, expanded) = task.await;
             let _ = view.update(cx, |view, cx| {
                 if view.comparison.as_deref() != Some(&content) {
-                    view.projection = if view.mode == mode && view.expanded == expanded {
-                        Arc::new(projection)
+                    let projection = if view.mode == mode && view.expanded == expanded {
+                        projection
                     } else {
-                        Arc::new(project(&content, view.mode, &view.expanded))
+                        project(&content, view.mode, &view.expanded)
                     };
-                    view.change = None;
+                    view.replace_projection(projection);
                     view.comparison = Some(Arc::new(content));
+                    view.clamp_horizontal_offset();
                     cx.notify();
                 }
                 if view.loading.finish() {
@@ -155,8 +170,21 @@ impl DiffView {
 
     fn rebuild_projection(&mut self) {
         if let Some(content) = &self.comparison {
-            self.projection = Arc::new(project(content, self.mode, &self.expanded));
+            self.replace_projection(project(content, self.mode, &self.expanded));
         }
+    }
+
+    fn replace_projection(&mut self, projection: Projection) {
+        if let Some(list) = &self.wrapped_scroll {
+            if list.item_count() == projection.len() {
+                list.remeasure();
+            } else {
+                let top = list.logical_scroll_top();
+                list.reset(projection.len());
+                list.scroll_to(top);
+            }
+        }
+        self.projection = Arc::new(projection);
         self.change = None;
     }
 
@@ -172,17 +200,96 @@ impl DiffView {
         if self.mode != mode {
             self.mode = mode;
             self.rebuild_projection();
+            self.clamp_horizontal_offset();
             cx.notify();
         }
     }
 
-    fn navigate(&mut self, next: bool, cx: &mut Context<Self>) {
+    fn vertical_anchor(&self) -> ListOffset {
+        if let Some(list) = &self.wrapped_scroll {
+            return list.logical_scroll_top();
+        }
         let offset = self.scroll.0.borrow().base_handle.offset().y;
-        let top = (-f32::from(offset) / render::ROW_H).max(0.) as usize;
+        fixed_anchor(-f32::from(offset))
+    }
+
+    fn toggle_wrap(&mut self, cx: &mut Context<Self>) {
+        let anchor = self.vertical_anchor();
+        let wrap = self.wrapped_scroll.is_none();
+        settings::set_diff_wrap_lines(wrap, cx);
+        self.drag = None;
+        if wrap {
+            let list = wrapped_list(self.projection.len());
+            list.scroll_to(anchor);
+            self.wrapped_scroll = Some(list);
+        } else {
+            self.wrapped_scroll = None;
+            let handle = self.scroll.0.borrow().base_handle.clone();
+            handle.set_offset(point(px(0.), px(-fixed_offset(anchor))));
+            self.clamp_horizontal_offset();
+        }
+        cx.notify();
+    }
+
+    fn navigate(&mut self, next: bool, cx: &mut Context<Self>) {
+        let top = self.vertical_anchor().item_ix;
         if let Some(row) = change_destination(self.projection.changes(), self.change, top, next) {
             self.change = Some(row);
-            self.scroll
-                .scroll_to_item_strict(row, ScrollStrategy::Center);
+            if let Some(list) = &self.wrapped_scroll {
+                list.scroll_to(ListOffset {
+                    item_ix: row,
+                    offset_in_item: px(0.),
+                });
+            } else {
+                self.scroll
+                    .scroll_to_item_strict(row, ScrollStrategy::Center);
+            }
+            cx.notify();
+        }
+    }
+
+    fn measure_advance(&mut self, window: &Window) {
+        if self.advance.is_none() {
+            let text = window.text_system();
+            let font = text.resolve_font(&gpui_kit::font(render::FONT));
+            let size = render::FONT_SIZE;
+            let advance = text
+                .advance(font, px(size), '0')
+                .ok()
+                .map(|size| f32::from(size.width));
+            self.advance = Some(advance.filter(|&width| width > 0.).unwrap_or(size * 0.6));
+        }
+    }
+
+    fn geometry(&self) -> HorizontalGeometry {
+        let columns = match self.comparison.as_deref() {
+            Some(Ok(CompareContent::Text(comparison))) => comparison.longest_line_columns(),
+            _ => 0,
+        };
+        HorizontalGeometry {
+            content: columns as f32 * self.advance.unwrap_or_default(),
+            viewport: render::code_viewport_width(self.body_width, self.mode),
+        }
+    }
+
+    fn clamp_horizontal_offset(&mut self) {
+        self.horizontal_offset = self.geometry().clamp(self.horizontal_offset);
+    }
+
+    fn set_body_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        if self.body_width != width {
+            self.body_width = width;
+            if self.wrapped_scroll.is_none() {
+                self.clamp_horizontal_offset();
+            }
+            cx.notify();
+        }
+    }
+
+    fn set_horizontal_offset(&mut self, offset: f32, cx: &mut Context<Self>) {
+        let offset = self.geometry().clamp(offset);
+        if self.horizontal_offset != offset {
+            self.horizontal_offset = offset;
             cx.notify();
         }
     }
@@ -205,6 +312,25 @@ impl DiffView {
         });
         cx.notify();
     }
+}
+
+fn wrapped_list(count: usize) -> ListState {
+    ListState::new(count, ListAlignment::Top, px(160.))
+}
+
+fn fixed_anchor(offset: f32) -> ListOffset {
+    let offset = offset.max(0.);
+    let row_height = render::ROW_H;
+    ListOffset {
+        item_ix: (offset / row_height).floor() as usize,
+        offset_in_item: px(offset % row_height),
+    }
+}
+
+fn fixed_offset(anchor: ListOffset) -> f32 {
+    let row_height = render::ROW_H;
+    let within = f32::from(anchor.offset_in_item).clamp(0., row_height - 1.);
+    anchor.item_ix as f32 * row_height + within
 }
 
 fn project(
@@ -254,21 +380,36 @@ pub(crate) fn source_label(source: &CompareSource, lang: Language) -> &str {
     }
 }
 
-fn code_text(line: DiffLineView<'_>) -> (String, Vec<Range<usize>>) {
+fn code_text(
+    line: DiffLineView<'_>,
+    columns: Option<&Range<usize>>,
+) -> (String, Vec<Range<usize>>) {
     let mut text = String::new();
     let mut highlights: Vec<Range<usize>> = Vec::new();
     let mut emphasis = line.emphasis.unwrap_or_default().iter().peekable();
     let whole_line = line.emphasis.is_none() && line.kind == sich_git::compare::LineKind::Changed;
-    // The view clips horizontally. Bound text shaping work for very long single lines.
-    for (offset, ch) in line.text.char_indices().take(4096) {
+    let columns = columns.cloned().unwrap_or(0..usize::MAX);
+    let mut column = 0;
+    for (offset, ch) in line.text.char_indices() {
+        let start_column = column;
+        let width = display_columns(ch);
+        column += width;
+        if start_column >= columns.end {
+            break;
+        }
+        if width == 0 || column <= columns.start {
+            continue;
+        }
         while emphasis.peek().is_some_and(|range| range.end <= offset) {
             emphasis.next();
         }
         let emphasized = emphasis.peek().is_some_and(|range| range.start <= offset);
         let start = text.len();
         match ch {
-            '\t' => text.push_str("    "),
-            ch if ch.is_control() => continue,
+            '\t' => {
+                let visible = column.min(columns.end) - start_column.max(columns.start);
+                text.push_str(&"    "[..visible]);
+            }
             ch => text.push(ch),
         }
         if emphasized || whole_line {
@@ -308,6 +449,49 @@ mod tests {
     }
 
     #[test]
+    fn code_text_keeps_lines_longer_than_four_thousand_characters() {
+        let text = format!("{}last", "x".repeat(5000));
+        let line = DiffLineView {
+            number: 1,
+            text: &text,
+            kind: LineKind::Same,
+            emphasis: None,
+        };
+        assert_eq!(code_text(line, None).0, text);
+    }
+
+    #[test]
+    fn horizontal_window_can_shape_the_end_and_partial_tabs() {
+        let text = format!("{}tail", "x".repeat(5000));
+        let line = DiffLineView {
+            number: 1,
+            text: &text,
+            kind: LineKind::Same,
+            emphasis: None,
+        };
+        assert_eq!(code_text(line, Some(&(5000..5004))).0, "tail");
+        let line = DiffLineView {
+            text: "\tπ",
+            emphasis: Some(&[0..3]),
+            ..line
+        };
+        assert_eq!(code_text(line, Some(&(2..5))), ("  π".into(), vec![0..4]));
+    }
+
+    #[test]
+    fn switching_wrap_keeps_the_top_logical_row() {
+        let anchor = fixed_anchor(47.);
+        assert_eq!(anchor.item_ix, 2);
+        assert_eq!(anchor.offset_in_item, px(9.));
+        assert_eq!(fixed_offset(anchor), 47.);
+        let wrapped = ListOffset {
+            item_ix: 2,
+            offset_in_item: px(180.),
+        };
+        assert_eq!(fixed_anchor(fixed_offset(wrapped)).item_ix, 2);
+    }
+
+    #[test]
     fn code_text_expands_tabs_and_remaps_highlights_around_control_characters() {
         let line = DiffLineView {
             number: 1,
@@ -315,19 +499,19 @@ mod tests {
             kind: LineKind::Changed,
             emphasis: Some(&[1..8]),
         };
-        assert_eq!(code_text(line), ("    π界".into(), vec![4..9]));
+        assert_eq!(code_text(line, None), ("    π界".into(), vec![4..9]));
         let line = DiffLineView {
             text: "same\r\n",
             emphasis: Some(&[4..6]),
             ..line
         };
-        assert_eq!(code_text(line), ("same".into(), Vec::new()));
+        assert_eq!(code_text(line, None), ("same".into(), Vec::new()));
         let line = DiffLineView {
             text: "\0before\x07\u{7f}after",
             kind: LineKind::Same,
             emphasis: None,
             ..line
         };
-        assert_eq!(code_text(line), ("beforeafter".into(), Vec::new()));
+        assert_eq!(code_text(line, None), ("beforeafter".into(), Vec::new()));
     }
 }

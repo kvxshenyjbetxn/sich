@@ -15,6 +15,7 @@ gpui_kit::assets::icon_assets!(ExtraIcons, [
     FileDiff,
     Columns2,
     Rows2,
+    TextWrap,
     Plus,
     RefreshCw,
     Ellipsis,

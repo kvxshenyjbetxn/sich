@@ -110,6 +110,7 @@ impl Projection {
 struct Document {
     text: String,
     starts: Vec<usize>,
+    longest_line: usize,
 }
 
 impl Document {
@@ -128,13 +129,26 @@ impl Document {
     }
 }
 
-fn offsets(lines: &[&str]) -> Vec<usize> {
-    std::iter::once(0)
-        .chain(lines.iter().scan(0, |start, line| {
-            *start += line.len();
-            Some(*start)
-        }))
-        .collect()
+/// Width in the diff viewer's monospace columns.
+pub fn display_columns(ch: char) -> usize {
+    match ch {
+        '\t' => 4,
+        ch if ch.is_control() => 0,
+        _ => 1,
+    }
+}
+
+fn document_layout(lines: &[&str]) -> (Vec<usize>, usize) {
+    let mut starts = Vec::with_capacity(lines.len() + 1);
+    let mut longest_line = 0;
+    let mut start = 0;
+    starts.push(start);
+    for line in lines {
+        start += line.len();
+        starts.push(start);
+        longest_line = longest_line.max(line.chars().map(display_columns).sum());
+    }
+    (starts, longest_line)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -192,6 +206,10 @@ pub struct Comparison {
 }
 
 impl Comparison {
+    pub fn longest_line_columns(&self) -> usize {
+        self.old.longest_line.max(self.new.longest_line)
+    }
+
     pub fn line_ending_change(&self) -> Option<(LineEndings, LineEndings)> {
         let (old, new) = (self.old_endings, self.new_endings);
         let different_styles = old != new && old != LineEndings::None && new != LineEndings::None;
@@ -335,16 +353,18 @@ pub fn compare_text(old: String, new: String) -> Comparison {
         aligned += block.len();
         blocks.push(block);
     }
-    let old_offsets = offsets(diff.old_slices());
-    let new_offsets = offsets(diff.new_slices());
+    let (old_offsets, old_width) = document_layout(diff.old_slices());
+    let (new_offsets, new_width) = document_layout(diff.new_slices());
     Comparison {
         old: Document {
             text: old,
             starts: old_offsets,
+            longest_line: old_width,
         },
         new: Document {
             text: new,
             starts: new_offsets,
+            longest_line: new_width,
         },
         blocks,
         added,
