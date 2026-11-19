@@ -4,7 +4,7 @@ use std::borrow::Cow;
 
 use gpui_kit::{AssetSource, SharedString};
 
-gpui_kit::assets::icon_assets!(ExtraIcons, [SquareTerminal]);
+gpui_kit::assets::icon_assets!(ExtraIcons, [SquareTerminal, Settings]);
 
 pub struct AppAssets;
 
