@@ -27,16 +27,33 @@ const KNOWN_CLAUDE_EVENTS: &[&str] = &[
     "Elicitation",
     "Stop",
     "StopFailure",
+    "SubagentStop",
+    "PostModelSwitch",
 ];
 
-/// The fields we use from a Claude hook payload.
+/// Prompt / assistant message / session title are cut to this many characters.
+pub const MAX_TEXT_CHARS: usize = 400;
+
+/// The fields we use from a Claude hook payload (only documented hook input fields).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeHook {
     pub event: String,
     pub tool_name: Option<String>,
+    /// Ready-made label for the tool call: `Bash: <command>`, `Edit: <file name>`.
+    pub tool_label: Option<String>,
     pub notification_type: Option<String>,
     pub message: Option<String>,
     pub error: Option<String>,
+    /// `SessionStart.model`.
+    pub model: Option<String>,
+    /// `PostModelSwitch.to_model`.
+    pub to_model: Option<String>,
+    /// `SessionStart.session_title`.
+    pub session_title: Option<String>,
+    /// `UserPromptSubmit.prompt`, normalized.
+    pub prompt: Option<String>,
+    /// `Stop` / `SubagentStop` / `StopFailure` `last_assistant_message`, normalized.
+    pub last_assistant_message: Option<String>,
 }
 
 impl ClaudeHook {
@@ -45,17 +62,94 @@ impl ClaudeHook {
     }
 }
 
+/// Cuts at `max` chars on a char boundary, appending "…" when something was removed.
+fn cap_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Replaces every `<pasted_content …>…</pasted_content>` block with "[…]" (an unclosed block
+/// swallows the rest of the text).
+fn strip_pasted(s: &str) -> String {
+    const OPEN: &str = "<pasted_content";
+    const CLOSE: &str = "</pasted_content>";
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        out.push_str("[\u{2026}]");
+        let after = &rest[start..];
+        match after.find(CLOSE) {
+            Some(end) => rest = &after[end + CLOSE.len()..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Normalizes free text for display: optionally strips pasted blocks, collapses all whitespace
+/// to single spaces, trims, caps at [`MAX_TEXT_CHARS`]. Empty → `None`.
+pub fn normalize_text(s: &str, strip_pasted_blocks: bool) -> Option<String> {
+    let stripped;
+    let s = if strip_pasted_blocks {
+        stripped = strip_pasted(s);
+        stripped.as_str()
+    } else {
+        s
+    };
+    let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() { None } else { Some(cap_chars(&collapsed, MAX_TEXT_CHARS)) }
+}
+
+fn file_name_of(path: &str) -> Option<String> {
+    let name = path.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next()?.trim();
+    if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// `Bash: <command>` for Bash, `<Tool>: <file name>` for file tools, `None` otherwise.
+pub fn tool_label(tool: &str, input: Option<&serde_json::Map<String, serde_json::Value>>) -> Option<String> {
+    let input = input?;
+    let text = |k: &str| input.get(k).and_then(|x| x.as_str());
+    match tool {
+        "Bash" => Some(format!("{tool}: {}", normalize_text(text("command")?, false)?)),
+        "Edit" | "MultiEdit" | "Write" | "Read" => {
+            Some(format!("{tool}: {}", file_name_of(text("file_path")?)?))
+        }
+        "NotebookEdit" => Some(format!("{tool}: {}", file_name_of(text("notebook_path")?)?)),
+        _ => None,
+    }
+}
+
 /// Parses the hook stdin JSON. `None` if it is not a JSON object with `hook_event_name`.
 pub fn parse_claude_payload(json: &str) -> Option<ClaudeHook> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
     let obj = v.as_object()?;
     let get = |k: &str| obj.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let nonempty = |k: &str| get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let tool_name = get("tool_name");
+    let tool_label = tool_name
+        .as_deref()
+        .and_then(|t| tool_label(t, obj.get("tool_input").and_then(|x| x.as_object())));
     Some(ClaudeHook {
         event: get("hook_event_name")?,
-        tool_name: get("tool_name"),
+        tool_name,
+        tool_label,
         notification_type: get("notification_type"),
         message: get("message"),
         error: get("error"),
+        model: nonempty("model"),
+        to_model: nonempty("to_model"),
+        session_title: get("session_title").and_then(|s| normalize_text(&s, false)),
+        prompt: get("prompt").and_then(|s| normalize_text(&s, true)),
+        last_assistant_message: get("last_assistant_message").and_then(|s| normalize_text(&s, false)),
     })
 }
 
@@ -96,7 +190,12 @@ fn settle(
         Some(p) if p.kind == kind && p.state == state => p.since_unix_ms,
         _ => now,
     };
-    Some(AgentStatus { kind, state, unread, since_unix_ms: since, detail })
+    // Model, title, prompt and message are sticky within one agent session.
+    let (model, title, prompt, message) = match &prev {
+        Some(p) if p.kind == kind => (p.model.clone(), p.title.clone(), p.prompt.clone(), p.message.clone()),
+        _ => (None, None, None, None),
+    };
+    Some(AgentStatus { kind, state, unread, since_unix_ms: since, detail, model, title, prompt, message })
 }
 
 /// All transitions. Returns the new status; equal to `prev` when nothing changed.
@@ -129,7 +228,21 @@ pub fn apply(prev: Option<AgentStatus>, input: AgentInput<'_>, now: u64) -> Opti
 
 fn apply_claude(prev: Option<AgentStatus>, h: &ClaudeHook, now: u64) -> Option<AgentStatus> {
     let kind = AgentKind::Claude;
-    let tool = non_empty(&h.tool_name);
+    let tool = h.tool_label.as_ref().or(h.tool_name.as_ref()).map(|t| clip(t)).filter(|t| !t.is_empty());
+    match h.event.as_str() {
+        // Only record the model / the subagent's final message; the state does not change.
+        "PostModelSwitch" | "SubagentStop" => {
+            let mut p = prev?;
+            if let Some(m) = &h.to_model {
+                p.model = Some(m.clone());
+            }
+            if h.event == "SubagentStop" && h.last_assistant_message.is_some() {
+                p.message = h.last_assistant_message.clone();
+            }
+            return Some(p);
+        }
+        _ => {}
+    }
     let (state, unread, detail) = match h.event.as_str() {
         "SessionEnd" => return None,
         "SessionStart" => (AgentState::Idle, false, None),
@@ -158,7 +271,28 @@ fn apply_claude(prev: Option<AgentStatus>, h: &ClaudeHook, now: u64) -> Option<A
         "StopFailure" => (AgentState::Failed, true, non_empty(&h.error)),
         _ => return prev,
     };
-    settle(prev, kind, state, unread, detail, now)
+    let mut s = settle(prev, kind, state, unread, detail, now)?;
+    if let Some(m) = &h.model {
+        s.model = Some(m.clone());
+    }
+    if let Some(t) = &h.session_title {
+        s.title = Some(t.clone());
+    }
+    match h.event.as_str() {
+        "UserPromptSubmit" => {
+            if h.prompt.is_some() {
+                s.prompt = h.prompt.clone();
+            }
+            s.message = None;
+        }
+        "Stop" | "StopFailure" => {
+            if h.last_assistant_message.is_some() {
+                s.message = h.last_assistant_message.clone();
+            }
+        }
+        _ => {}
+    }
+    Some(s)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,7 +424,170 @@ mod tests {
             unread: false,
             since_unix_ms: T0,
             detail: None,
+            model: None,
+            title: None,
+            prompt: None,
+            message: None,
         })
+    }
+
+    fn json_str(s: &str) -> String {
+        serde_json::to_string(s).unwrap()
+    }
+
+    #[test]
+    fn normalize_collapses_whitespace_and_trims() {
+        assert_eq!(normalize_text("  a \n\n b\t\tc  ", false).as_deref(), Some("a b c"));
+        assert_eq!(normalize_text("   \n\t ", false), None);
+        assert_eq!(normalize_text("", true), None);
+    }
+
+    #[test]
+    fn normalize_caps_on_char_boundary() {
+        let long = "ї".repeat(MAX_TEXT_CHARS + 50);
+        let out = normalize_text(&long, false).unwrap();
+        assert_eq!(out.chars().count(), MAX_TEXT_CHARS + 1);
+        assert!(out.ends_with('\u{2026}'));
+        let exact = "x".repeat(MAX_TEXT_CHARS);
+        assert_eq!(normalize_text(&exact, false).unwrap(), exact);
+    }
+
+    #[test]
+    fn normalize_strips_pasted_blocks_only_when_asked() {
+        let text = "look at this\n<pasted_content id=\"1\">\nline1\nline2\n</pasted_content>\nand <pasted_content id=\"2\">x</pasted_content> done";
+        assert_eq!(normalize_text(text, true).as_deref(), Some("look at this [\u{2026}] and [\u{2026}] done"));
+        assert!(normalize_text(text, false).unwrap().contains("line1 line2"));
+        // Unclosed block swallows the rest.
+        assert_eq!(normalize_text("a <pasted_content id=\"1\">zzz", true).as_deref(), Some("a [\u{2026}]"));
+        // Only a pasted block.
+        assert_eq!(normalize_text("<pasted_content id=\"1\">q</pasted_content>", true).as_deref(), Some("[\u{2026}]"));
+    }
+
+    #[test]
+    fn session_start_model_and_title() {
+        let s = run(None, "SessionStart", r#","model":"claude-opus-5-5","session_title":"Sync  phone""#, T0).unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(s.title.as_deref(), Some("Sync phone"));
+        // Absent (or empty) model/title are fine.
+        let s = run(None, "SessionStart", r#","model":"""#, T0).unwrap();
+        assert_eq!((s.model, s.title), (None, None));
+    }
+
+    #[test]
+    fn model_and_title_are_sticky_until_session_end() {
+        let s = run(None, "SessionStart", r#","model":"claude-opus-5-5","session_title":"T""#, T0);
+        let s = run(s, "UserPromptSubmit", r#","prompt":"hi""#, T0 + 1);
+        let s = run(s, "PreToolUse", r#","tool_name":"Bash""#, T0 + 2);
+        let s = run(s, "Stop", "", T0 + 3);
+        let s = run(s, "Notification", r#","message":"x""#, T0 + 4).unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(s.title.as_deref(), Some("T"));
+        // A later SessionStart without model keeps them.
+        let s = run(Some(s), "SessionStart", "", T0 + 5).unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-opus-5-5"));
+        // Present again: replaced.
+        let s = run(Some(s), "SessionStart", r#","model":"claude-sonnet-5-5""#, T0 + 6).unwrap();
+        assert_eq!(s.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(run(Some(s), "SessionEnd", "", T0 + 7), None);
+        let fresh = run(None, "SessionStart", "", T0 + 8).unwrap();
+        assert_eq!((fresh.model, fresh.title), (None, None));
+    }
+
+    #[test]
+    fn post_model_switch_updates_model_only() {
+        let s = run(None, "SessionStart", r#","model":"claude-opus-5-5""#, T0);
+        let w = run(s, "UserPromptSubmit", r#","prompt":"p""#, T0 + 1);
+        let sw = run(w.clone(), "PostModelSwitch", r#","from_model":"a","to_model":"claude-sonnet-5-5""#, T0 + 2).unwrap();
+        assert_eq!(sw.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(sw.state, AgentState::Working);
+        assert_eq!(sw.since_unix_ms, w.unwrap().since_unix_ms);
+        assert_eq!(sw.prompt.as_deref(), Some("p"));
+        // Without status it creates nothing; without to_model nothing changes.
+        assert_eq!(run(None, "PostModelSwitch", r#","to_model":"m""#, T0), None);
+        let same = run(Some(sw.clone()), "PostModelSwitch", "", T0 + 3);
+        assert_eq!(same, Some(sw));
+    }
+
+    #[test]
+    fn prompt_is_normalized_sticky_and_clears_message() {
+        let pasted = r#","prompt":"fix\n\nthis\n<pasted_content id=\"1\">\nbig\n</pasted_content>""#;
+        let s = run(None, "UserPromptSubmit", pasted, T0).unwrap();
+        assert_eq!(s.prompt.as_deref(), Some("fix this [\u{2026}]"));
+        let s = run(Some(s), "PreToolUse", r#","tool_name":"Bash""#, T0 + 1);
+        let s = run(s, "Stop", r#","last_assistant_message":"all\ndone""#, T0 + 2).unwrap();
+        assert_eq!(s.prompt.as_deref(), Some("fix this [\u{2026}]"), "kept after Stop");
+        assert_eq!(s.message.as_deref(), Some("all done"));
+        // New turn: message cleared, prompt replaced.
+        let s = run(Some(s), "UserPromptSubmit", r#","prompt":"next""#, T0 + 3).unwrap();
+        assert_eq!(s.prompt.as_deref(), Some("next"));
+        assert_eq!(s.message, None);
+        // Prompt-less submit keeps the previous prompt but still clears the message.
+        let s = run(Some(s), "UserPromptSubmit", "", T0 + 4).unwrap();
+        assert_eq!(s.prompt.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn message_set_on_stop_failure_and_subagent_stop() {
+        let s = run(st(AgentState::Working), "StopFailure", r#","error":"rate_limit","last_assistant_message":"API Error: 529""#, T0 + 1).unwrap();
+        assert_eq!(s.message.as_deref(), Some("API Error: 529"));
+        assert_eq!(s.detail.as_deref(), Some("rate_limit"));
+        let w = run(None, "UserPromptSubmit", r#","prompt":"p""#, T0);
+        let s = run(w, "SubagentStop", r#","last_assistant_message":"sub done""#, T0 + 1).unwrap();
+        assert_eq!(s.message.as_deref(), Some("sub done"));
+        assert_eq!(s.state, AgentState::Working);
+        // Messages stay after notification / tool events.
+        let s = run(Some(s), "Notification", r#","message":"n""#, T0 + 2).unwrap();
+        assert_eq!(s.message.as_deref(), Some("sub done"));
+        // Stop without a message does not invent one.
+        let s = run(run(None, "UserPromptSubmit", "", T0), "Stop", "", T0 + 1).unwrap();
+        assert_eq!(s.message, None);
+    }
+
+    #[test]
+    fn tool_detail_for_bash_and_file_tools() {
+        let s = run(None, "PreToolUse", r#","tool_name":"Bash","tool_input":{"command":"cargo  test\n  -p x"}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("Bash: cargo test -p x"));
+        for (tool, key) in [("Edit", "file_path"), ("Write", "file_path"), ("Read", "file_path")] {
+            let extra = format!(r#","tool_name":"{tool}","tool_input":{{"{key}":"C:\\dev\\p\\src\\main.rs"}}"#);
+            let s = run(None, "PreToolUse", &extra, T0).unwrap();
+            assert_eq!(s.detail, Some(format!("{tool}: main.rs")));
+        }
+        let s = run(None, "PreToolUse", r#","tool_name":"Edit","tool_input":{"file_path":"/a/b/c.txt"}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("Edit: c.txt"));
+        // Other tools and missing input fall back to the tool name.
+        let s = run(None, "PreToolUse", r#","tool_name":"Grep","tool_input":{"pattern":"x"}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("Grep"));
+        let s = run(None, "PreToolUse", r#","tool_name":"Bash","tool_input":{}"#, T0).unwrap();
+        assert_eq!(s.detail.as_deref(), Some("Bash"));
+    }
+
+    #[test]
+    fn long_bash_command_is_clipped() {
+        let cmd = "a".repeat(500);
+        let extra = format!(r#","tool_name":"Bash","tool_input":{{"command":{}}}"#, json_str(&cmd));
+        let s = run(None, "PreToolUse", &extra, T0).unwrap();
+        assert_eq!(s.detail.unwrap().chars().count(), MAX_DETAIL_CHARS);
+    }
+
+    #[test]
+    fn parse_new_fields() {
+        let h = hook(&payload(
+            "Stop",
+            r#","model":"m1","to_model":"m2","session_title":" t ","prompt":" p ","last_assistant_message":" a  b ""#,
+        ));
+        assert_eq!(h.model.as_deref(), Some("m1"));
+        assert_eq!(h.to_model.as_deref(), Some("m2"));
+        assert_eq!(h.session_title.as_deref(), Some("t"));
+        assert_eq!(h.prompt.as_deref(), Some("p"));
+        assert_eq!(h.last_assistant_message.as_deref(), Some("a b"));
+        assert!(h.is_known());
+        let bare = hook(&payload("Stop", ""));
+        assert_eq!(
+            (bare.model, bare.to_model, bare.session_title, bare.prompt, bare.last_assistant_message),
+            (None, None, None, None, None)
+        );
+        assert!(hook(&payload("PostModelSwitch", "")).is_known());
+        assert!(hook(&payload("SubagentStop", "")).is_known());
     }
 
     fn state_of(s: &Option<AgentStatus>) -> AgentState {

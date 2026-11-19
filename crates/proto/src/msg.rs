@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTO_VERSION: u32 = 4;
+pub const PROTO_VERSION: u32 = 5;
 
 /// Maximum payload of a single `ServerMsg::Output` frame.
 pub const MAX_OUTPUT_CHUNK: usize = 64 * 1024;
@@ -105,6 +105,14 @@ pub struct AgentStatus {
     pub since_unix_ms: u64,
     /// Short (<= 120 chars): a tool name or a notification message.
     pub detail: Option<String>,
+    /// Model id as reported by Claude Code (`SessionStart.model`, `PostModelSwitch.to_model`).
+    pub model: Option<String>,
+    /// Session title (`SessionStart.session_title`).
+    pub title: Option<String>,
+    /// Last user prompt (normalized, <= 400 chars).
+    pub prompt: Option<String>,
+    /// Last assistant message, or the failure text for `Failed` (normalized, <= 400 chars).
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

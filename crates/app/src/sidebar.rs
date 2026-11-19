@@ -10,23 +10,32 @@ use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     ClickEvent, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, PathPromptOptions, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, div, px,
+    StatefulInteractiveElement as _, Styled as _, div, px, rgb,
 };
 use sich_proto::{GroupId, GroupInfo, ProjectId, ProjectInfo, TermId, TerminalInfo, WorktreeInfo};
 
-use crate::agent_badge::{Badge, badge_element, badge_for, rollup};
+use crate::agent_badge::{
+    Badge, agent_glyph, agent_preview, badge_element, badge_for, rollup, shorten_model,
+};
 use crate::app_view::AppView;
 use crate::daemon_client::Snapshot;
 use crate::group_dialogs;
 use crate::groups::{group_badge, group_projects};
-use crate::i18n::{Language, Tr, tr};
+use crate::i18n::{Language, Tr, relative_time, tr};
 use crate::os;
 use crate::tab_bar::{entry_title, tab_label};
 use crate::workspace::{WorkspaceKey, same_path, terminals_in};
 use crate::worktree_dialogs::{self, WorktreeRef};
 
-pub const SIDEBAR_W: f32 = 260.;
+pub const SIDEBAR_W: f32 = 300.;
 const ROW_H: f32 = 28.;
+/// Height of a terminal row that shows an agent (title line + preview line).
+const AGENT_ROW_H: f32 = 44.;
+const BADGE_SLOT_W: f32 = 14.;
+const GLYPH_SLOT_W: f32 = 12.;
+const ROW_GAP: f32 = 6.;
+/// Preview line indent: under the title (badge slot + glyph slot + two gaps).
+const PREVIEW_INDENT: f32 = BADGE_SLOT_W + GLYPH_SLOT_W + ROW_GAP * 2.;
 const INDENT: f32 = 20.;
 
 /// Branch name, or the folder name when detached / not a git project.
@@ -51,10 +60,19 @@ pub fn workspace_badge(key: &WorkspaceKey, infos: &[TerminalInfo]) -> Option<Bad
     )
 }
 
-/// Terminals shown as a nested sub-list under `key`: only when it has 2 or more (tab-bar order).
+/// Terminals shown as a nested sub-list under `key` (tab-bar order): when it has 2 or more, or
+/// any of them runs an agent (so a single agent terminal still gets its rich row).
 pub fn sub_list_ids(key: &WorkspaceKey, infos: &[TerminalInfo]) -> Vec<TermId> {
     let ids = terminals_in(key, infos);
-    if ids.len() >= 2 { ids } else { Vec::new() }
+    let has_agent = ids.iter().any(|id| infos.iter().any(|t| t.id == *id && t.agent.is_some()));
+    if ids.len() >= 2 || has_agent { ids } else { Vec::new() }
+}
+
+/// Wall-clock time for relative ages.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// `(highlighted, shows_rollup_badge)` of a workspace row. With a sub-list the active child
@@ -644,25 +662,82 @@ impl AppView {
                         this.client.kill_terminal(id);
                         cx.stop_propagation();
                     }));
+                let close = div().invisible().group_hover(group.clone(), |s| s.visible()).child(close);
                 let key = key.clone();
+                let row = row_base(("side-term", id), selected, indent, &theme)
+                    .group(group.clone())
+                    .text_color(if exited { muted } else { theme.sidebar_foreground })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.activate_terminal_in(key.clone(), id, window, cx)
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, _w, cx| {
+                            this.client.kill_terminal(id);
+                            cx.stop_propagation();
+                        }),
+                    );
+                let Some(status) = entry.info.agent.as_ref() else {
+                    return Some(
+                        row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
+                            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
+                            .children(badge)
+                            .child(close),
+                    );
+                };
+                let (glyph, glyph_color) = agent_glyph(status.kind);
+                let glyph_color: Hsla = glyph_color.map_or(muted, |c| rgb(c).into());
+                let title = status.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or(label);
+                let model = status.model.as_deref().map(shorten_model).filter(|m| !m.is_empty());
+                let line1 = h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap(px(ROW_GAP))
+                    .child(div().flex_shrink_0().w(px(BADGE_SLOT_W)).children(badge))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .w(px(GLYPH_SLOT_W))
+                            .text_size(px(13.))
+                            .text_color(glyph_color)
+                            .child(glyph),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.5))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .child(title),
+                    )
+                    .children(model.map(|m| {
+                        div()
+                            .flex_shrink_0()
+                            .font_family("Cascadia Mono")
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(m)
+                    }))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(relative_time(lang, now_unix_ms(), status.since_unix_ms)),
+                    )
+                    .child(close);
+                let line2 = div()
+                    .w_full()
+                    .pl(px(PREVIEW_INDENT))
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.5))
+                    .text_color(muted)
+                    .children(agent_preview(status));
                 Some(
-                    row_base(("side-term", id), selected, indent, &theme)
-                        .group(group.clone())
-                        .text_color(if exited { muted } else { theme.sidebar_foreground })
-                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                            this.activate_terminal_in(key.clone(), id, window, cx)
-                        }))
-                        .on_mouse_down(
-                            MouseButton::Middle,
-                            cx.listener(move |this, _, _w, cx| {
-                                this.client.kill_terminal(id);
-                                cx.stop_propagation();
-                            }),
-                        )
-                        .child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
-                        .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
-                        .children(badge)
-                        .child(div().invisible().group_hover(group, |s| s.visible()).child(close)),
+                    row.h(px(AGENT_ROW_H))
+                        .child(v_flex().flex_1().min_w_0().gap(px(2.)).child(line1).child(line2)),
                 )
             })
             .collect()
@@ -712,6 +787,10 @@ mod tests {
                 unread,
                 since_unix_ms: 1,
                 detail: None,
+                model: None,
+                title: None,
+                prompt: None,
+                message: None,
             }),
         }
     }
@@ -744,6 +823,24 @@ mod tests {
         assert!(sub_list_ids(&a, &[]).is_empty());
         let infos = vec![term(1, Some("/w/a"), None), term(2, Some("/w/b"), None)];
         assert!(sub_list_ids(&a, &infos).is_empty());
+    }
+
+    #[test]
+    fn sub_list_shown_for_a_single_agent_terminal() {
+        let a = WorkspaceKey::Worktree("/w/a".into());
+        let infos = vec![
+            term(1, Some("/w/a"), Some((AgentState::Idle, false))),
+            term(2, Some("/w/b"), None),
+        ];
+        assert_eq!(sub_list_ids(&a, &infos), vec![1]);
+        // The agent in another workspace does not count.
+        assert!(sub_list_ids(&WorkspaceKey::Worktree("/w/b".into()), &infos).is_empty());
+        assert!(sub_list_ids(&WorkspaceKey::Home, &infos).is_empty());
+        // Two terminals, one with an agent: both listed.
+        let infos = vec![term(1, None, None), term(2, None, Some((AgentState::Working, false)))];
+        assert_eq!(sub_list_ids(&WorkspaceKey::Home, &infos), vec![1, 2]);
+        // A single agent-free terminal stays hidden.
+        assert!(sub_list_ids(&WorkspaceKey::Home, &infos[..1]).is_empty());
     }
 
     #[test]

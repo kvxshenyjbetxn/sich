@@ -170,6 +170,10 @@ mod tests {
                 unread: false,
                 since_unix_ms: 0,
                 detail: None,
+                model: None,
+                title: None,
+                prompt: None,
+                message: None,
             }),
         }
     }

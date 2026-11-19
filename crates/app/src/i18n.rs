@@ -492,6 +492,39 @@ pub fn agent_tooltip(label: &str, detail: Option<&str>) -> String {
     }
 }
 
+/// Compact age of `since_ms` at `now_ms`: "now", "5m", "2h", "3d" (translated). A `since` in
+/// the future (clock skew) counts as "now".
+pub fn relative_time(lang: Language, now_ms: u64, since_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(since_ms) / 1000;
+    let (n, unit) = if secs < 60 {
+        return match lang {
+            Language::Uk => "щойно",
+            Language::Ru => "только что",
+            Language::En => "now",
+        }
+        .to_string();
+    } else if secs < 3600 {
+        (secs / 60, 0)
+    } else if secs < 86_400 {
+        (secs / 3600, 1)
+    } else {
+        (secs / 86_400, 2)
+    };
+    let suffix = match (lang, unit) {
+        (Language::Uk, 0) => "хв",
+        (Language::Ru, 0) => "м",
+        (Language::En, 0) => "m",
+        (Language::Uk, 1) => "год",
+        (Language::Ru, 1) => "ч",
+        (Language::En, 1) => "h",
+        (_, _) => match lang {
+            Language::En => "d",
+            _ => "д",
+        },
+    };
+    format!("{n}{suffix}")
+}
+
 /// Status line under the hooks switch when hooks are installed.
 pub fn hooks_installed(lang: Language, events: Option<usize>, claude_version: Option<&str>) -> String {
     let head = match lang {
@@ -624,6 +657,36 @@ mod tests {
             assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains("v2.1.3"));
             assert!(!hooks_installed(lang, None, None).contains('('));
         }
+    }
+
+    #[test]
+    fn relative_time_all_languages_and_boundaries() {
+        let now = 10_000_000_000u64;
+        let rt = |lang, ago_s: u64| relative_time(lang, now, now - ago_s * 1000);
+        let cases: [(u64, [&str; 3]); 11] = [
+            (0, ["щойно", "только что", "now"]),
+            (59, ["щойно", "только что", "now"]),
+            (60, ["1хв", "1м", "1m"]),
+            (300, ["5хв", "5м", "5m"]),
+            (3599, ["59хв", "59м", "59m"]),
+            (3600, ["1год", "1ч", "1h"]),
+            (7200, ["2год", "2ч", "2h"]),
+            (86_399, ["23год", "23ч", "23h"]),
+            (86_400, ["1д", "1д", "1d"]),
+            (3 * 86_400 + 5, ["3д", "3д", "3d"]),
+            (40 * 86_400, ["40д", "40д", "40d"]),
+        ];
+        for (ago, [uk, ru, en]) in cases {
+            assert_eq!(rt(Language::Uk, ago), uk, "{ago}");
+            assert_eq!(rt(Language::Ru, ago), ru, "{ago}");
+            assert_eq!(rt(Language::En, ago), en, "{ago}");
+        }
+    }
+
+    #[test]
+    fn relative_time_clock_skew_is_now() {
+        assert_eq!(relative_time(Language::En, 1_000, 5_000), "now");
+        assert_eq!(relative_time(Language::Uk, 0, u64::MAX), "щойно");
     }
 
     #[test]

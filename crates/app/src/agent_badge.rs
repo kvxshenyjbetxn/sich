@@ -11,7 +11,7 @@ use gpui_kit::{
     ParentElement as _, StatefulInteractiveElement as _, Styled as _, Transformation, div,
     percentage, px, rgb,
 };
-use sich_proto::{AgentState, AgentStatus};
+use sich_proto::{AgentKind, AgentState, AgentStatus};
 
 use crate::i18n::{self, Language, Tr, tr};
 use crate::settings;
@@ -65,6 +65,36 @@ pub fn rollup<'a>(statuses: impl IntoIterator<Item = &'a AgentStatus>) -> Option
 /// Badge kind of a terminal's optional status (for transition tracking).
 pub fn kind_of(status: Option<&AgentStatus>) -> Option<BadgeKind> {
     status.and_then(badge_for).map(|b| b.kind)
+}
+
+/// Plain text glyph and brand color (`None` = muted) of an agent kind.
+pub fn agent_glyph(kind: AgentKind) -> (&'static str, Option<u32>) {
+    match kind {
+        // U+273B has no emoji presentation (U+2733 renders as a green emoji on Windows).
+        AgentKind::Claude => ("\u{273B}", Some(0xD97757)),
+        AgentKind::Gemini => ("\u{2726}", Some(0x4796E3)),
+        AgentKind::Codex | AgentKind::Other => ("\u{2022}", None),
+    }
+}
+
+/// `claude-opus-5-5` -> `opus-5-5` (a leading `claude-` is dropped; empty stays empty).
+pub fn shorten_model(model: &str) -> String {
+    let m = model.trim();
+    m.strip_prefix("claude-").filter(|s| !s.is_empty()).unwrap_or(m).to_string()
+}
+
+fn non_blank(s: &Option<String>) -> Option<String> {
+    s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// The muted second line of an agent row.
+pub fn agent_preview(status: &AgentStatus) -> Option<String> {
+    let (detail, prompt, message) = (non_blank(&status.detail), non_blank(&status.prompt), non_blank(&status.message));
+    match status.state {
+        AgentState::Waiting | AgentState::Working => detail.or(prompt),
+        AgentState::Done | AgentState::Idle => message.or(prompt),
+        AgentState::Failed => message.or(detail),
+    }
 }
 
 /// True when the user has to be called: the terminal moved INTO Waiting, or into Done/Failed
@@ -166,7 +196,59 @@ mod tests {
             unread,
             since_unix_ms: 1,
             detail: detail.map(String::from),
+            model: None,
+            title: None,
+            prompt: None,
+            message: None,
         }
+    }
+
+    fn full(state: AgentState, detail: Option<&str>, prompt: Option<&str>, message: Option<&str>) -> AgentStatus {
+        AgentStatus {
+            prompt: prompt.map(String::from),
+            message: message.map(String::from),
+            ..st(state, false, detail)
+        }
+    }
+
+    #[test]
+    fn preview_rules_per_state() {
+        let p = |s: AgentState, d, pr, m| agent_preview(&full(s, d, pr, m));
+        // Waiting / Working: detail, else prompt (never the message).
+        for s in [AgentState::Waiting, AgentState::Working] {
+            assert_eq!(p(s, Some("Bash: ls"), Some("p"), Some("m")).as_deref(), Some("Bash: ls"));
+            assert_eq!(p(s, None, Some("p"), Some("m")).as_deref(), Some("p"));
+            assert_eq!(p(s, Some("  "), Some("p"), None).as_deref(), Some("p"));
+            assert_eq!(p(s, None, None, Some("m")), None);
+        }
+        // Done / Idle: message, else prompt (never the detail).
+        for s in [AgentState::Done, AgentState::Idle] {
+            assert_eq!(p(s, Some("d"), Some("p"), Some("m")).as_deref(), Some("m"));
+            assert_eq!(p(s, Some("d"), Some("p"), None).as_deref(), Some("p"));
+            assert_eq!(p(s, Some("d"), None, None), None);
+        }
+        // Failed: message, else detail.
+        assert_eq!(p(AgentState::Failed, Some("d"), Some("p"), Some("m")).as_deref(), Some("m"));
+        assert_eq!(p(AgentState::Failed, Some("d"), Some("p"), None).as_deref(), Some("d"));
+        assert_eq!(p(AgentState::Failed, None, Some("p"), None), None);
+    }
+
+    #[test]
+    fn shorten_model_strips_claude_prefix() {
+        assert_eq!(shorten_model("claude-opus-5-5"), "opus-5-5");
+        assert_eq!(shorten_model("claude-sonnet-5-5"), "sonnet-5-5");
+        assert_eq!(shorten_model("gemini-2.5-pro"), "gemini-2.5-pro");
+        assert_eq!(shorten_model(" claude-haiku "), "haiku");
+        assert_eq!(shorten_model("claude-"), "claude-");
+        assert_eq!(shorten_model(""), "");
+    }
+
+    #[test]
+    fn glyph_per_agent_kind() {
+        assert_eq!(agent_glyph(AgentKind::Claude), ("\u{273B}", Some(0xD97757)));
+        assert_eq!(agent_glyph(AgentKind::Gemini), ("\u{2726}", Some(0x4796E3)));
+        assert_eq!(agent_glyph(AgentKind::Codex).1, None);
+        assert_eq!(agent_glyph(AgentKind::Other).1, None);
     }
 
     fn kind(s: &AgentStatus) -> Option<BadgeKind> {

@@ -34,6 +34,9 @@ use crate::win_flash;
 use crate::win_show;
 use crate::worktree_dialogs;
 
+/// How often the sidebar is repainted while agents are present, to refresh relative times.
+const AGE_REFRESH: Duration = Duration::from_secs(30);
+
 /// Upper bound for creations waiting to be matched with a `TerminalCreated`.
 const MAX_PENDING_CREATES: usize = 8;
 
@@ -119,6 +122,23 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             while wake_rx.recv().await.is_ok() {
                 let alive = this.update(cx, |this, cx| this.on_wake(cx));
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // Relative times in the sidebar ("5m") tick even when nothing else changes.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(AGE_REFRESH).await;
+                let alive = this.update(cx, |this, cx| {
+                    let snap = this.client.snapshot();
+                    if snap.terminals.iter().any(|t| t.info.agent.is_some()) {
+                        cx.notify();
+                    }
+                });
                 if alive.is_err() {
                     break;
                 }

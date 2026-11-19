@@ -114,6 +114,10 @@ mod tests {
                 unread,
                 since_unix_ms: 1,
                 detail: None,
+                model: None,
+                title: None,
+                prompt: None,
+                message: None,
             }),
         }
     }

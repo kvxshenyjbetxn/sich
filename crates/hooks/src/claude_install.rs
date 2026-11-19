@@ -52,6 +52,7 @@ pub const EVENTS: &[EventDef] = &[
     ev("PostToolUseFailure", (2, 0, 56), true, false),
     ev("Elicitation", (2, 1, 63), true, false),
     ev("StopFailure", (2, 1, 78), false, false),
+    ev("PostModelSwitch", (2, 1, 251), false, false),
 ];
 
 /// Events that must carry our exact command for `is_installed`.
@@ -584,6 +585,11 @@ mod tests {
         assert!(!has("2.1.77", "StopFailure"));
         assert!(has("2.1.78", "StopFailure"));
         assert!(has("2.1.139-beta.2", "StopFailure"));
+        assert!(!has("2.1.250", "PostModelSwitch"));
+        assert!(has("2.1.251", "PostModelSwitch"));
+        assert!(has("2.2.0", "PostModelSwitch"));
+        assert!(!has("2.1.139", "PostModelSwitch"));
+        assert!(!names(&events_for_version(None)).contains(&"PostModelSwitch"));
         // Newest: everything.
         assert_eq!(events_for_version(Some(NEW_VERSION)).len(), EVENTS.len());
         // Every event name is unique and only known names are ever installed.
@@ -843,6 +849,28 @@ mod tests {
         assert!(!is_installed(dir.path(), &exe()));
         install_with_version(dir.path(), &exe(), None).unwrap();
         assert!(is_installed(dir.path(), &exe()));
+    }
+
+    #[test]
+    fn reinstall_adds_post_model_switch_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), USER_SETTINGS);
+        // Older Claude: no PostModelSwitch.
+        install_with_version(dir.path(), &exe(), Some("2.1.200")).unwrap();
+        assert!(read(dir.path())["hooks"].get("PostModelSwitch").is_none());
+        // Upgraded Claude: the event is added, nothing else duplicated.
+        let r = install_with_version(dir.path(), &exe(), Some("2.1.251")).unwrap();
+        assert!(r.changed);
+        let v = read(dir.path());
+        assert_eq!(v["hooks"]["PostModelSwitch"].as_array().unwrap().len(), 1);
+        assert!(v["hooks"]["PostModelSwitch"][0].get("matcher").is_none());
+        assert_eq!(ours_count(&v), events_for_version(Some("2.1.251")).len());
+        let r = install_with_version(dir.path(), &exe(), Some("2.1.251")).unwrap();
+        assert!(!r.changed);
+        assert_eq!(read(dir.path())["hooks"]["PostModelSwitch"].as_array().unwrap().len(), 1);
+        // Uninstall removes it too.
+        uninstall(dir.path(), &exe()).unwrap();
+        assert!(read(dir.path())["hooks"].get("PostModelSwitch").is_none());
     }
 
     #[test]

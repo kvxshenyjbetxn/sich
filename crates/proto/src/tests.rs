@@ -23,6 +23,10 @@ fn status() -> AgentStatus {
         unread: true,
         since_unix_ms: 1_700_000_000_123,
         detail: Some("Claude needs your permission".into()),
+        model: Some("claude-opus-5-5".into()),
+        title: Some("Sync phone feature".into()),
+        prompt: Some("fix the bug".into()),
+        message: Some("Done, tests pass".into()),
     }
 }
 
@@ -153,8 +157,18 @@ fn agent_enums_round_trip() {
 }
 
 #[test]
-fn proto_version_is_4() {
-    assert_eq!(PROTO_VERSION, 4);
+fn proto_version_is_5() {
+    assert_eq!(PROTO_VERSION, 5);
+}
+
+#[test]
+fn agent_status_optional_fields_round_trip() {
+    let empty = AgentStatus { detail: None, model: None, title: None, prompt: None, message: None, ..status() };
+    assert_eq!(decode::<AgentStatus>(&encode(&empty).unwrap()).unwrap(), empty);
+    let only_model = AgentStatus { model: Some("m".into()), ..empty.clone() };
+    assert_eq!(decode::<AgentStatus>(&encode(&only_model).unwrap()).unwrap(), only_model);
+    let unicode = AgentStatus { prompt: Some("привіт ✳".into()), message: Some("…".into()), ..empty };
+    assert_eq!(decode::<AgentStatus>(&encode(&unicode).unwrap()).unwrap(), unicode);
 }
 
 #[test]
