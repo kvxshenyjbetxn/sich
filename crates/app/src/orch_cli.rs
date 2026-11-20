@@ -25,7 +25,9 @@ pub const ENV_READY_TIMEOUT_MS: &str = "SICH_ORCH_READY_TIMEOUT_MS";
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(90);
 const PROMPT_QUIET: Duration = Duration::from_millis(800);
 const PROMPT_MAX_WAIT: Duration = Duration::from_secs(10);
-const DSR_FALLBACK_QUIET: Duration = Duration::from_millis(700);
+/// Long enough for a slow shell start (PowerShell 7 profile loading takes about a second after
+/// the GUI answered); a second reply typed into a running shell eats the first typed character.
+const DSR_FALLBACK_QUIET: Duration = Duration::from_millis(3000);
 const DSR_QUERY: &[u8] = b"\x1b[6n";
 const DSR_REPLY: &[u8] = b"\x1b[1;1R";
 const OUTPUT_TAIL_BYTES: usize = 16 * 1024;
@@ -441,8 +443,45 @@ pub fn prompt_action(
     if quiet >= PROMPT_QUIET { PromptAction::Ready } else { PromptAction::Wait }
 }
 
+#[cfg(test)]
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Start index of the last occurrence of `needle`.
+fn rfind(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).rposition(|w| w == needle)
+}
+
+/// True when `bytes` hold printable text or line breaks outside of escape sequences
+/// (CSI, OSC and two-byte escapes are skipped).
+pub fn has_text(bytes: &[u8]) -> bool {
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x1b => match bytes.get(i + 1) {
+                Some(b'[') => {
+                    i += 2;
+                    while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                Some(b']') => {
+                    i += 2;
+                    while i < bytes.len() && bytes[i] != 0x07 && !(bytes[i] == 0x1b && bytes.get(i + 1) == Some(&b'\\')) {
+                        i += 1;
+                    }
+                    i += if bytes.get(i) == Some(&0x1b) { 2 } else { 1 };
+                }
+                _ => i += 2,
+            },
+            b'\r' | b'\n' => return true,
+            b if b >= 0x20 && b != 0x7f => return true,
+            _ => i += 1,
+        }
+    }
+    false
 }
 
 /// Waits for the shell prompt of a fresh terminal: first output, then a quiet period.
@@ -470,10 +509,13 @@ async fn wait_for_prompt(link: &mut Link, term: TermId) -> Result<()> {
                 if dsr_seen {
                     after_dsr = true;
                 }
+                
                 carry.extend_from_slice(&bytes);
-                if contains(&carry, DSR_QUERY) {
+                if let Some(pos) = rfind(&carry, DSR_QUERY) {
                     dsr_seen = true;
-                    after_dsr = false;
+                    // A replayed chunk may already hold what the shell printed after the query
+                    // (so the GUI answered long ago): answering again would type garbage.
+                    after_dsr = has_text(&carry[pos + DSR_QUERY.len()..]);
                     carry.clear();
                 } else if carry.len() > 8 {
                     carry.drain(..carry.len() - 3);
@@ -790,6 +832,25 @@ mod tests {
     }
 
     #[test]
+    fn has_text_ignores_escape_sequences() {
+        assert!(!has_text(b""));
+        assert!(!has_text(b"\x1b[c\x1b[?1004h\x1b[?9001h"));
+        assert!(!has_text(b"\x1b]0;title\x07\x1b]0;t2\x1b\\\x1b[1;1H"));
+        assert!(!has_text(b"\x1b[?25l\x1b="));
+        assert!(has_text(b"\x1b[?9001h\x1b[1;1HPowerShell 7"));
+        assert!(has_text(b"\r\n"));
+        // An unterminated escape at the end is not text.
+        assert!(!has_text(b"\x1b[1;"));
+    }
+
+    #[test]
+    fn rfind_returns_the_last_match() {
+        assert_eq!(rfind(b"ab6nab6nx", b"6n"), Some(6));
+        assert_eq!(rfind(b"abc", b"6n"), None);
+        assert_eq!(rfind(b"", b"6n"), None);
+    }
+
+    #[test]
     fn prompt_waits_for_output_then_a_quiet_period() {
         let ms = Duration::from_millis;
         assert_eq!(prompt_action(false, ms(5000), false, false, false), PromptAction::Wait);
@@ -801,8 +862,8 @@ mod tests {
     fn unanswered_cursor_query_is_answered_after_a_short_silence() {
         let ms = Duration::from_millis;
         // ConPTY is blocked waiting for the reply.
-        assert_eq!(prompt_action(true, ms(500), true, false, false), PromptAction::Wait);
-        assert_eq!(prompt_action(true, ms(700), true, false, false), PromptAction::AnswerDsr);
+        assert_eq!(prompt_action(true, ms(2999), true, false, false), PromptAction::Wait);
+        assert_eq!(prompt_action(true, ms(3000), true, false, false), PromptAction::AnswerDsr);
         // Output after the query means someone (the GUI) already answered it.
         assert_eq!(prompt_action(true, ms(100), true, true, false), PromptAction::Wait);
         assert_eq!(prompt_action(true, ms(800), true, true, false), PromptAction::Ready);
