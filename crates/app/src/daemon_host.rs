@@ -169,10 +169,34 @@ fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
     }
 }
 
+/// Bundled ConPTY files that must sit next to the relocated exe (see ARCHITECTURE.md).
+const CONPTY_FILES: [&str; 2] = ["conpty.dll", "OpenConsole.exe"];
+
 fn relocate(source: &Path, root: &Path, build_id: &str) -> io::Result<PathBuf> {
     let target = executable(root, build_id);
-    if same_contents(source, &target).unwrap_or(false) {
-        return Ok(target);
+    let result = publish(source, &target);
+    // Best effort: without the files Sich falls back to the system ConPTY.
+    let (from, to) = (source.parent(), target.parent());
+    if let (Some(from), Some(to)) = (from, to) {
+        for name in CONPTY_FILES {
+            let file = from.join(name);
+            if !file.is_file() {
+                tracing::warn!("{} not found next to {}; using the system ConPTY", name, source.display());
+                continue;
+            }
+            if let Err(err) = fs::create_dir_all(to).and_then(|()| publish(&file, &to.join(name))) {
+                tracing::warn!("could not copy {name} for the daemon host: {err}");
+            }
+        }
+    }
+    result?;
+    Ok(target)
+}
+
+/// Atomically publishes `source` as `target`, reusing `target` when it already has the same bytes.
+fn publish(source: &Path, target: &Path) -> io::Result<()> {
+    if same_contents(source, target).unwrap_or(false) {
+        return Ok(());
     }
     let dir = target.parent().expect("daemon copy has a parent");
     fs::create_dir_all(dir)?;
@@ -181,12 +205,12 @@ fn relocate(source: &Path, root: &Path, build_id: &str) -> io::Result<PathBuf> {
     io::copy(&mut src, temp.as_file_mut())?;
     temp.as_file()
         .set_permissions(src.metadata()?.permissions())?;
-    match temp.persist_noclobber(&target) {
-        Ok(_) => Ok(target),
-        Err(err) if same_contents(source, &target).unwrap_or(false) => {
+    match temp.persist_noclobber(target) {
+        Ok(_) => Ok(()),
+        Err(err) if same_contents(source, target).unwrap_or(false) => {
             // Another launch published the same build while the copy was being staged.
             drop(err);
-            Ok(target)
+            Ok(())
         }
         Err(err) => Err(err.error),
     }
@@ -326,6 +350,29 @@ mod tests {
         assert_eq!(relocate(&source, &root, "build").unwrap(), target);
         assert_eq!(fs::metadata(target).unwrap().modified().unwrap(), original);
         assert_eq!(fs::read_dir(root.join("build")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn conpty_files_are_copied_when_present_and_skipped_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let source = src_dir.join("source");
+        fs::write(&source, b"exe").unwrap();
+        let root = host_root(dir.path());
+        // Missing files: relocation still succeeds.
+        let target = relocate(&source, &root, "b").unwrap();
+        assert!(!target.with_file_name("conpty.dll").exists());
+        // Present files are copied beside the exe, and reused unchanged.
+        fs::write(src_dir.join("conpty.dll"), b"dll").unwrap();
+        fs::write(src_dir.join("OpenConsole.exe"), b"oc").unwrap();
+        relocate(&source, &root, "b").unwrap();
+        assert_eq!(fs::read(target.with_file_name("conpty.dll")).unwrap(), b"dll");
+        assert_eq!(fs::read(target.with_file_name("OpenConsole.exe")).unwrap(), b"oc");
+        let modified = fs::metadata(target.with_file_name("conpty.dll")).unwrap().modified().unwrap();
+        relocate(&source, &root, "b").unwrap();
+        assert_eq!(fs::metadata(target.with_file_name("conpty.dll")).unwrap().modified().unwrap(), modified);
+        assert_eq!(fs::read_dir(target.parent().unwrap()).unwrap().count(), 3);
     }
 
     #[test]

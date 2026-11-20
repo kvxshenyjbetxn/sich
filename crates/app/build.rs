@@ -37,5 +37,33 @@ fn main() {
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
             println!("cargo:rustc-link-arg-bins=/STACK:8388608");
         }
+        bundle_conpty();
+    }
+}
+
+/// Copies the bundled ConPTY (`conpty.dll` + `OpenConsole.exe`) next to `sich.exe` in the cargo
+/// profile dir. Failures only warn: Sich then falls back to the system ConPTY.
+fn bundle_conpty() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../third_party/conpty/x64");
+    let Some(profile_dir) = std::env::var_os("OUT_DIR")
+        .map(std::path::PathBuf::from)
+        .and_then(|out| out.ancestors().nth(3).map(std::path::Path::to_path_buf))
+    else {
+        return;
+    };
+    for name in ["conpty.dll", "OpenConsole.exe"] {
+        let from = src.join(name);
+        println!("cargo:rerun-if-changed={}", from.display());
+        let to = profile_dir.join(name);
+        let result = std::fs::read(&from).and_then(|bytes| {
+            if std::fs::read(&to).is_ok_and(|existing| existing == bytes) {
+                Ok(())
+            } else {
+                std::fs::write(&to, bytes)
+            }
+        });
+        if let Err(err) = result {
+            println!("cargo:warning=could not bundle {name} into {}: {err}", profile_dir.display());
+        }
     }
 }
