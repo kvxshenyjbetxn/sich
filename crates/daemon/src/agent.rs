@@ -1,9 +1,9 @@
 //! AI agent status state machine. Pure logic: no IPC, no clocks (the caller passes `now`).
 //!
 //! Two sources feed it:
-//! - Claude Code hook events (`SICH_TERM_ID` + `sich hook claude`), which are authoritative;
-//! - terminal title glyphs (Claude's spinner, Gemini's markers), used only while the terminal
-//!   has not received any hook event during the current agent session.
+//! - Claude Code and Codex hook events, which are authoritative;
+//! - terminal title glyphs, used only while the terminal has not received any hook event
+//!   during the current agent session.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -773,6 +773,11 @@ fn is_quarter_circle(c: char) -> bool {
 fn title_signal(title: &str) -> Option<(AgentKind, TitleSignal)> {
     let c = title.trim_start().chars().next()?;
     match c {
+        // Codex v0.170.0 uses these frames at startup and during work. The rest of the
+        // title is configurable and can look like a Claude session title.
+        '⠋' | '⠙' | '⠹' | '⠸' | '⠼' | '⠴' | '⠦' | '⠧' | '⠇' | '⠏' => {
+            Some((AgentKind::Other, TitleSignal::Working))
+        }
         c if is_braille(c) || is_quarter_circle(c) => Some((AgentKind::Claude, TitleSignal::Working)),
         CLAUDE_IDLE => Some((AgentKind::Claude, TitleSignal::Idle)),
         GEMINI_WORKING | GEMINI_SILENT_WORKING => Some((AgentKind::Gemini, TitleSignal::Working)),
@@ -784,9 +789,10 @@ fn title_signal(title: &str) -> Option<(AgentKind, TitleSignal)> {
 
 fn apply_title(prev: Option<AgentStatus>, title: &str, now: u64) -> Option<AgentStatus> {
     let Some((kind, sig)) = title_signal(title) else {
-        // A plain title: while working it may be transient; otherwise the agent is gone.
+        // Codex drops the spinner from its title when ready. Clear unconfirmed activity
+        // on a plain title, which may be transient for an identified working agent.
         return match prev {
-            Some(p) if p.state == AgentState::Working => Some(p),
+            Some(p) if p.kind != AgentKind::Other && p.state == AgentState::Working => Some(p),
             _ => None,
         };
     };
@@ -1386,6 +1392,43 @@ mod tests {
         }
         let s = title(None, "\u{2733} Claude Code", false, T0).unwrap();
         assert_eq!((s.kind, s.state, s.unread), (AgentKind::Claude, AgentState::Idle, false));
+    }
+
+    #[test]
+    fn codex_spinner_titles_only_identify_generic_activity() {
+        let mut tracker = AgentTracker::default();
+        for frame in ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] {
+            tracker.on_title(&format!("{frame} sich"), T0);
+            let s = tracker.status().unwrap();
+            assert_eq!((s.kind, s.state), (AgentKind::Other, AgentState::Working), "{frame}");
+        }
+        assert!(tracker.on_title("sich", T0 + 1));
+        assert!(tracker.status().is_none());
+
+        assert!(tracker.on_title("⠋ Fix bug | sich", T0 + 2));
+        assert_eq!(tracker.status().unwrap().kind, AgentKind::Other);
+        assert!(tracker.on_title("Fix bug | sich", T0 + 3));
+        assert!(tracker.status().is_none());
+
+        // Claude's own spinner and idle marker still work with the same project title.
+        assert!(tracker.on_title("⠂ sich", T0 + 4));
+        let s = tracker.status().unwrap();
+        assert_eq!((s.kind, s.state), (AgentKind::Claude, AgentState::Working));
+        assert!(tracker.on_title("✳ sich", T0 + 5));
+        let s = tracker.status().unwrap();
+        assert_eq!((s.kind, s.state, s.unread), (AgentKind::Claude, AgentState::Done, true));
+    }
+
+    #[test]
+    fn codex_hook_replaces_ambiguous_spinner_and_keeps_authority() {
+        let mut tracker = AgentTracker::default();
+        assert!(tracker.on_title("⠋ sich", T0));
+        assert_eq!(tracker.status().unwrap().kind, AgentKind::Other);
+        assert!(tracker.on_codex_hook(&chook("SessionStart", ""), T0 + 1));
+        assert!(!tracker.on_title("⠙ sich", T0 + 2));
+        assert!(!tracker.on_title("sich", T0 + 3));
+        let s = tracker.status().unwrap();
+        assert_eq!((s.kind, s.state), (AgentKind::Codex, AgentState::Idle));
     }
 
     #[test]
