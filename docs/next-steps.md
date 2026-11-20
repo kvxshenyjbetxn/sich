@@ -31,18 +31,15 @@ stopped freely (`sich daemon stop` with `SICH_SOCKET=sich-uitest`, then taskkill
   `sich orch start` takes the first TerminalCreated after its request (race with a user-created terminal);
   a message to a done worker whose terminal exited stays unread.
 
-## Task A — "Оновити" button (small, do first)
-Goal: like Orca's single "Restart to Update" button.
-- The GUI knows the user-facing exe (`daemon_host::launcher_exe()`, `SICH_LAUNCHER_EXE`). Every 3 s (background
-  executor) stat it; remember (len, mtime) at startup. When it changed and has been stable for ≥ 3 s (cargo
-  finished writing), show a status-bar button "Оновити" (i18n uk/ru/en: "Оновити" / "Обновить" / "Update") plus
-  a muted "Нова збірка готова" label.
-- Click = exactly the tray "Перезапустити Sich" path: `cli::spawn_replacement_ui` (spawns the launcher exe with
-  `--takeover`); the old GUI saves the session and exits; daemon untouched.
-- Optional: compare the new file's embedded build id cheaply? Not needed — any change of the launcher file means
-  a newer build.
-- Pure, unit-tested decision fn (initial stamp, current stamp, stable-since, now → Hidden/Ready).
-- Do not show the button when running with `SICH_NO_RELOCATE` (GUI runs in place, file locked).
+## Releases and updates (done 2026-11-20, replaces the old Task A)
+- Public repo github.com/kvxshenyjbetxn/sich. Cut a release with `scripts/release.ps1 -Bump patch` (see
+  `docs/releasing.md`): bumps the workspace version, check + test, `SICH_RELEASE=1` release build, zip + sha256,
+  commit, tag, push, `gh release create`. Bump the version on every release.
+- Official builds (`SICH_RELEASE=1`) run the GUI in place (one taskbar identity) and check GitHub for updates
+  (`crates/app/src/updater.rs`, `update_dialog.rs`): ask first, show progress, rename-swap the 4 files in the
+  user's folder, then `--takeover`. Dev builds still relocate the GUI and never check for updates.
+- Note: after a release, `targetelease\sich.exe` is an official build (runs in place, locks the file). For dev
+  use, run the normal `cargo build --release` again.
 
 ## Task B — daemons side by side, like Orca (bigger; removes most "restart daemon" prompts)
 Orca never restarts its daemon on update: the old daemon keeps the old terminals, a new daemon generation serves
