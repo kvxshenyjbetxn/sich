@@ -126,12 +126,18 @@ fn uninstall(receipt: &Path) -> anyhow::Result<()> {
 
 /// Reads local installation state only; does not launch omp.
 pub fn current(receipt: &Path) -> anyhow::Result<Status> {
-    if let Some(path) = recorded_path(receipt)? {
-        if read_owned(&path)?.is_some() {
-            return Ok(Status::Installed);
-        }
-    }
-    Ok(Status::NotInstalled)
+    Ok(if installed_extension(receipt)?.is_some() { Status::Installed } else { Status::NotInstalled })
+}
+
+/// The installer-owned extension, if still present. Never returns a foreign file.
+pub fn installed_extension(receipt: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let Some(path) = recorded_path(receipt)? else { return Ok(None) };
+    Ok(read_owned(&path)?.is_some().then_some(path))
+}
+
+/// Probes the official CLI without opening a session. `None` means no recognized omp binary.
+pub async fn supports_hooks() -> anyhow::Result<Option<bool>> {
+    Ok(query(&["--version"]).await?.as_deref().and_then(check_version))
 }
 
 /// Resolves the active profile through the documented CLI. Disabling needs no omp binary.
@@ -141,7 +147,7 @@ pub fn configure(enable: bool, receipt: &Path) -> anyhow::Result<Status> {
         return Ok(Status::NotInstalled);
     }
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
-        match query(&["--version"]).await?.as_deref().and_then(check_version) {
+        match supports_hooks().await? {
             None => return Ok(Status::NotFound),
             Some(false) => return Ok(Status::TooOld),
             Some(true) => {}

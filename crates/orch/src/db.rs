@@ -87,10 +87,48 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX dispatches_worktree_cleanup ON dispatches(state)
         WHERE worktree_identity IS NOT NULL AND worktree_cleaned = 0;
     ",
+    "
+    CREATE TABLE dispatches_v4 (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        worker_term INTEGER NOT NULL,
+        agent TEXT NOT NULL CHECK (agent IN ('claude','codex','omp')),
+        model TEXT,
+        effort TEXT,
+        state TEXT NOT NULL CHECK (state IN ('starting','working','done','failed','lost','released')),
+        outcome TEXT,
+        started_ms INTEGER NOT NULL,
+        ended_ms INTEGER,
+        keep_open INTEGER NOT NULL DEFAULT 0 CHECK (keep_open IN (0,1)),
+        auto_close_allowed_ms INTEGER,
+        worktree_path TEXT,
+        worktree_branch TEXT,
+        worktree_base_branch TEXT,
+        worktree_identity TEXT,
+        worktree_cleaned INTEGER NOT NULL DEFAULT 0 CHECK (worktree_cleaned IN (0,1))
+    );
+    INSERT INTO dispatches_v4 SELECT * FROM dispatches ORDER BY rowid;
+
+    -- The child table has ON DELETE CASCADE: preserve its socket identities explicitly.
+    CREATE TEMP TABLE saved_dispatch_sockets AS SELECT dispatch_id, socket FROM dispatch_sockets;
+    DROP TABLE dispatch_sockets;
+    DROP TABLE dispatches;
+    ALTER TABLE dispatches_v4 RENAME TO dispatches;
+    CREATE INDEX dispatches_by_run ON dispatches(run_id);
+    CREATE INDEX dispatches_by_term ON dispatches(worker_term, started_ms);
+    CREATE INDEX dispatches_worktree_cleanup ON dispatches(state)
+        WHERE worktree_identity IS NOT NULL AND worktree_cleaned = 0;
+    CREATE TABLE dispatch_sockets (
+        dispatch_id TEXT PRIMARY KEY REFERENCES dispatches(id) ON DELETE CASCADE,
+        socket TEXT NOT NULL
+    );
+    INSERT INTO dispatch_sockets SELECT dispatch_id, socket FROM saved_dispatch_sockets;
+    DROP TABLE saved_dispatch_sockets;
+    ",
 ];
 
-/// Optional endpoint data for new records. Keep it additive so an executable still in
-/// use by a legacy terminal can open the database during a GUI takeover.
+/// Optional endpoint data; v4 preserves it while expanding the allowed worker agent kinds.
 const ENDPOINT_TABLES: &str = "
     CREATE TABLE IF NOT EXISTS run_sockets (
         run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
@@ -295,6 +333,10 @@ impl Db {
             bail!("orchestration database has schema {current}, newer than this build understands");
         }
         for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+            if i == 3 {
+                // Databases from before socket tracking (including a fresh one) lack these tables.
+                tx.execute_batch(ENDPOINT_TABLES)?;
+            }
             tx.execute_batch(sql).with_context(|| format!("migration {}", i + 1))?;
             tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [i as i64 + 1])?;
         }
@@ -988,6 +1030,46 @@ mod tests {
         assert!(!d.keep_open);
         assert_eq!(d.auto_close_allowed_ms, None);
         assert_eq!(d.auto_close_state(true), Some(AutoClose::ClosesAt(250 + AUTO_CLOSE_DELAY_MS)));
+    }
+
+    #[test]
+    fn migrates_v3_without_losing_dispatch_socket_or_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orchestration.db");
+        let conn = Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..3] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(ENDPOINT_TABLES).unwrap();
+        conn.execute_batch("
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version VALUES (3);
+            INSERT INTO runs VALUES ('r_1', 1, 100);
+            INSERT INTO run_sockets VALUES ('r_1', 'base-old');
+            INSERT INTO tasks (id, run_id, title, spec, status, created_ms, updated_ms)
+                VALUES ('t_1', 'r_1', 'Old task', 'spec', 'dispatched', 100, 120);
+            INSERT INTO dispatches (id, task_id, run_id, worker_term, agent, state, started_ms,
+                                    keep_open, worktree_path, worktree_branch, worktree_base_branch, worktree_identity)
+                VALUES ('d_1', 't_1', 'r_1', 2, 'codex', 'working', 120, 1, '/tmp/old', 'old', 'main', 'old-id');
+            INSERT INTO dispatch_sockets VALUES ('d_1', 'base-old');
+        ").unwrap();
+        drop(conn);
+
+        let mut db = Db::open(&path).unwrap();
+        let scope = Some(TerminalScope { socket: "base-old", legacy: false });
+        let old = db.dispatch_for_worker_at(2, 120, scope).unwrap().unwrap();
+        assert_eq!((old.agent, old.keep_open), (Agent::Codex, true));
+        assert_eq!(old.owned_worktree.unwrap().identity, "old-id");
+        let (_, worker) = db.create_task_with_dispatch_at(
+            "r_1", "t_2", "d_2", "New task", "spec", 2, Agent::Omp,
+            Some("openai/gpt-5"), Some("auto"), None, 150, Some("base-new"),
+        ).unwrap();
+        assert_eq!(worker.agent, Agent::Omp);
+        assert_eq!(db.dispatch_for_worker_at(2, 150, Some(TerminalScope {
+            socket: "base-new", legacy: false,
+        })).unwrap().unwrap().id, "d_2");
+        let violations: i64 = db.conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(violations, 0);
     }
 
     #[test]

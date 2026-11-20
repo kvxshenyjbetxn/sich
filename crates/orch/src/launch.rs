@@ -12,19 +12,24 @@ pub enum LaunchError {
     BadModel(String),
     BadEffort { agent: Agent, value: String },
     BadPath(String),
+    BadExtension(String),
     BadProgram(String),
 }
 
 impl fmt::Display for LaunchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BadModel(m) => write!(f, "invalid --model `{m}` (allowed: letters, digits and . _ : -, up to 64 characters)"),
+            Self::BadModel(m) => write!(f, "invalid --model `{m}` (64 characters max; omp also accepts provider/model)"),
             Self::BadEffort { agent: Agent::Claude, value } => {
                 write!(f, "invalid --effort `{value}` for claude (low, medium, high, xhigh, max)")
             }
             Self::BadEffort { agent: Agent::Codex, value } => {
                 write!(f, "invalid --effort `{value}` for codex (low, medium, high, xhigh, max, ultra)")
             }
+            Self::BadEffort { agent: Agent::Omp, value } => {
+                write!(f, "invalid --effort `{value}` for omp (off, minimal, low, medium, high, xhigh, max, auto)")
+            }
+            Self::BadExtension(p) => write!(f, "omp extension path `{p}` is not an absolute shell-safe path"),
             Self::BadPath(p) => write!(f, "task file path `{p}` contains a character that is unsafe in a shell command"),
             Self::BadProgram(p) => write!(f, "invalid agent program `{p}`"),
         }
@@ -39,10 +44,19 @@ pub fn valid_model(model: &str) -> bool {
         && model.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
 }
 
+fn valid_model_for(agent: Agent, model: &str) -> bool {
+    if agent == Agent::Omp {
+        model.len() <= 64 && model.split('/').all(valid_model)
+    } else {
+        valid_model(model)
+    }
+}
+
 pub fn valid_effort(agent: Agent, effort: &str) -> bool {
     match agent {
         Agent::Claude => matches!(effort, "low" | "medium" | "high" | "xhigh" | "max"),
         Agent::Codex => matches!(effort, "low" | "medium" | "high" | "xhigh" | "max" | "ultra"),
+        Agent::Omp => matches!(effort, "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "auto"),
     }
 }
 
@@ -53,7 +67,9 @@ pub struct LaunchSpec<'a> {
     pub effort: Option<&'a str>,
     pub task_file: &'a Path,
     pub unattended: bool,
-    /// Replaces `claude` / `codex` (tests and the hidden `SICH_ORCH_FAKE_AGENT` hook).
+    /// Use the installed status extension explicitly even if the worker shell uses another profile.
+    pub omp_extension: Option<&'a Path>,
+    /// Replaces the agent program in tests.
     pub program: Option<&'a str>,
 }
 
@@ -63,7 +79,7 @@ pub fn initial_prompt(task_file: &str) -> String {
 }
 
 fn path_is_safe(path: &str) -> bool {
-    !path.is_empty() && !path.chars().any(|c| matches!(c, '"' | '`' | '$' | '\r' | '\n' | '\0'))
+    !path.is_empty() && !path.chars().any(|c| matches!(c, '"' | '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' | '`' | '$' | '\r' | '\n' | '\0'))
 }
 
 /// A program the shell can run: bare when it is a plain word, otherwise `& "<path>"`.
@@ -80,13 +96,14 @@ pub fn autonomy_flag(agent: Agent) -> &'static str {
     match agent {
         Agent::Claude => "--dangerously-skip-permissions",
         Agent::Codex => "--dangerously-bypass-approvals-and-sandbox",
+        Agent::Omp => "--auto-approve",
     }
 }
 
 /// The exact line (without the trailing Enter) to type into PowerShell.
 pub fn build_command(spec: &LaunchSpec<'_>) -> Result<String, LaunchError> {
     if let Some(model) = spec.model {
-        if !valid_model(model) {
+        if !valid_model_for(spec.agent, model) {
             return Err(LaunchError::BadModel(model.to_string()));
         }
     }
@@ -121,6 +138,24 @@ pub fn build_command(spec: &LaunchSpec<'_>) -> Result<String, LaunchError> {
                 line.push_str(&format!(" -c model_reasoning_effort={e}"));
             }
         }
+        Agent::Omp => {
+            // A new directory per dispatch keeps omp's autoResume setting from injecting a task
+            // into the user's existing session, without disabling worker session persistence.
+            line.push_str(&format!(" --session-dir \"{path}.session\""));
+            if let Some(ext) = spec.omp_extension {
+                let text = ext.to_string_lossy();
+                if !ext.is_absolute() || !path_is_safe(&text) {
+                    return Err(LaunchError::BadExtension(text.into_owned()));
+                }
+                line.push_str(&format!(" --extension \"{text}\""));
+            }
+            if let Some(m) = spec.model {
+                line.push_str(&format!(" --model={m}"));
+            }
+            if let Some(e) = spec.effort {
+                line.push_str(&format!(" --thinking={e}"));
+            }
+        }
     }
     line.push_str(&format!(" \"{}\"", initial_prompt(&path)));
     Ok(line)
@@ -132,7 +167,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn spec<'a>(agent: Agent, model: Option<&'a str>, effort: Option<&'a str>, file: &'a Path) -> LaunchSpec<'a> {
-        LaunchSpec { agent, model, effort, task_file: file, unattended: true, program: None }
+        LaunchSpec { agent, model, effort, task_file: file, unattended: true, omp_extension: None, program: None }
     }
 
     #[test]
@@ -153,6 +188,33 @@ mod tests {
             cmd,
             r#"codex --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort=xhigh "You are a Sich worker. Read your task and instructions in C:\cfg\t_1.md and follow them exactly.""#
         );
+    }
+
+    #[test]
+    fn omp_worker_has_a_fresh_session_and_uses_native_flags() {
+        let file = Path::new("/tmp/worker tasks/t_1.md");
+        let extension = std::env::temp_dir().join("Sich extensions/omp.js");
+        let mut launch = LaunchSpec {
+            omp_extension: Some(&extension),
+            ..spec(Agent::Omp, Some("openai/gpt-5.4"), Some("minimal"), file)
+        };
+        let command = build_command(&launch).unwrap();
+        assert_eq!(command, format!(
+            "omp --auto-approve --session-dir \"/tmp/worker tasks/t_1.md.session\" --extension \"{}\" --model=openai/gpt-5.4 --thinking=minimal \"{}\"",
+            extension.display(), initial_prompt("/tmp/worker tasks/t_1.md"),
+        ));
+        launch.unattended = false;
+        assert!(!build_command(&launch).unwrap().contains("--auto-approve"));
+        launch.model = Some("openrouter/anthropic/claude-sonnet-4.5");
+        assert!(build_command(&launch).unwrap().contains("--model=openrouter/anthropic/claude-sonnet-4.5"));
+        launch.model = Some("openai/gpt;exit");
+        assert!(matches!(build_command(&launch), Err(LaunchError::BadModel(_))));
+        launch.model = None;
+        launch.effort = Some("ultra");
+        assert!(matches!(build_command(&launch), Err(LaunchError::BadEffort { .. })));
+        launch.effort = None;
+        launch.omp_extension = Some(Path::new("relative.js"));
+        assert!(matches!(build_command(&launch), Err(LaunchError::BadExtension(_))));
     }
 
     #[test]

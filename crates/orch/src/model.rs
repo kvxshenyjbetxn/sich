@@ -23,7 +23,7 @@ macro_rules! string_enum {
     };
 }
 
-string_enum!(Agent { Claude => "claude", Codex => "codex" });
+string_enum!(Agent { Claude => "claude", Codex => "codex", Omp => "omp" });
 string_enum!(TaskStatus { Pending => "pending", Dispatched => "dispatched", Completed => "completed", Failed => "failed" });
 string_enum!(DispatchState {
     Starting => "starting",

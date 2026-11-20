@@ -24,6 +24,7 @@ struct Harness {
     socket: String,
     outputs: HashMap<TermId, String>,
     hooked: HashSet<TermId>,
+    omp_hooked: HashSet<TermId>,
     removed: Vec<TermId>,
     created: Vec<TermId>,
     terminal_info: HashMap<TermId, TerminalInfo>,
@@ -59,6 +60,14 @@ impl Harness {
                     )
                     .await;
                 }
+                if text.contains("FAKE-OMP-STARTED") && self.omp_hooked.insert(id) {
+                    for payload in [
+                        r#"{"session_id":"omp-fixture","state":"idle"}"#,
+                        r#"{"session_id":"omp-fixture","state":"working","prompt":"go"}"#,
+                    ] {
+                        send(&mut self.conn, ClientMsg::AgentHook { term_id: id, agent: AgentKind::Omp, payload: payload.into() }).await;
+                    }
+                }
             }
             _ => {}
         }
@@ -77,6 +86,7 @@ impl Harness {
     /// Runs `sich orch <args>` as `term`, keeping the fake GUI reactions going meanwhile.
     async fn orch(&mut self, term: Option<TermId>, args: &[&str], extra_env: &[(&str, String)]) -> Output {
         let mut cmd = Command::new(BIN);
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         cmd.arg("orch").args(args).env("SICH_SOCKET", &self.socket).env_remove("SICH_TERM_ID");
         cmd.env("SICH_ORCH_FAKE_AGENT", &self.fake_agent).env("SICH_ORCH_READY_TIMEOUT_MS", "60000");
         if let Some(t) = term {
@@ -170,6 +180,7 @@ async fn coordinator_and_worker_round_trip_through_the_cli() {
         outputs: HashMap::new(),
         hooked: HashSet::new(),
         removed: Vec::new(),
+        omp_hooked: HashSet::new(),
         created: Vec::new(),
         terminal_info: HashMap::new(),
         fake_agent: fake.to_string_lossy().into_owned(),
@@ -296,6 +307,37 @@ async fn coordinator_and_worker_round_trip_through_the_cli() {
     h.pump_for(Duration::from_millis(500)).await;
     assert!(h.removed.contains(&worker), "terminal {worker} should be gone; removed: {:?}", h.removed);
     assert_eq!(db.get_dispatch(&dispatch).unwrap().unwrap().state, DispatchState::Released);
+
+    let not_installed = h.orch(
+        Some(coord), &["start", "--agent", "omp", "--spec", "Compare reports"],
+        &[("SICH_ORCH_FAKE_AGENT", String::new())],
+    ).await;
+    assert!(!not_installed.status.success());
+    assert!(String::from_utf8_lossy(&not_installed.stderr).contains("omp extension is not installed"));
+    assert_eq!(h.created.len(), terminals_before);
+
+    let omp = base.join("fake-omp.cmd");
+    std::fs::write(&omp, "@echo off\r\necho FAKE-OMP-STARTED %*\r\nping -n 180 127.0.0.1 >nul\r\n").unwrap();
+    let omp_args = ["start", "--agent", "omp", "--model", "openai/gpt-5.4", "--effort", "minimal", "--spec", "Compare reports"];
+    let opts = [("SICH_ORCH_FAKE_AGENT", omp.to_string_lossy().into_owned())];
+    let out = h.orch(Some(coord), &omp_args, &opts).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&out.stderr));
+    let line = stdout.lines().find(|line| line.starts_with("dispatch=")).unwrap();
+    let omp_dispatch = field(line, "dispatch");
+    let omp_worker: TermId = field(line, "terminal").parse().unwrap();
+    let actual = &h.outputs[&omp_worker];
+    assert!(actual.contains("--model=openai/gpt-5.4") && actual.contains("--thinking=minimal") && actual.contains(".md.session"), "{actual}");
+    assert_eq!(db.get_dispatch(&omp_dispatch).unwrap().unwrap().agent, sich_orch::Agent::Omp);
+    h.orch_ok(omp_worker, &["done", "--outcome", "succeeded", "--summary", "Compared reports"]).await;
+    assert!(h.orch_ok(coord, &["check"]).await.contains("Compared reports"));
+
+    // A foreign hook must not hide an omp setup failure or mark its dispatch ready.
+    let setup = base.join("fake-omp-setup.cmd");
+    std::fs::write(&setup, "@echo off\r\necho FAKE-AGENT-STARTED\r\necho Sign in to your providers\r\necho Select provider to login\r\nping -n 180 127.0.0.1 >nul\r\n").unwrap();
+    let out = h.orch(Some(coord), &omp_args, &[("SICH_ORCH_FAKE_AGENT", setup.to_string_lossy().into_owned())]).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success() && stdout.contains("state=blocked reason=omp-setup"), "{stdout}");
 
     worker_worktree_lifecycle(&mut h, &mut db, base).await;
 

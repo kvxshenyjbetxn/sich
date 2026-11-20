@@ -4,6 +4,7 @@
 //! worktrees and types launch commands through the client protocol.
 
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -16,11 +17,11 @@ use sich_orch::model::*;
 use sich_orch::paths;
 use sich_orch::preamble::{self, PreambleInput};
 use sich_orch::{Db, dialogs};
-use sich_proto::{AgentState, ClientMsg, ServerMsg, TermId, TerminalInfo};
+use sich_proto::{AgentKind, AgentState, ClientMsg, OMP_CLIENT_SUFFIX, ServerMsg, TermId, TerminalInfo};
 
 use crate::settings::AppSettings;
 
-/// Hidden test hook: replaces the `claude` / `codex` program in the launch command.
+/// Hidden test hook: replaces the worker agent program in the launch command.
 pub const ENV_FAKE_AGENT: &str = "SICH_ORCH_FAKE_AGENT";
 /// Hidden test hook: readiness timeout in milliseconds (default 90 s).
 pub const ENV_READY_TIMEOUT_MS: &str = "SICH_ORCH_READY_TIMEOUT_MS";
@@ -94,10 +95,16 @@ impl Caller {
         Some(TerminalScope { socket: &self.socket, legacy: self.socket == self.base })
     }
 
-    fn worker_socket(&self) -> String {
-        let entries = sich_daemon::generation::entries();
-        sich_daemon::generation::newest_compatible(&self.base, &entries)
-            .map_or_else(|| self.socket.clone(), |entry| entry.socket.clone())
+    fn worker_socket(&self, require_omp: bool) -> Result<String> {
+        let mut entries = sich_daemon::generation::entries();
+        if require_omp {
+            entries.retain(|entry| entry.omp_status);
+        }
+        match sich_daemon::generation::newest_compatible(&self.base, &entries) {
+            Some(entry) => Ok(entry.socket.clone()),
+            None if !require_omp => Ok(self.socket.clone()),
+            None => bail!("no Sich daemon supports omp workers; open the current Sich build first"),
+        }
     }
 }
 
@@ -526,13 +533,15 @@ pub enum Readiness {
     Timeout,
 }
 
-async fn wait_ready(link: &mut Link, term: TermId, timeout: Duration) -> Result<Readiness> {
+async fn wait_ready(link: &mut Link, term: TermId, agent: Agent, timeout: Duration) -> Result<Readiness> {
     let deadline = Instant::now() + timeout;
     let mut tail: Vec<u8> = Vec::new();
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match link.recv(left.min(Duration::from_millis(500))).await? {
             Some(ServerMsg::AgentStatusChanged { id, status: Some(s) }) if id == term => {
-                if matches!(s.state, AgentState::Working | AgentState::Done | AgentState::Waiting) {
+                if (agent != Agent::Omp || s.kind == AgentKind::Omp)
+                    && matches!(s.state, AgentState::Working | AgentState::Done | AgentState::Waiting)
+                {
                     return Ok(Readiness::Ready);
                 }
             }
@@ -541,7 +550,13 @@ async fn wait_ready(link: &mut Link, term: TermId, timeout: Duration) -> Result<
                 if tail.len() > OUTPUT_TAIL_BYTES {
                     tail.drain(..tail.len() - OUTPUT_TAIL_BYTES);
                 }
-                if let Some(dialog) = dialogs::detect(&String::from_utf8_lossy(&tail)) {
+                let output = String::from_utf8_lossy(&tail);
+                let dialog = if agent == Agent::Omp {
+                    dialogs::detect_omp(&output)
+                } else {
+                    dialogs::detect(&output)
+                };
+                if let Some(dialog) = dialog {
                     return Ok(Readiness::Blocked(dialog.reason()));
                 }
             }
@@ -607,6 +622,21 @@ async fn create_worker_terminal(
     bail!("the daemon did not create the worker terminal")
 }
 
+async fn omp_worker_extension(settings: &AppSettings) -> Result<PathBuf> {
+    if !settings.omp_hooks {
+        bail!("omp workers require status tracking; enable it in Sich Settings → Agents");
+    }
+    let receipt = crate::settings::config_file(crate::omp_hooks::RECEIPT)
+        .context("cannot locate the Sich config directory")?;
+    let extension = sich_hooks::omp_install::installed_extension(&receipt)?
+        .context("Sich's omp extension is not installed; check Settings → Agents")?;
+    match sich_hooks::omp_install::supports_hooks().await? {
+        Some(true) => Ok(extension),
+        Some(false) => bail!("omp workers require omp 19.0.1 or newer"),
+        None => bail!("omp was not found on PATH"),
+    }
+}
+
 async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
     let spec = match &args.spec {
         SpecSource::Text(t) => t.clone(),
@@ -621,12 +651,16 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
     let task_id = paths::new_task_id();
     let dispatch_id = paths::new_dispatch_id();
     let task_file = paths::task_file(&task_id).ok_or_else(|| anyhow!("cannot locate the config directory"))?;
+    let settings = AppSettings::load();
+    let require_omp = args.agent == Agent::Omp && program.is_none();
+    let omp_extension = if require_omp { Some(omp_worker_extension(&settings).await?) } else { None };
     let launch_spec = LaunchSpec {
         agent: args.agent,
         model: args.model.as_deref(),
         effort: args.effort.as_deref(),
         task_file: &task_file,
-        unattended: AppSettings::load().orch_unattended_workers,
+        unattended: settings.orch_unattended_workers,
+        omp_extension: omp_extension.as_deref(),
         program: program.as_deref(),
     };
     // Validate everything before any side effect.
@@ -639,8 +673,11 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
         .find(|t| t.id == caller.term)
         .ok_or_else(|| anyhow!("terminal {} is not known to the daemon", caller.term))?;
 
-    let worker_socket = caller.worker_socket();
-    if worker_socket != caller.socket {
+    let worker_socket = caller.worker_socket(require_omp)?;
+    if args.agent == Agent::Omp {
+        // Ask for the distinct omp status, not the legacy Other representation.
+        link = Link::connect(&worker_socket, &format!("sich-orch{OMP_CLIENT_SUFFIX}")).await?;
+    } else if worker_socket != caller.socket {
         link = Link::connect(&worker_socket, "sich-orch").await?;
     }
     let worker_worktree = if let Some(branch) = &args.worktree {
@@ -712,7 +749,7 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
     wait_for_prompt(&mut link, worker_term).await?;
     link.send(&ClientMsg::Input { id: worker_term, bytes: format!("{command}\r").into_bytes() }).await?;
 
-    let readiness = wait_ready(&mut link, worker_term, ready_timeout()).await?;
+    let readiness = wait_ready(&mut link, worker_term, args.agent, ready_timeout()).await?;
     let line = |state: &str, reason: Option<&str>| status_line(&dispatch_id, &task_id, worker_term, state, reason);
     match readiness {
         Readiness::Ready => {
@@ -723,7 +760,11 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
         }
         Readiness::Blocked(reason) => {
             say(&line("blocked", Some(reason)));
-            warn("The worker terminal shows a dialog that needs the user. Answer it there; the task file is already in place.");
+            if matches!(reason, "omp-setup" | "omp-no-model") {
+                warn("Set up a provider and model in the omp worker terminal. If the task did not start automatically, ask omp to read the task file shown in the launch command.");
+            } else {
+                warn("The worker terminal shows a dialog that needs the user. Answer it there; the task file is already in place.");
+            }
             Ok(1)
         }
         Readiness::Exited => {
@@ -759,7 +800,7 @@ fn release(caller: &Caller, dispatch_id: &str, remove_worktree: bool, rt: &tokio
     release_worker(&mut db, dispatch_id, ReleaseMode::Manual, &caller.base, rt)?;
     if let Some(wt) = worktree.filter(|wt| !wt.cleaned) {
         rt.block_on(async {
-            WorktreeClient::connect(&caller.worker_socket(), Some(&wt.identity)).await?.discard(wt).await
+            WorktreeClient::connect(&caller.worker_socket(false)?, Some(&wt.identity)).await?.discard(wt).await
         }).context("worker terminal closed, but worktree removal failed")?;
         db.mark_worktree_cleaned(dispatch_id)?;
     }

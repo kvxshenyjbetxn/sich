@@ -38,7 +38,7 @@ pub enum Command {
 
 pub const USAGE: &str = "\
 usage: sich orch <command>
-  start --agent claude|codex [--model M] [--effort E] [--title T] [--worktree NAME] (--spec TEXT | --spec-file PATH)
+  start --agent claude|codex|omp [--model M] [--effort E] [--title T] [--worktree NAME] (--spec TEXT | --spec-file PATH)
   send --to dispatch:<id>|coordinator --body TEXT [--subject S]
   check
   ask --question TEXT

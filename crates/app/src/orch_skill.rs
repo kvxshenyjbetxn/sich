@@ -52,21 +52,21 @@ pub fn render(exe: &Path) -> String {
     format!(
         "---
 name: sich-orchestration
-description: Use when the user asks to delegate or orchestrate work to Codex or Claude worker agents inside Sich, for example \"start a worker\", \"have codex do X and report back\", \"run these tasks in parallel with workers\" or \"ask claude to review this in another terminal\". Starts worker agents in new Sich terminals, hands them tasks, answers their questions and collects their results.
+description: Use when the user asks to delegate or orchestrate work to Codex or Claude worker agents, or to omp, inside Sich. For example, \"start a worker\", \"have codex do X and report back\", \"run these tasks in parallel with workers\" or \"ask omp to review this in another terminal\". Starts workers, hands them tasks, answers their questions and collects their results.
 allowed-tools: {allowed_tools}
 ---
 {MARKER}
 
 # Sich orchestration
 
-You are a coordinator running inside a Sich terminal. You can start worker agents (Codex or Claude) in new Sich terminals, give them tasks, answer their questions and collect their results. Workers are ordinary agent CLIs started with their own login; you never touch their terminals.
+You are a coordinator running inside a Sich terminal. You can start Claude Code, Codex, or omp worker agents in new Sich terminals, give them tasks, answer their questions and collect their results. Workers are ordinary agent CLIs started with their own login; you never touch their terminals.
 Workers start with the agent's full-autonomy flag unless the user turned that off in Sich settings.
 
 All commands are `{x} orch <command>`. In PowerShell write `& {x} orch <command>`. They identify you through the `SICH_TERM_ID` environment variable of this terminal, so they only work inside Sich.
 
 ## Commands
 
-- `start --agent claude|codex [--model M] [--effort E] [--title T] [--worktree <name>] (--spec TEXT | --spec-file PATH)`: opens a new terminal in the same project, starts the agent and gives it the task. Prints `dispatch=<id> task=<id> terminal=<n> state=working` when the worker is running. Use `--spec-file` for anything longer than a sentence.
+- `start --agent claude|codex|omp [--model M] [--effort E] [--title T] [--worktree <name>] (--spec TEXT | --spec-file PATH)`: opens a new terminal in the same project, starts the agent and gives it the task. Prints `dispatch=<id> task=<id> terminal=<n> state=working` when the worker is running. Use `--spec-file` for anything longer than a sentence. omp needs its Sich status extension and a configured model; it accepts `--model provider/model` and `--effort off|minimal|low|medium|high|xhigh|max|auto`.
 - `send --to dispatch:<id> --body TEXT [--subject S]`: a follow-up or guidance for a worker. A worker that already reported starts working again.
 - `check`: prints and consumes the mail addressed to you (questions, results, escalations).
 - `reply --id <message id> --body TEXT`: answers a worker's question.
@@ -236,7 +236,7 @@ mod tests {
     fn description_tells_when_to_use_it() {
         let text = render(&exe());
         let description = text.lines().find(|l| l.starts_with("description:")).unwrap();
-        for phrase in ["delegate", "Codex or Claude", "start a worker", "report back"] {
+        for phrase in ["delegate", "Codex or Claude", "omp", "start a worker", "report back"] {
             assert!(description.contains(phrase), "{phrase}");
         }
     }

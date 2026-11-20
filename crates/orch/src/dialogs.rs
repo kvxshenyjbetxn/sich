@@ -9,6 +9,8 @@ pub enum Dialog {
     TrustPrompt,
     /// A generic "press Enter to confirm" screen.
     ConfirmPrompt,
+    OmpSetup,
+    OmpNoModel,
 }
 
 impl Dialog {
@@ -17,6 +19,8 @@ impl Dialog {
             Self::CodexHooksReview => "codex-hooks-review",
             Self::TrustPrompt => "trust-prompt",
             Self::ConfirmPrompt => "confirm-prompt",
+            Self::OmpSetup => "omp-setup",
+            Self::OmpNoModel => "omp-no-model",
         }
     }
 }
@@ -82,6 +86,18 @@ pub fn detect(output: &str) -> Option<Dialog> {
     None
 }
 
+/// omp's onboarding and missing-model screens need user action, not a blind prompt submit.
+pub fn detect_omp(output: &str) -> Option<Dialog> {
+    let text = normalize(output);
+    if text.contains("sign in to your providers") && text.contains("select provider to login") {
+        Some(Dialog::OmpSetup)
+    } else if text.contains("warning: no default model selected.") {
+        Some(Dialog::OmpNoModel)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +132,19 @@ mod tests {
     fn detects_a_bare_confirmation_screen() {
         assert_eq!(detect("\x1b[2mEnter to confirm\x1b[0m"), Some(Dialog::ConfirmPrompt));
         assert_eq!(detect("Press\x1b[1Center\x1b[1Cto\x1b[1Cconfirm"), Some(Dialog::ConfirmPrompt));
+    }
+
+    #[test]
+    fn recognizes_omp_onboarding_and_missing_model_not_normal_output() {
+        assert_eq!(
+            detect_omp("Setup step 1 of 6\n\x1b[1mSign in to your providers\x1b[0m\r\nSelect provider to login"),
+            Some(Dialog::OmpSetup),
+        );
+        assert_eq!(
+            detect_omp("\x1b[33mWarning:\r\nNo default model selected. Use /login\x1b[0m"),
+            Some(Dialog::OmpNoModel),
+        );
+        assert_eq!(detect_omp("OMP 19.0.1 ready. Use /login to change providers."), None);
     }
 
     #[test]

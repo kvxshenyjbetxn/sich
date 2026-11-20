@@ -6,6 +6,8 @@ use sich_hooks::omp_install::{self, Status};
 use crate::i18n::{Language, Tr, tr};
 use crate::{agent_hooks, notifications, settings};
 
+pub(crate) const RECEIPT: &str = "omp-hook.json";
+
 struct InstallState(Option<Result<Status, String>>);
 impl Global for InstallState {}
 
@@ -31,7 +33,7 @@ pub(crate) fn apply(enable: Option<bool>, window: Option<&Window>, cx: &mut App)
     let handle = window.map(|w| w.window_handle());
     cx.spawn(async move |cx: &mut AsyncApp| {
         let result = cx.background_executor().spawn(async move {
-            let receipt = settings::config_file("omp-hook.json")
+            let receipt = settings::config_file(RECEIPT)
                 .ok_or_else(|| "cannot locate the Sich config directory".to_string())?;
             match enable {
                 Some(enable) => omp_install::configure(enable, &receipt),
