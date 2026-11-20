@@ -90,6 +90,7 @@ pub struct AppView {
     shown_error: Option<Instant>,
     /// Terminal that last received keyboard focus.
     focused: Option<TermId>,
+    pub(crate) usage_bar: crate::usage_bar::UsageBar,
     /// Whether the window has focus (kept by the activation observer and `sync`).
     window_active: bool,
     /// Native window handle for the taskbar flash (Windows).
@@ -255,6 +256,7 @@ impl AppView {
             seen_projects_rev: 0,
             shown_error: None,
             focused: None,
+            usage_bar: crate::usage_bar::UsageBar::default(),
             window_active: false,
             hwnd: None,
             attention: HashMap::new(),
@@ -347,6 +349,7 @@ impl AppView {
     /// the native handle (taskbar flash, hide to tray), close interception, the tray icon and
     /// window-bounds tracking for the session.
     pub fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.usage_bar.watch(window, cx);
         cx.observe(&self.git_panel, |this, panel, cx| {
             let collapsed = panel.read(cx).history_collapsed();
             if this.right_panel.history_collapsed != collapsed {
@@ -1220,6 +1223,7 @@ impl AppView {
         &self,
         snap: &Snapshot,
         lang: i18n::Language,
+        window_width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
@@ -1261,6 +1265,7 @@ impl AppView {
             .text_size(px(12.))
             .text_color(if old_build { theme.warning } else { theme.muted_foreground })
             .child(div().flex_1().child(indicator))
+            .children(self.usage_bar.render(lang, window_width, cx))
             .children(self.update_available.as_ref().map(|release| {
                 let app = app.clone();
                 h_flex()
@@ -1463,7 +1468,7 @@ impl Render for AppView {
         let right_w = clamp_right_w(self.right_panel.width.unwrap_or(DEFAULT_RIGHT_W), window_w, sidebar_w);
         let sidebar = self.render_sidebar(&snap, &infos, lang, sidebar_w, cx);
         let main = self.render_main(&snap, &infos, lang, cx);
-        let status_bar = self.render_status_bar(&snap, lang, cx);
+        let status_bar = self.render_status_bar(&snap, lang, window_w, cx);
         if matches!(snap.status, ConnStatus::Incompatible { .. })
             && !self.restarting_daemon && !self.restart_dialog_shown
         {

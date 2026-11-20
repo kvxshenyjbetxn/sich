@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, bail};
 use serde_json::{Map, Value, json};
 
+mod statusline;
+
+pub use statusline::{StatuslineState, update_statusline};
+
 const SETTINGS_FILE: &str = "settings.json";
 const BACKUP_FILE: &str = "settings.json.sich-backup";
 const TMP_FILE: &str = "settings.json.sich-tmp";

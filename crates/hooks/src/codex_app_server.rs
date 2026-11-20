@@ -36,6 +36,13 @@ fn initialized() -> Value {
     json!({ "method": "initialized" })
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Codex app-server {method} failed (RPC error {code})")]
+pub(crate) struct RpcError {
+    method: String,
+    pub(crate) code: i64,
+}
+
 fn parse_reply(line: &str, id: u64, method: &str) -> anyhow::Result<Option<Value>> {
     let mut message: Value = serde_json::from_str(line).context("invalid Codex app-server JSON")?;
     if message.get("method").is_some() || message["id"].as_u64() != Some(id) {
@@ -45,7 +52,7 @@ fn parse_reply(line: &str, id: u64, method: &str) -> anyhow::Result<Option<Value
     if let Some(error) = message.get("error").filter(|error| !error.is_null()) {
         // Report the code only. A server error may embed private config values.
         let code = error["code"].as_i64().unwrap_or_default();
-        bail!("Codex app-server {method} failed (RPC error {code})");
+        return Err(RpcError { method: method.into(), code }.into());
     }
     let result = message.get_mut("result").with_context(|| format!("missing result for {method}"))?;
     Ok(Some(result.take()))
@@ -200,11 +207,11 @@ if ($inputLine.method -ne 'initialize' -or $inputLine.params.clientInfo.name -ne
 $inputLine = [Console]::ReadLine() | ConvertFrom-Json
 if ($inputLine.method -ne 'initialized' -or $null -ne $inputLine.id) { exit 3 }
 $inputLine = [Console]::ReadLine() | ConvertFrom-Json
-if ($inputLine.id -ne 2 -or $inputLine.method -ne 'hooks/list') { exit 4 }
+if ($inputLine.id -ne 2 -or $inputLine.method -ne $env:SICH_FAKE_CODEX_METHOD) { exit 4 }
 switch ($env:SICH_FAKE_CODEX_REPLY) {
     'ok' {
         [Console]::WriteLine('{"method":"warning","params":{"message":"fake warning"}}')
-        [Console]::WriteLine('{"id":2,"result":{"data":[]}}')
+        [Console]::WriteLine($env:SICH_FAKE_CODEX_RESULT)
     }
     'error' {
         [Console]::WriteLine('{"id":2,"error":{"code":-32601,"message":"private data"}}')
@@ -213,7 +220,7 @@ switch ($env:SICH_FAKE_CODEX_REPLY) {
         [IO.File]::WriteAllText((Join-Path $env:CODEX_HOME 'waiting'), '')
         [Console]::Write('{"id":2,')
         [Console]::Out.Flush()
-        Start-Sleep -Milliseconds 850
+        Start-Sleep -Milliseconds ([int]$env:SICH_FAKE_CODEX_HANG_MS)
         [IO.File]::WriteAllText((Join-Path $env:CODEX_HOME 'survived'), '')
     }
 }
@@ -227,17 +234,17 @@ printf '%s\n' '{"id":1,"result":{"userAgent":"fake"}}'
 IFS= read -r request || exit 1
 [ "$request" = '{"method":"initialized"}' ] || exit 3
 IFS= read -r request || exit 1
-case "$request" in '{"id":2,"method":"hooks/list",'* ) ;; *) exit 4;; esac
+case "$request" in '{"id":2,"method":"'${SICH_FAKE_CODEX_METHOD}'",'* ) ;; *) exit 4;; esac
 case "$SICH_FAKE_CODEX_REPLY" in
     ok)
         printf '%s\n' '{"method":"warning","params":{"message":"fake warning"}}'
-        printf '%s\n' '{"id":2,"result":{"data":[]}}'
+        printf '%s\n' "$SICH_FAKE_CODEX_RESULT"
         ;;
     error) printf '%s\n' '{"id":2,"error":{"code":-32601,"message":"private data"}}';;
     hang)
         : > "$CODEX_HOME/waiting"
         printf '%s' '{"id":2,'
-        sleep 0.85
+        sleep "$SICH_FAKE_CODEX_HANG_SECONDS"
         : > "$CODEX_HOME/survived"
         ;;
 esac
@@ -264,7 +271,11 @@ esac
             command.arg(script);
             command
         };
-        command.env("SICH_FAKE_CODEX_REPLY", reply);
+        command.env("SICH_FAKE_CODEX_REPLY", reply)
+            .env("SICH_FAKE_CODEX_METHOD", "hooks/list")
+            .env("SICH_FAKE_CODEX_HANG_MS", "850")
+            .env("SICH_FAKE_CODEX_HANG_SECONDS", "0.85")
+            .env("SICH_FAKE_CODEX_RESULT", r#"{"id":2,"result":{"data":[]}}"#);
         command
     }
 
@@ -305,5 +316,34 @@ esac
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn fake_usage_success_error_and_timeout() {
+        use crate::usage::query_codex;
+
+        let home = tempfile::tempdir().unwrap();
+        let fake = |reply| {
+            let mut command = fake_command(home.path(), reply);
+            command.env("SICH_FAKE_CODEX_METHOD", "account/rateLimits/read")
+                .env("SICH_FAKE_CODEX_RESULT", r#"{"id":2,"result":{"rateLimits":{"primary":{"usedPercent":84}}}}"#)
+                .env("SICH_FAKE_CODEX_HANG_MS", "4000")
+                .env("SICH_FAKE_CODEX_HANG_SECONDS", "4");
+            command
+        };
+        let windows = bounded(query_codex(fake("ok"), home.path())).unwrap();
+        assert_eq!(windows.five_hour.unwrap().used_percent, 84.0);
+        let error = bounded(query_codex(fake("error"), home.path())).unwrap_err();
+        assert_eq!(error.downcast_ref::<RpcError>().unwrap().code, -32601);
+        assert!(!error.to_string().contains("private data"));
+        bounded(async {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                query_codex(fake("hang"), home.path()),
+            ).await;
+            assert!(result.is_err());
+            assert!(home.path().join("waiting").exists());
+            Ok(())
+        }).unwrap();
     }
 }

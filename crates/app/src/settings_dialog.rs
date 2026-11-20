@@ -28,6 +28,7 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, move |dialog, _window, cx| {
         let lang = settings::language(cx);
         let app = app.clone();
+        let prefs = settings::get(cx);
         dialog
             .title(tr(lang, Tr::Settings))
             .w(px(520.))
@@ -38,6 +39,18 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                     .child(section(tr(lang, Tr::Language), language_picker(lang, cx), cx))
                     .child(section(tr(lang, Tr::Theme), theme_cards(lang, cx), cx))
                     .child(section(tr(lang, Tr::AgentsSection), agents_section(lang, cx), cx))
+                    .child(
+                        Switch::new("usage-limits")
+                            .checked(prefs.usage_limits)
+                            .label(tr(lang, Tr::UsageLimits))
+                            .on_click(|checked, _, cx| settings::set_usage_limits(*checked, cx)),
+                    )
+                    .child(
+                        Switch::new("claude-statusline-wrap")
+                            .checked(prefs.claude_statusline_wrap)
+                            .label(tr(lang, Tr::ClaudeStatuslineWrap))
+                            .on_click(|checked, _, cx| settings::set_claude_statusline_wrap(*checked, cx)),
+                    )
                     .child(
                         Switch::new("resume-agents-on-restore")
                             .checked(settings::get(cx).resume_agents_on_restore)

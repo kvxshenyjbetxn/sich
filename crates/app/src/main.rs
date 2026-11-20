@@ -40,6 +40,7 @@ mod tray;
 mod update_dialog;
 mod update_status;
 mod updater;
+mod usage_bar;
 mod view;
 mod win_caret;
 mod win_flash;
@@ -67,6 +68,9 @@ fn main() -> anyhow::Result<()> {
     // never returns (always exits 0, prints nothing).
     if args.first().is_some_and(|a| a == "hook") {
         sich_hooks::hook_main(args.get(1).map_or("", String::as_str));
+    }
+    if args.first().is_some_and(|a| a == "statusline") {
+        std::process::exit(sich_hooks::statusline::run(&args[1..]));
     }
     // `sich orch <cmd>`: the orchestration CLI. Runs in place, never starts the GUI.
     if args.first().is_some_and(|a| a == "orch") {
