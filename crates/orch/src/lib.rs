@@ -2,6 +2,7 @@
 //! tasks and exchanges mail with them. Everything here is GPUI-free and daemon-protocol-free:
 //! state lives in a small SQLite database, the rest is pure decision logic.
 
+pub mod auto_close;
 pub mod cli_parse;
 pub mod db;
 pub mod delivery;

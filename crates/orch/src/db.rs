@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use rusqlite::{Connection, OptionalExtension as _, Row, TransactionBehavior, params};
 
+use crate::auto_close::due_for_close;
 use crate::model::*;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -73,10 +74,20 @@ const MIGRATIONS: &[&str] = &[
         last_pointed_ms INTEGER NOT NULL
     );
     ",
+    "
+    ALTER TABLE dispatches ADD COLUMN keep_open INTEGER NOT NULL DEFAULT 0 CHECK (keep_open IN (0,1));
+    ALTER TABLE dispatches ADD COLUMN auto_close_allowed_ms INTEGER;
+    ",
 ];
 
 pub struct Db {
     conn: Connection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseMode {
+    Manual,
+    AutoClose,
 }
 
 /// Result of [`Db::send_message`].
@@ -121,7 +132,8 @@ fn endpoint_cols(e: &Endpoint) -> (&'static str, Option<&str>) {
 }
 
 const TASK_COLS: &str = "id, run_id, title, spec, status, result_summary, report_path, files_modified, created_ms, updated_ms";
-const DISPATCH_COLS: &str = "id, task_id, run_id, worker_term, agent, model, effort, state, outcome, started_ms, ended_ms";
+const DISPATCH_COLS: &str =
+    "id, task_id, run_id, worker_term, agent, model, effort, state, outcome, started_ms, ended_ms, keep_open, auto_close_allowed_ms";
 const MESSAGE_COLS: &str =
     "id, run_id, from_kind, from_dispatch, to_kind, to_dispatch, type, subject, body, reply_to, payload, created_ms, read_ms";
 
@@ -153,7 +165,13 @@ fn dispatch_of(r: &Row<'_>) -> rusqlite::Result<Dispatch> {
         outcome: r.get(8)?,
         started_ms: r.get(9)?,
         ended_ms: r.get(10)?,
+        keep_open: r.get(11)?,
+        auto_close_allowed_ms: r.get(12)?,
     })
+}
+
+fn dispatch_by_id(conn: &Connection, id: &str) -> Result<Option<Dispatch>> {
+    Ok(conn.query_row(&format!("SELECT {DISPATCH_COLS} FROM dispatches WHERE id = ?1"), [id], dispatch_of).optional()?)
 }
 
 fn message_of(r: &Row<'_>) -> rusqlite::Result<Message> {
@@ -319,10 +337,7 @@ impl Db {
     }
 
     pub fn get_dispatch(&self, id: &str) -> Result<Option<Dispatch>> {
-        Ok(self
-            .conn
-            .query_row(&format!("SELECT {DISPATCH_COLS} FROM dispatches WHERE id = ?1"), [id], dispatch_of)
-            .optional()?)
+        dispatch_by_id(&self.conn, id)
     }
 
     pub fn list_tasks(&self, run_id: &str) -> Result<Vec<Task>> {
@@ -379,8 +394,43 @@ impl Db {
         Ok(self.conn.execute("UPDATE dispatches SET state = 'working' WHERE id = ?1 AND state = 'starting'", [id])? > 0)
     }
 
-    pub fn release_dispatch(&mut self, id: &str, now: i64) -> Result<()> {
-        self.set_dispatch_state(id, DispatchState::Released, now)
+    /// Keeps a live worker open, or starts a fresh grace period if the worker has finished.
+    pub fn set_keep_open(&mut self, id: &str, keep_open: bool, now: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE dispatches SET keep_open = ?2, auto_close_allowed_ms =
+                CASE WHEN NOT ?2 AND state IN ('done','failed') THEN ?3 END
+             WHERE id = ?1 AND state NOT IN ('lost','released') AND keep_open != ?2",
+            params![id, keep_open, now],
+        )? > 0)
+    }
+
+    /// Closes a worker and releases its dispatch. The write transaction prevents a resume or
+    /// Keep open from taking effect between the final check and closing the terminal.
+    pub fn release_dispatch(
+        &mut self,
+        id: &str,
+        now: i64,
+        mode: ReleaseMode,
+        close_terminal: impl FnOnce(&Dispatch) -> Result<()>,
+    ) -> Result<Option<u64>> {
+        let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let d = dispatch_by_id(&tx, id)?.with_context(|| format!("unknown dispatch {id}"))?;
+        match mode {
+            ReleaseMode::Manual if d.keep_open => {
+                bail!("the user chose Keep open for this worker; it stays open until they allow auto-close");
+            }
+            ReleaseMode::AutoClose if !due_for_close(d.auto_close_state(true), now) => return Ok(None),
+            _ => {}
+        }
+        if d.state != DispatchState::Released {
+            close_terminal(&d)?;
+            tx.execute(
+                "UPDATE dispatches SET state = 'released', ended_ms = COALESCE(ended_ms, ?2) WHERE id = ?1",
+                params![id, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Some(d.worker_term))
     }
 
     // ---- messages --------------------------------------------------------------------------
@@ -398,7 +448,8 @@ impl Db {
             match DispatchState::parse(&state) {
                 Some(DispatchState::Done | DispatchState::Failed) => {
                     tx.execute(
-                        "UPDATE dispatches SET state = 'working', outcome = NULL, ended_ms = NULL WHERE id = ?1",
+                        "UPDATE dispatches SET state = 'working', outcome = NULL, ended_ms = NULL,
+                                               auto_close_allowed_ms = NULL WHERE id = ?1",
                         [did],
                     )?;
                     tx.execute(
@@ -664,7 +715,8 @@ impl Db {
     pub fn snapshot(&self) -> Result<OrchSnapshot> {
         let mut snap = OrchSnapshot::default();
         let mut st = self.conn.prepare(
-            "SELECT d.worker_term, t.title, d.id, d.state, d.started_ms
+            "SELECT d.worker_term, t.title, d.id, d.state, d.started_ms,
+                    d.ended_ms, d.keep_open, d.auto_close_allowed_ms
              FROM dispatches d JOIN tasks t ON t.id = d.task_id
              WHERE d.state NOT IN ('lost','released') ORDER BY d.started_ms, d.rowid",
         )?;
@@ -676,6 +728,9 @@ impl Db {
                     dispatch_id: r.get(2)?,
                     state: enum_col(r, 3, DispatchState::parse)?,
                     started_ms: r.get(4)?,
+                    ended_ms: r.get(5)?,
+                    keep_open: r.get(6)?,
+                    auto_close_allowed_ms: r.get(7)?,
                 },
             ))
         })? {
@@ -740,6 +795,97 @@ mod tests {
         assert_eq!(again.schema_version().unwrap(), Db::latest_schema_version());
         let mode: String = f.db.conn.query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn migrates_v1_worker_rows_with_auto_close_enabled_by_default() {
+        use crate::auto_close::{AUTO_CLOSE_DELAY_MS, AutoClose};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orchestration.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (1);
+             INSERT INTO runs VALUES ('r_1', 1, 100);
+             INSERT INTO tasks (id, run_id, title, spec, status, created_ms, updated_ms)
+                 VALUES ('t_1', 'r_1', 'Fix parser', 'spec', 'completed', 100, 250);
+             INSERT INTO dispatches (id, task_id, run_id, worker_term, agent, state, outcome, started_ms, ended_ms)
+                 VALUES ('d_1', 't_1', 'r_1', 2, 'codex', 'done', 'succeeded', 100, 250);",
+        ).unwrap();
+        drop(conn);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), Db::latest_schema_version());
+        let d = db.get_dispatch("d_1").unwrap().unwrap();
+        assert_eq!(d.ended_ms, Some(250));
+        assert_eq!(d.outcome.as_deref(), Some("succeeded"));
+        assert!(!d.keep_open);
+        assert_eq!(d.auto_close_allowed_ms, None);
+        assert_eq!(d.auto_close_state(true), Some(AutoClose::ClosesAt(250 + AUTO_CLOSE_DELAY_MS)));
+    }
+
+    #[test]
+    fn keep_open_round_trips_and_allow_after_finish_restarts_the_grace_period() {
+        use crate::auto_close::{AUTO_CLOSE_DELAY_MS, AutoClose};
+
+        let mut f = fixture();
+        let (_, _, d) = started(&mut f);
+        assert!(f.db.set_keep_open(&d.id, true, 1_500).unwrap());
+        f.db.complete_dispatch(&d.id, Outcome::Succeeded, "done", None, &[], 2_000).unwrap().unwrap();
+
+        let mut db = Db::open(&f.path).unwrap();
+        assert_eq!(db.get_dispatch(&d.id).unwrap().unwrap().auto_close_state(true), Some(AutoClose::Kept));
+        assert!(db.set_keep_open(&d.id, false, 3_000).unwrap());
+        assert!(!db.set_keep_open(&d.id, false, 4_000).unwrap());
+        let changed = f.db.get_dispatch(&d.id).unwrap().unwrap();
+        assert_eq!(changed.ended_ms, Some(2_000));
+        assert_eq!(changed.auto_close_allowed_ms, Some(3_000));
+        assert_eq!(changed.auto_close_state(true), Some(AutoClose::ClosesAt(3_000 + AUTO_CLOSE_DELAY_MS)));
+        let snap = f.db.snapshot().unwrap();
+        assert_eq!(snap.workers[&d.worker_term].auto_close_state(true), changed.auto_close_state(true));
+    }
+
+    #[test]
+    fn auto_release_rechecks_keep_open_and_resume_and_retries_a_failed_close() {
+        use crate::auto_close::AUTO_CLOSE_DELAY_MS;
+
+        let mut f = fixture();
+        let (run, _, d) = started(&mut f);
+        f.db.complete_dispatch(&d.id, Outcome::Succeeded, "done", None, &[], 2_000).unwrap().unwrap();
+        let deadline = 2_000 + AUTO_CLOSE_DELAY_MS;
+        let mut db = Db::open(&f.path).unwrap();
+        f.db.set_keep_open(&d.id, true, deadline - 1).unwrap();
+        let skip = |_: &Dispatch| panic!("a kept or resumed worker must not close");
+        assert_eq!(db.release_dispatch(&d.id, deadline, ReleaseMode::AutoClose, skip).unwrap(), None);
+        let refusal = db.release_dispatch(&d.id, deadline, ReleaseMode::Manual, skip).unwrap_err();
+        assert_eq!(refusal.to_string(), "the user chose Keep open for this worker; it stays open until they allow auto-close");
+
+        f.db.set_keep_open(&d.id, false, deadline).unwrap();
+        let followup = msg(&run.id, Endpoint::Coordinator, Endpoint::Worker(d.id.clone()), MsgType::Message, "resume");
+        assert!(f.db.send_message(&followup, deadline + 1).unwrap().reopened);
+        let resumed = db.get_dispatch(&d.id).unwrap().unwrap();
+        assert_eq!((resumed.ended_ms, resumed.auto_close_allowed_ms), (None, None));
+        assert_eq!(db.release_dispatch(&d.id, deadline + 1, ReleaseMode::AutoClose, skip).unwrap(), None);
+
+        let finish = deadline + 2;
+        f.db.complete_dispatch(&d.id, Outcome::Failed, "second", None, &[], finish).unwrap().unwrap();
+        let deadline = finish + AUTO_CLOSE_DELAY_MS;
+        let mail_before = f.db.max_message_id().unwrap();
+        assert_eq!(db.release_dispatch(&d.id, deadline - 1, ReleaseMode::AutoClose, skip).unwrap(), None);
+        let error = db.release_dispatch(&d.id, deadline, ReleaseMode::AutoClose, |_| bail!("disconnected")).unwrap_err();
+        assert_eq!(error.to_string(), "disconnected");
+        assert_eq!(f.db.get_dispatch(&d.id).unwrap().unwrap().state, DispatchState::Failed);
+        let released = db.release_dispatch(&d.id, deadline + 1, ReleaseMode::AutoClose, |dispatch| {
+            assert_eq!(dispatch.worker_term, d.worker_term);
+            Ok(())
+        }).unwrap();
+        assert_eq!(released, Some(d.worker_term));
+        assert_eq!(f.db.get_dispatch(&d.id).unwrap().unwrap().state, DispatchState::Released);
+        assert!(!f.db.set_keep_open(&d.id, true, deadline + 1).unwrap());
+        assert_eq!(db.release_dispatch(&d.id, deadline + 2, ReleaseMode::AutoClose, skip).unwrap(), None);
+        assert_eq!(f.db.max_message_id().unwrap(), mail_before);
     }
 
     #[test]
@@ -878,7 +1024,7 @@ mod tests {
             f.db.complete_dispatch("d_ffffffff", Outcome::Succeeded, "x", None, &[], 5001).unwrap().unwrap_err(),
             DoneError::NotFound
         );
-        f.db.release_dispatch(&d.id, 6000).unwrap();
+        f.db.release_dispatch(&d.id, 6000, ReleaseMode::Manual, |_| Ok(())).unwrap();
         assert_eq!(
             f.db.complete_dispatch(&d.id, Outcome::Succeeded, "x", None, &[], 6001).unwrap().unwrap_err(),
             DoneError::Closed(DispatchState::Released)
@@ -906,7 +1052,7 @@ mod tests {
     fn released_or_lost_workers_cannot_receive_mail() {
         let mut f = fixture();
         let (run, _, d) = started(&mut f);
-        f.db.release_dispatch(&d.id, 3000).unwrap();
+        f.db.release_dispatch(&d.id, 3000, ReleaseMode::Manual, |_| Ok(())).unwrap();
         let err = f.db.send_message(&msg(&run.id, Endpoint::Coordinator, Endpoint::Worker(d.id.clone()), MsgType::Message, "hi"), 3100);
         assert!(err.unwrap_err().to_string().contains("released"));
         assert!(f.db.send_message(&msg(&run.id, Endpoint::Coordinator, Endpoint::Worker("d_nope0000".into()), MsgType::Message, "hi"), 3100).is_err());
@@ -942,7 +1088,7 @@ mod tests {
         f.db.take_unread(&Endpoint::Coordinator, &run.id, 3000).unwrap();
         assert_eq!(f.db.pending_recipients().unwrap().len(), 1);
         // Mail for a released worker is no longer pending.
-        f.db.release_dispatch(&d.id, 3100).unwrap();
+        f.db.release_dispatch(&d.id, 3100, ReleaseMode::Manual, |_| Ok(())).unwrap();
         assert!(f.db.pending_recipients().unwrap().is_empty());
     }
 
@@ -986,7 +1132,7 @@ mod tests {
         assert_eq!(snap.worker_title(2), Some("Fix parser"));
         assert!(snap.is_coordinator(1) && !snap.is_coordinator(2));
         assert_eq!(snap.workers[&2].state, DispatchState::Starting);
-        f.db.release_dispatch(&d.id, 3000).unwrap();
+        f.db.release_dispatch(&d.id, 3000, ReleaseMode::Manual, |_| Ok(())).unwrap();
         assert!(f.db.snapshot().unwrap().workers.is_empty());
     }
 

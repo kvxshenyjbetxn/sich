@@ -36,6 +36,8 @@ pub struct AppSettings {
     pub check_updates: bool,
     pub(crate) diff_mode: DiffMode,
     pub(crate) diff_wrap_lines: bool,
+    /// Close finished orchestration workers after their grace period.
+    pub orch_auto_close_workers: bool,
 }
 
 impl Default for AppSettings {
@@ -52,6 +54,7 @@ impl Default for AppSettings {
             check_updates: true,
             diff_mode: DiffMode::default(),
             diff_wrap_lines: false,
+            orch_auto_close_workers: true,
         }
     }
 }
@@ -161,6 +164,15 @@ pub fn set_orchestration_skill(enabled: bool, cx: &mut App) {
     }
     s.orchestration_skill = enabled;
     store(s, cx);
+}
+
+pub fn set_orch_auto_close_workers(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.orch_auto_close_workers != enabled {
+        s.orch_auto_close_workers = enabled;
+        store(s, cx);
+        cx.refresh_windows();
+    }
 }
 
 pub fn set_resume_agents_on_restore(enabled: bool, cx: &mut App) {
@@ -295,6 +307,16 @@ mod tests {
         let off = AppSettings { orchestration_skill: false, ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!back.orchestration_skill);
+    }
+
+    #[test]
+    fn orch_auto_close_workers_defaults_to_true_and_round_trips() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(old.orch_auto_close_workers);
+        assert!(AppSettings::default().orch_auto_close_workers);
+        let off = AppSettings { orch_auto_close_workers: false, ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.orch_auto_close_workers);
     }
 
     #[test]

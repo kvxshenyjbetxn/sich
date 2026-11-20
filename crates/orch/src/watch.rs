@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 
+use crate::auto_close::due_dispatches;
 use crate::db::Db;
 use crate::delivery::{self, DeliveryInput};
 use crate::escalation::{self, Escalation, EscalationInput};
@@ -29,6 +30,7 @@ pub struct TickInput<'a> {
     /// The terminal list is complete (connected, first list received). Without it a terminal
     /// that merely has not been listed yet would look gone.
     pub synced: bool,
+    pub auto_close_workers: bool,
     pub now_ms: i64,
     /// The sich executable as it should appear in the pointer text.
     pub exe: &'a str,
@@ -46,6 +48,8 @@ pub struct TickOutput {
     pub pointers: Vec<Pointer>,
     /// `Some` only when the sidebar data changed.
     pub snapshot: Option<OrchSnapshot>,
+    /// Finished dispatches ready for the GUI to release, including off-screen terminals.
+    pub due: Vec<String>,
 }
 
 pub struct Watcher {
@@ -113,6 +117,9 @@ impl Watcher {
                 out.snapshot = Some(snap);
             }
         }
+        if input.synced && input.auto_close_workers {
+            out.due = due_dispatches(&self.last_snapshot, input.auto_close_workers, input.now_ms);
+        }
         Ok(out)
     }
 }
@@ -128,7 +135,12 @@ fn term_signature(terms: &HashMap<u64, TermObs>) -> u64 {
 
 /// Drops rows that belong to terminals that no longer exist (or reused ids).
 fn visible_snapshot(mut snap: OrchSnapshot, terms: &HashMap<u64, TermObs>) -> OrchSnapshot {
-    snap.workers.retain(|term, w| terminal_alive(terms, *term, w.started_ms));
+    snap.workers.retain(|term, w| {
+        terms.get(term).is_some_and(|t| {
+            // Finished workers can leave an exited terminal pane whose scrollback is still visible.
+            t.created_ms <= w.started_ms && (!t.exited || matches!(w.state, DispatchState::Done | DispatchState::Failed))
+        })
+    });
     snap.coordinators.retain(|term, created| terminal_alive(terms, *term, *created));
     snap
 }
@@ -232,7 +244,7 @@ mod tests {
     }
 
     fn tick(w: &mut World, terms: &HashMap<u64, TermObs>, now: i64) -> TickOutput {
-        w.watcher.tick(&TickInput { terms, synced: true, now_ms: now, exe: "C:/sich.exe" })
+        w.watcher.tick(&TickInput { terms, synced: true, auto_close_workers: true, now_ms: now, exe: "C:/sich.exe" })
     }
 
     fn mail_to_coordinator(w: &mut World, body: &str, at: i64) -> i64 {
@@ -254,8 +266,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut watcher = Watcher::new(Some(dir.path().join("none.db")));
         let terms = HashMap::new();
-        let out = watcher.tick(&TickInput { terms: &terms, synced: true, now_ms: NOW, exe: "x" });
-        assert!(out.pointers.is_empty() && out.snapshot.is_none());
+        let out = watcher.tick(&TickInput { terms: &terms, synced: true, auto_close_workers: true, now_ms: NOW, exe: "x" });
+        assert!(out.pointers.is_empty() && out.snapshot.is_none() && out.due.is_empty());
         assert!(!dir.path().join("none.db").exists(), "the watcher must not create the database");
     }
 
@@ -377,7 +389,7 @@ mod tests {
         t2.exited = true;
         let terms = HashMap::from([(1, obs(AgentObs::Working, NOW)), (2, t2)]);
         // Not synced yet (e.g. reconnecting): nothing may be concluded.
-        w.watcher.tick(&TickInput { terms: &HashMap::new(), synced: false, now_ms: NOW, exe: "x" });
+        w.watcher.tick(&TickInput { terms: &HashMap::new(), synced: false, auto_close_workers: true, now_ms: NOW, exe: "x" });
         assert_eq!(w.db.get_dispatch(&w.dispatch.id).unwrap().unwrap().state, DispatchState::Working);
         tick(&mut w, &terms, NOW);
         assert_eq!(w.db.get_dispatch(&w.dispatch.id).unwrap().unwrap().state, DispatchState::Lost);
@@ -396,5 +408,33 @@ mod tests {
         let snap = tick(&mut w, &terms, NOW + 1000);
         // (The dispatch is also marked lost by the escalation pass, so the worker vanishes.)
         assert!(snap.snapshot.expect("changed").worker_title(2).is_none());
+    }
+
+    #[test]
+    fn deadlines_pass_without_snapshot_changes_and_skip_disabled_or_stale_workers() {
+        use crate::auto_close::AUTO_CLOSE_DELAY_MS;
+
+        let mut w = world();
+        let id = w.dispatch.id.clone();
+        w.db.complete_dispatch(&id, Outcome::Failed, "failed", None, &[], NOW).unwrap().unwrap();
+        let deadline = NOW + AUTO_CLOSE_DELAY_MS;
+        let mut exited_worker = obs(AgentObs::Failed, NOW);
+        exited_worker.exited = true;
+        let mut terms = HashMap::from([(1, obs(AgentObs::Idle, NOW)), (2, exited_worker)]);
+        assert!(tick(&mut w, &terms, deadline - 1).due.is_empty());
+        let out = tick(&mut w, &terms, deadline);
+        assert!(out.snapshot.is_none());
+        assert_eq!(out.due, [id.clone()]);
+
+        let input = TickInput { terms: &terms, synced: true, auto_close_workers: false, now_ms: deadline, exe: "x" };
+        assert!(w.watcher.tick(&input).due.is_empty());
+        assert!(w.watcher.tick(&TickInput { synced: false, auto_close_workers: true, ..input }).due.is_empty());
+        w.db.set_keep_open(&id, true, deadline).unwrap();
+        assert!(tick(&mut w, &terms, deadline).due.is_empty());
+        w.db.set_keep_open(&id, false, deadline).unwrap();
+        assert!(tick(&mut w, &terms, deadline + AUTO_CLOSE_DELAY_MS - 1).due.is_empty());
+        assert_eq!(tick(&mut w, &terms, deadline + AUTO_CLOSE_DELAY_MS).due, [id]);
+        terms.get_mut(&2).unwrap().created_ms = NOW;
+        assert!(tick(&mut w, &terms, deadline + AUTO_CLOSE_DELAY_MS).due.is_empty());
     }
 }

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, anyhow, bail};
 use futures::{SinkExt as _, StreamExt as _};
 use sich_orch::cli_parse::{self, Command, SpecSource, Target};
+use sich_orch::db::ReleaseMode;
 use sich_orch::launch::{self, LaunchSpec};
 use sich_orch::model::*;
 use sich_orch::paths;
@@ -89,8 +90,8 @@ fn execute(command: Command) -> Result<i32> {
             rt.block_on(start(&caller, StartArgs { agent, model, effort, title, spec }))
         }
         Command::Release { dispatch } => {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            rt.block_on(release(&caller, &dispatch))
+            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
+            release(&caller, &dispatch, rt.handle())
         }
         Command::Check => check(&caller),
         Command::Send { to, body, subject } => send(&caller, to, body, subject),
@@ -691,7 +692,7 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
 
 // ---- release ------------------------------------------------------------------------------
 
-async fn release(caller: &Caller, dispatch_id: &str) -> Result<i32> {
+fn release(caller: &Caller, dispatch_id: &str, rt: &tokio::runtime::Handle) -> Result<i32> {
     let mut db = open_db()?;
     let id = identify(&db, caller.term)?;
     let run = require_run(&id)?;
@@ -699,20 +700,44 @@ async fn release(caller: &Caller, dispatch_id: &str) -> Result<i32> {
     if d.run_id != run.id {
         bail!("dispatch {dispatch_id} does not belong to your run");
     }
-    let mut link = Link::connect(&caller.socket).await?;
-    link.send(&ClientMsg::KillTerminal { id: d.worker_term }).await?;
-    // Give the daemon a moment to act before this process exits.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-        match link.recv(left).await? {
-            Some(ServerMsg::TerminalRemoved { id }) if id == d.worker_term => break,
-            Some(_) => {}
-            None => break,
-        }
-    }
-    db.release_dispatch(dispatch_id, paths::now_ms())?;
+    release_worker(&mut db, dispatch_id, ReleaseMode::Manual, &caller.socket, rt)?;
     say(&format!("Released {dispatch_id} (terminal {} closed).", d.worker_term));
     Ok(0)
+}
+
+/// Shared by the CLI and the GUI watcher. Run on a thread that can block while SQLite holds
+/// the write transaction. Keep the daemon round trip shorter than SQLite's busy timeout.
+pub(crate) fn release_worker(
+    db: &mut Db,
+    dispatch_id: &str,
+    mode: ReleaseMode,
+    socket: &str,
+    rt: &tokio::runtime::Handle,
+) -> Result<()> {
+    db.release_dispatch(dispatch_id, paths::now_ms(), mode, |d| {
+        rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(4), close_worker_terminal(socket, d))
+                .await
+                .context("timed out closing the worker terminal")?
+        })
+    })?;
+    Ok(())
+}
+
+async fn close_worker_terminal(socket: &str, dispatch: &Dispatch) -> Result<()> {
+    let mut link = Link::connect(socket).await?;
+    let id = dispatch.worker_term;
+    // The daemon can reuse terminal ids after a restart. Check on the connection that will send
+    // KillTerminal so a stale dispatch cannot close an unrelated terminal in the new daemon.
+    if !link.list_terminals().await?.iter().any(|t| t.id == id && t.created_unix_ms as i64 <= dispatch.started_ms) {
+        return Ok(());
+    }
+    link.send(&ClientMsg::KillTerminal { id }).await?;
+    // A list after KillTerminal confirms its effect, even if the pane closed concurrently.
+    if link.list_terminals().await?.iter().any(|t| t.id == id) {
+        bail!("the daemon did not close worker terminal {id}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -732,6 +757,8 @@ mod tests {
             outcome: Some("succeeded".into()),
             started_ms: 0,
             ended_ms: None,
+            keep_open: false,
+            auto_close_allowed_ms: None,
         }
     }
 

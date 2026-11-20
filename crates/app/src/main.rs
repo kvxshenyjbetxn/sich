@@ -22,6 +22,7 @@ mod i18n;
 mod input;
 mod links;
 mod notifications;
+mod orch_banner;
 mod orch_cli;
 mod orch_skill;
 mod orch_watch;

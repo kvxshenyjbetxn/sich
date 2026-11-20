@@ -12,7 +12,12 @@ use crate::agent_hooks::auto_install_here;
 use crate::settings;
 
 pub const SKILL_DIR: &str = "sich-orchestration";
-pub const MARKER: &str = "<!-- sich:managed sich-orchestration-skill v1 -->";
+pub const MARKER: &str = "<!-- sich:managed sich-orchestration-skill v2 -->";
+const MARKER_V1: &str = "<!-- sich:managed sich-orchestration-skill v1 -->";
+
+fn is_managed(text: &str) -> bool {
+    text.contains(MARKER) || text.contains(MARKER_V1)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
@@ -61,7 +66,7 @@ All commands are `{x} orch <command>`. In PowerShell write `& {x} orch <command>
 - `check`: prints and consumes the mail addressed to you (questions, results, escalations).
 - `reply --id <message id> --body TEXT`: answers a worker's question.
 - `list`: your tasks and workers with their states.
-- `release --dispatch <id>`: closes the worker's terminal when you no longer need it.
+- `release --dispatch <id>`: closes a worker early, for example if it is stuck or no longer needed. It is refused if the user chose Keep open.
 
 Workers use `ask`, `send --to coordinator`, `done` and `check` themselves; their instructions are in the task file Sich writes for them.
 
@@ -75,7 +80,7 @@ Workers use `ask`, `send --to coordinator`, `done` and `check` themselves; their
    - `worker_done`: read the summary, report and files, verify what matters, and summarize the result for the user;
    - an escalation (a worker stopped without reporting, or its terminal exited): look at `list`, then re-brief the worker with `send`, start a replacement or tell the user.
 5. For follow-up work on the same worker use `send --to dispatch:<id>`; it reopens a finished worker.
-6. When everything is done run `release` for the workers you no longer need.
+6. When auto-close is enabled, finished workers close automatically two minutes after `worker_done`. Reserve `release` for workers you need to close early.
 
 ## Rules
 
@@ -94,7 +99,7 @@ pub fn install(claude_dir: &Path, exe: &Path) -> std::io::Result<InstallOutcome>
     let content = render(exe);
     match std::fs::read_to_string(&file) {
         Ok(existing) if existing == content => return Ok(InstallOutcome::Unchanged),
-        Ok(existing) if !existing.contains(MARKER) => return Ok(InstallOutcome::ForeignFile),
+        Ok(existing) if !is_managed(&existing) => return Ok(InstallOutcome::ForeignFile),
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -107,7 +112,7 @@ pub fn install(claude_dir: &Path, exe: &Path) -> std::io::Result<InstallOutcome>
 pub fn remove(claude_dir: &Path) -> std::io::Result<RemoveOutcome> {
     let file = skill_file(claude_dir);
     match std::fs::read_to_string(&file) {
-        Ok(existing) if existing.contains(MARKER) => {
+        Ok(existing) if is_managed(&existing) => {
             std::fs::remove_file(&file)?;
             if let Some(dir) = file.parent() {
                 // Only succeeds when empty: never delete files that are not ours.
@@ -185,6 +190,8 @@ mod tests {
         for rule in ["END YOUR TURN", "Never poll", "Never type into a worker's terminal", "state=blocked", "state=unknown"] {
             assert!(text.contains(rule), "missing {rule}");
         }
+        assert!(text.contains("finished workers close automatically two minutes after `worker_done`"));
+        assert!(text.contains("It is refused if the user chose Keep open"));
     }
 
     #[test]
@@ -208,6 +215,18 @@ mod tests {
         assert_eq!(install(dir.path(), &exe()).unwrap(), InstallOutcome::ForeignFile);
         assert_eq!(remove(dir.path()).unwrap(), RemoveOutcome::ForeignFile);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "my own skill");
+    }
+
+    #[test]
+    fn previous_managed_skill_can_be_upgraded_or_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = skill_file(dir.path());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, MARKER_V1).unwrap();
+        assert_eq!(install(dir.path(), &exe()).unwrap(), InstallOutcome::Written);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), render(&exe()));
+        std::fs::write(&file, MARKER_V1).unwrap();
+        assert_eq!(remove(dir.path()).unwrap(), RemoveOutcome::Removed);
     }
 
     #[test]
