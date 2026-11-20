@@ -2,8 +2,7 @@
 //!
 //! Safety rules: only our own entries are ever added, changed or removed; everything else (user
 //! hooks, key order) is kept; an unparsable `hooks.json` is never touched; the first modification
-//! makes a backup. We never write Codex's trust state (`[hooks.state]` / `trusted_hash`) and never
-//! bypass hook trust: the user approves our hooks once with `/hooks` inside Codex.
+//! makes a backup. Trust is reconciled separately through Codex app-server.
 //!
 //! Codex identifies a hook for trust by `<path>:<event>:<group_index>:<handler_index>`, so our
 //! matcher group is always APPENDED to an event's array (user hook indexes never shift) and an
@@ -143,24 +142,37 @@ pub fn events_for_version(version: Option<&str>) -> Vec<&'static EventDef> {
     }
 }
 
-/// Runs `codex --version` (hidden window, 3 s timeout).
-pub fn probe_codex_version() -> Option<String> {
-    let mut cmd;
-    if cfg!(windows) {
-        // `codex` may be a `.cmd` shim (npm install), which only the shell resolves.
-        cmd = Command::new("cmd");
-        cmd.args(["/C", "codex", "--version"]);
-    } else {
-        cmd = Command::new("codex");
-        cmd.arg("--version");
-    }
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+// Use the same executable lookup for version gating and app-server, including npm .cmd shims.
+pub(crate) fn codex_command(arg: &str) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/D", "/C", "codex", arg]).creation_flags(CREATE_NO_WINDOW);
+        cmd
     }
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new("codex");
+        cmd.arg(arg);
+        cmd
+    }
+}
+
+/// Runs `codex --version` (hidden window, 3 s timeout).
+pub fn probe_codex_version() -> Option<String> {
+    probe_version(codex_command("--version"))
+}
+
+pub(crate) fn probe_codex_version_in(home: &Path) -> Option<String> {
+    let mut cmd = codex_command("--version");
+    cmd.env("CODEX_HOME", home);
+    probe_version(cmd)
+}
+
+fn probe_version(mut cmd: Command) -> Option<String> {
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn().ok()?;
     let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
     loop {
@@ -364,7 +376,7 @@ fn hooks_path(dir: &Path) -> PathBuf {
 }
 
 /// Reads hooks.json: `Ok(None)` when missing, an empty file counts as `{}`.
-fn read_hooks(path: &Path) -> anyhow::Result<Option<Value>> {
+pub(crate) fn read_hooks(path: &Path) -> anyhow::Result<Option<Value>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),

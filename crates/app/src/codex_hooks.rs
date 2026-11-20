@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::{App, AsyncApp, Global, Window};
 use sich_hooks::codex_install::{self, InstallReport, Skipped};
+use sich_hooks::codex_trust;
 
 use crate::agent_hooks::auto_install_here;
 use crate::i18n::{self, Language, Tr, tr};
@@ -16,7 +17,12 @@ pub enum CodexStatus {
     /// `codex --version` failed.
     NotFound,
     TooOld,
-    Installed { events: Option<usize>, version: Option<String> },
+    Installed {
+        events: Option<usize>,
+        version: Option<String>,
+        trust_pending: bool,
+    },
+    CleanupPending,
     Error(String),
 }
 
@@ -49,6 +55,7 @@ pub fn status_after(enable: bool, result: anyhow::Result<InstallReport>) -> Code
             None => CodexStatus::Installed {
                 events: Some(report.installed.len()),
                 version: report.codex_version,
+                trust_pending: false,
             },
         },
         Ok(_) => CodexStatus::NotInstalled,
@@ -60,7 +67,7 @@ pub fn status_after(enable: bool, result: anyhow::Result<InstallReport>) -> Code
 pub fn current_status(dir: Option<&Path>, exe: Option<&Path>) -> CodexStatus {
     match (dir, exe) {
         (Some(dir), Some(exe)) if codex_install::is_installed(dir, exe) => {
-            CodexStatus::Installed { events: None, version: None }
+            CodexStatus::Installed { events: None, version: None, trust_pending: false }
         }
         _ => CodexStatus::NotInstalled,
     }
@@ -72,14 +79,18 @@ pub fn status_text(lang: Language, status: &CodexStatus) -> (String, bool) {
         CodexStatus::NotInstalled => (tr(lang, Tr::HooksNotInstalled).to_string(), false),
         CodexStatus::NotFound => (tr(lang, Tr::CodexNotFound).to_string(), false),
         CodexStatus::TooOld => (tr(lang, Tr::CodexTooOld).to_string(), false),
-        CodexStatus::Installed { events, version } => {
+        CodexStatus::Installed { trust_pending: true, .. } => {
+            (tr(lang, Tr::CodexTrustPending).to_string(), false)
+        }
+        CodexStatus::CleanupPending => (tr(lang, Tr::CodexTrustCleanupPending).to_string(), false),
+        CodexStatus::Installed { events, version, .. } => {
             (i18n::codex_hooks_installed(lang, *events, version.as_deref()), false)
         }
         CodexStatus::Error(e) => (e.clone(), true),
     }
 }
 
-/// Blocking install/uninstall (runs `codex --version`, so never on the UI thread).
+/// Blocking hook install/uninstall and trust reconciliation.
 fn run(enable: bool, dir: Option<PathBuf>, exe: Option<PathBuf>) -> CodexStatus {
     let (Some(dir), Some(exe)) = (dir, exe) else {
         return CodexStatus::Error("cannot locate the Codex home directory or the sich executable".into());
@@ -89,7 +100,28 @@ fn run(enable: bool, dir: Option<PathBuf>, exe: Option<PathBuf>) -> CodexStatus 
     } else {
         codex_install::uninstall(&dir, &exe)
     };
-    status_after(enable, result)
+    let trust = match &result {
+        Ok(report) if enable && report.skipped.is_none() => {
+            trust_ledger().and_then(|ledger| codex_trust::approve_installed(&dir, &exe, report, &ledger))
+        }
+        Ok(_) if !enable => trust_ledger().and_then(|ledger| codex_trust::clear_approvals(&dir, &ledger)),
+        _ => Ok(()),
+    };
+    let mut status = status_after(enable, result);
+    if let Err(err) = trust {
+        tracing::warn!(error = %err, enable, "Codex hook trust reconciliation failed");
+        match &mut status {
+            CodexStatus::Installed { trust_pending, .. } => *trust_pending = true,
+            CodexStatus::NotInstalled => status = CodexStatus::CleanupPending,
+            _ => {}
+        }
+    }
+    status
+}
+
+fn trust_ledger() -> anyhow::Result<PathBuf> {
+    settings::config_file(codex_trust::LEDGER_FILE)
+        .ok_or_else(|| anyhow::anyhow!("cannot locate the Sich config directory"))
 }
 
 /// Installs or removes the hooks on the background executor and publishes the result.
@@ -142,7 +174,7 @@ mod tests {
         };
         assert_eq!(
             status_after(true, Ok(report.clone())),
-            CodexStatus::Installed { events: Some(2), version: Some("0.170.0".into()) }
+            CodexStatus::Installed { events: Some(2), version: Some("0.170.0".into()), trust_pending: false }
         );
         assert_eq!(status_after(false, Ok(report)), CodexStatus::NotInstalled);
         let skipped = |s| InstallReport { skipped: Some(s), ..Default::default() };
@@ -155,12 +187,25 @@ mod tests {
     fn status_lines() {
         let (text, err) = status_text(
             Language::En,
-            &CodexStatus::Installed { events: Some(8), version: Some("0.170.0".into()) },
+            &CodexStatus::Installed {
+                events: Some(8),
+                version: Some("0.170.0".into()),
+                trust_pending: false,
+            },
         );
         assert_eq!(text, "Hooks installed (8 events, Codex v0.170.0)");
         assert!(!err);
         assert_eq!(status_text(Language::En, &CodexStatus::NotFound).0, "Codex not found");
         assert_eq!(status_text(Language::En, &CodexStatus::NotInstalled).0, "Not installed");
+        let pending = CodexStatus::Installed { events: Some(8), version: None, trust_pending: true };
+        assert_eq!(
+            status_text(Language::En, &pending),
+            ("Hooks installed. Codex may still ask for approval (/hooks)".into(), false)
+        );
+        assert_eq!(
+            status_text(Language::En, &CodexStatus::CleanupPending),
+            ("Hooks removed. Their Codex approvals could not be cleared".into(), false)
+        );
         let (text, err) = status_text(Language::Uk, &CodexStatus::Error("x".into()));
         assert_eq!((text.as_str(), err), ("x", true));
     }

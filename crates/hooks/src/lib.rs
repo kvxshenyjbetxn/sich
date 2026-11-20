@@ -2,7 +2,9 @@
 //! registers it in Claude Code's `settings.json`.
 
 pub mod claude_install;
+mod codex_app_server;
 pub mod codex_install;
+pub mod codex_trust;
 mod hook;
 
 pub use hook::{
