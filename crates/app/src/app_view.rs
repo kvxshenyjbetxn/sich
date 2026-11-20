@@ -34,6 +34,8 @@ use crate::session::{self, RightPanelState, RightTab, SavedWindow, Session, Sess
 use crate::settings;
 use crate::settings_dialog;
 use crate::tray::{self, Tray, UiEvent};
+use crate::update_dialog::{self, UpdateFlow};
+use crate::updater;
 use crate::view::TerminalView;
 use crate::workspace::{
     PendingWorktree, WorkspaceKey, Workspaces, cycle_id,
@@ -123,6 +125,9 @@ pub struct AppView {
     pub(crate) right_panel: RightPanelState,
     right_dragging: bool,
     hidden_to_tray: bool,
+    /// Newer release found by the periodic check.
+    update_available: Option<updater::Release>,
+    update_flow: Option<Arc<UpdateFlow>>,
 }
 
 impl AppView {
@@ -207,6 +212,7 @@ impl AppView {
         })
         .detach();
 
+        Self::start_update_checks(cx);
         Self {
             client,
             views: HashMap::new(),
@@ -256,6 +262,8 @@ impl AppView {
             right_panel,
             right_dragging: false,
             hidden_to_tray: false,
+            update_available: None,
+            update_flow: None,
         }
     }
 
@@ -411,7 +419,7 @@ impl AppView {
                 }
             }
             UiEvent::Restart if !self.restarting_daemon => {
-                if let Err(err) = self.save_current_session().and_then(|()| crate::cli::spawn_replacement_ui()) {
+                if let Err(err) = self.restart_ui() {
                     self.show_window(cx);
                     notifications::show_error(format!("{err:#}"), window, cx);
                 }
@@ -419,6 +427,71 @@ impl AppView {
             UiEvent::Takeover | UiEvent::Restart => {}
             UiEvent::Quit => self.request_quit(window, cx),
         }
+    }
+
+    /// Saves the session and starts a replacement UI (it takes over this one).
+    pub(crate) fn restart_ui(&mut self) -> anyhow::Result<()> {
+        self.save_current_session().and_then(|()| crate::cli::spawn_replacement_ui())
+    }
+
+    // ---- updates -----------------------------------------------------------------------------
+
+    /// Periodic release check (official builds only). Errors are logged and ignored.
+    fn start_update_checks(cx: &mut Context<Self>) {
+        if !updater::OFFICIAL {
+            return;
+        }
+        if let Some(dir) = updater::install_dir() {
+            cx.background_executor().spawn(async move { updater::cleanup_old(&dir) }).detach();
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(updater::FIRST_CHECK_DELAY).await;
+            loop {
+                let wanted = this
+                    .update(cx, |this, cx| {
+                        settings::get(cx).check_updates && this.update_flow.is_none()
+                    })
+                    .unwrap_or(false);
+                if wanted {
+                    let found = cx
+                        .background_executor()
+                        .spawn(async { updater::fetch_latest(&updater::current_version()) })
+                        .await;
+                    match found {
+                        Ok(release) => {
+                            let alive = this.update(cx, |this, cx| {
+                                if this.update_flow.is_none() {
+                                    this.update_available = release;
+                                    cx.notify();
+                                }
+                            });
+                            if alive.is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => tracing::debug!("update check failed: {err:#}"),
+                    }
+                }
+                cx.background_executor().timer(updater::CHECK_INTERVAL).await;
+            }
+        })
+        .detach();
+    }
+
+    /// The flow shown by the update dialog; created from the pending release on first use.
+    pub(crate) fn update_flow_for_dialog(&mut self) -> Option<Arc<UpdateFlow>> {
+        if self.update_flow.is_none() {
+            self.update_flow = self.update_available.clone().map(UpdateFlow::new);
+        }
+        self.update_flow.clone()
+    }
+
+    pub(crate) fn finish_update_flow(&mut self) {
+        self.update_flow = None;
+    }
+
+    pub(crate) fn start_update(&mut self, flow: Arc<UpdateFlow>, window: &mut Window, cx: &mut Context<Self>) {
+        update_dialog::run(cx.entity(), flow, window, cx);
     }
 
     fn show_window(&mut self, cx: &mut Context<Self>) {
@@ -1092,6 +1165,20 @@ impl AppView {
             .text_size(px(12.))
             .text_color(if old_build { theme.warning } else { theme.muted_foreground })
             .child(div().flex_1().child(text))
+            .children(self.update_available.as_ref().map(|release| {
+                let app = app.clone();
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child(i18n::update_available(lang, &release.version.to_string())),
+                    )
+                    .child(Button::new("update-available").xsmall().label(tr(lang, Tr::Update)).on_click(
+                        move |_, window, cx| update_dialog::open(app.clone(), window, cx),
+                    ))
+            }))
             .children(restart.then(|| {
                 Button::new("restart-daemon").xsmall().label(tr(lang, Tr::RestartDaemon)).on_click(
                     move |_, window, cx| {
