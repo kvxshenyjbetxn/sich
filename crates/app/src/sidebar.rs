@@ -89,12 +89,15 @@ pub fn workspace_badge(key: &WorkspaceKey, infos: &[TerminalInfo]) -> Option<Bad
     )
 }
 
-/// Terminals shown as a nested sub-list under `key` (tab-bar order): when it has 2 or more, or
-/// any of them runs an agent (so a single agent terminal still gets its rich row).
+/// Terminals shown as a nested sub-list under `key` (tab-bar order). Home always lists its
+/// terminals; a worktree lists them when it has at least two or any of them runs an agent.
 pub fn sub_list_ids(key: &WorkspaceKey, infos: &[TerminalInfo]) -> Vec<TermId> {
     let ids = terminals_in(key, infos);
+    if *key == WorkspaceKey::Home || ids.len() >= 2 {
+        return ids;
+    }
     let has_agent = ids.iter().any(|id| infos.iter().any(|t| t.id == *id && t.agent.is_some()));
-    if ids.len() >= 2 || has_agent { ids } else { Vec::new() }
+    if has_agent { ids } else { Vec::new() }
 }
 
 /// Wall-clock time for relative ages.
@@ -104,8 +107,8 @@ pub fn now_unix_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Whether a workspace row is highlighted. With a sub-list the active child carries the
-/// highlight, so the parent does not. (The roll-up badge is shown either way, on the left.)
+/// Whether a workspace row is highlighted. With a visible sub-list the active child carries
+/// the highlight, so the parent does not.
 pub fn parent_row_state(workspace_selected: bool, has_sub_list: bool) -> bool {
     workspace_selected && !has_sub_list
 }
@@ -374,18 +377,40 @@ impl AppView {
 
         let home_key = WorkspaceKey::Home;
         let home_sub = sub_list_ids(&home_key, infos);
-        let home_highlight = parent_row_state(self.ws.selected == home_key, !home_sub.is_empty());
-        let home_row = row_base("ws-home", home_highlight, 0., &theme)
+        let home_expanded = !self.home_collapsed && !home_sub.is_empty();
+        let home_highlight = parent_row_state(self.ws.selected == home_key, home_expanded);
+        let mut home_row = row_base("ws-home", home_highlight, 0., &theme)
             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                 this.select_workspace(WorkspaceKey::Home, window, cx)
             }))
             .child(Icon::new(Ic::House).small().text_color(muted))
             .child(div().flex_1().min_w_0().truncate().text_size(px(13.)).child(tr(lang, Tr::Home)));
-        // Home has only 8px of left padding: the left roll-up badge does not fit, so it is skipped
-        // (the terminal rows below carry their own badges).
-        let home = v_flex()
-            .child(home_row)
-            .children(self.render_term_rows(&home_key, &home_sub, INDENT, snap, lang, cx));
+        if !home_sub.is_empty() {
+            if self.home_collapsed {
+                home_row = home_row.children(
+                    workspace_badge(&home_key, infos)
+                        .map(|b| badge_element(&b, false, lang, "home-agent", cx)),
+                );
+            }
+            home_row = home_row.child(
+                h_flex()
+                    .id("home-toggle")
+                    .size(px(ROW_H))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _w, cx| {
+                        cx.stop_propagation();
+                        this.home_collapsed = !this.home_collapsed;
+                        cx.notify();
+                    }))
+                    .child(chevron(home_expanded, muted)),
+            );
+        }
+        let mut home = v_flex().child(home_row);
+        if home_expanded {
+            home = home.children(self.render_term_rows(&home_key, &home_sub, INDENT, snap, lang, cx));
+        }
 
         let mut body = v_flex().id("sidebar-body").flex_1().min_h_0().overflow_y_scroll().child(home);
 
@@ -1105,8 +1130,8 @@ mod tests {
         // Two terminals, one with an agent: both listed.
         let infos = vec![term(1, None, None), term(2, None, Some((AgentState::Working, false)))];
         assert_eq!(sub_list_ids(&WorkspaceKey::Home, &infos), vec![1, 2]);
-        // A single agent-free terminal stays hidden.
-        assert!(sub_list_ids(&WorkspaceKey::Home, &infos[..1]).is_empty());
+        // Unlike a worktree, Home lists a single plain shell.
+        assert_eq!(sub_list_ids(&WorkspaceKey::Home, &infos[..1]), vec![1]);
     }
 
     #[test]
@@ -1138,6 +1163,22 @@ mod tests {
             term(3, None, None),
         ];
         assert_eq!(sub_list_ids(&WorkspaceKey::Home, &infos), vec![1, 3]);
+    }
+
+    #[test]
+    fn home_sub_list_and_rollup_exclude_worktree_agents() {
+        let home = WorkspaceKey::Home;
+        let mut infos = vec![term(1, Some("/w/a"), Some((AgentState::Waiting, false)))];
+        assert!(sub_list_ids(&home, &infos).is_empty());
+        assert_eq!(kind(workspace_badge(&home, &infos)), None);
+
+        infos.push(term(2, None, None));
+        assert_eq!(sub_list_ids(&home, &infos), vec![2]);
+        assert_eq!(kind(workspace_badge(&home, &infos)), None);
+
+        infos[1] = term(2, None, Some((AgentState::Working, false)));
+        assert_eq!(sub_list_ids(&home, &infos), vec![2]);
+        assert_eq!(kind(workspace_badge(&home, &infos)), Some(BadgeKind::Working));
     }
 
     #[test]

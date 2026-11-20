@@ -93,6 +93,8 @@ pub struct AppView {
     pub(crate) projects: Vec<ProjectInfo>,
     pub(crate) worktree_visibility: crate::worktree_visibility::Store,
     pub(crate) groups: Vec<GroupInfo>,
+    /// Whether the Home terminal list is collapsed.
+    pub(crate) home_collapsed: bool,
     /// Groups whose project list is collapsed (default: expanded).
     pub(crate) collapsed_groups: HashSet<GroupId>,
     /// Projects whose tree is collapsed (default: expanded).
@@ -279,6 +281,7 @@ impl AppView {
             projects: Vec::new(),
             worktree_visibility: Default::default(),
             groups: Vec::new(),
+            home_collapsed: saved.as_ref().is_some_and(|s| s.home_collapsed),
             collapsed_groups: HashSet::new(),
             collapsed: HashSet::new(),
             pending_creates: VecDeque::new(),
@@ -748,6 +751,7 @@ impl AppView {
             ws: &self.ws,
             projects: &self.projects,
             groups: &self.groups,
+            home_collapsed: self.home_collapsed,
             collapsed: &self.collapsed,
             collapsed_groups: &self.collapsed_groups,
             window: self.window_state,

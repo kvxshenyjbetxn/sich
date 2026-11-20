@@ -21,6 +21,8 @@ pub struct Session {
     pub selected: Option<PathBuf>,
     pub daemon_pid: Option<u32>,
     pub workspaces: Vec<SavedWorkspace>,
+    /// Whether the Home terminal list is collapsed (expanded in older sessions).
+    pub home_collapsed: bool,
     /// Collapsed projects by path (ids may change between daemon runs).
     pub collapsed_projects: Vec<PathBuf>,
     /// Collapsed groups by name.
@@ -318,6 +320,7 @@ pub struct SessionInput<'a> {
     pub ws: &'a Workspaces,
     pub projects: &'a [ProjectInfo],
     pub groups: &'a [GroupInfo],
+    pub home_collapsed: bool,
     pub collapsed: &'a HashSet<ProjectId>,
     pub collapsed_groups: &'a HashSet<GroupId>,
     pub window: Option<SavedWindow>,
@@ -359,6 +362,7 @@ pub fn build_session(input: &SessionInput) -> Session {
         selected: input.ws.selected.path().map(Path::to_path_buf),
         daemon_pid: None,
         workspaces,
+        home_collapsed: input.home_collapsed,
         collapsed_projects: input
             .projects
             .iter()
@@ -633,6 +637,7 @@ mod tests {
         assert_eq!(s.selected, Some(PathBuf::from("/w/a")));
         assert_eq!(s.workspaces.len(), 1);
         assert!(s.workspaces[0].terminals.is_empty());
+        assert!(!s.home_collapsed);
         assert!(!s.has_terminals());
     }
 
@@ -651,6 +656,7 @@ mod tests {
             selected: Some("/w/a".into()),
             daemon_pid: Some(45),
             workspaces: vec![saved_ws(None, &["/h"], Some(0)), saved_ws(Some("/w/a"), &["/w/a", "/w/a/src"], Some(1))],
+            home_collapsed: true,
             collapsed_projects: vec!["/w".into()],
             collapsed_groups: vec!["game".into()],
             window: Some(SavedWindow { x: 10., y: 20., width: 900., height: 700., maximized: true, display: None }),
@@ -695,6 +701,7 @@ mod tests {
             ws: &ws,
             projects: &projects,
             groups: &[],
+            home_collapsed: true,
             collapsed: &collapsed,
             collapsed_groups: &cg,
             window: None,
@@ -702,6 +709,7 @@ mod tests {
             right_panel: RightPanelState::default(),
         });
         assert_eq!(s.selected, Some(PathBuf::from("/w/a-x")));
+        assert!(s.home_collapsed);
         assert_eq!(s.workspaces.len(), 3);
         let mut expected = [
             saved_ws(None, &["/home"], Some(0)),
@@ -732,6 +740,7 @@ mod tests {
             ws: &ws,
             projects: &projects,
             groups: &groups,
+            home_collapsed: false,
             collapsed: &collapsed,
             collapsed_groups: &cg,
             window: Some(SavedWindow { x: 1., y: 2., width: 800., height: 600., maximized: false, display: None }),
@@ -757,6 +766,7 @@ mod tests {
             ws: &ws,
             projects: &[],
             groups: &[],
+            home_collapsed: false,
             collapsed: &c,
             collapsed_groups: &g,
             window: None,
