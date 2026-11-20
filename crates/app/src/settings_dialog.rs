@@ -48,6 +48,12 @@ pub fn open(window: &mut Window, cx: &mut App) {
                             }),
                     )
                     .child(
+                        Switch::new("check-updates")
+                            .checked(settings::get(cx).check_updates)
+                            .label(tr(lang, Tr::CheckUpdates))
+                            .on_click(|checked, _window, cx| settings::set_check_updates(*checked, cx)),
+                    )
+                    .child(
                         Switch::new("close-to-tray")
                             .checked(settings::get(cx).close_to_tray)
                             .label(tr(lang, Tr::CloseToTray))

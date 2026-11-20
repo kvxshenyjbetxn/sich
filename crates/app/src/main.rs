@@ -36,6 +36,8 @@ mod term_images;
 mod term_settings;
 mod theme;
 mod tray;
+mod update_dialog;
+mod updater;
 mod view;
 mod win_caret;
 mod win_flash;

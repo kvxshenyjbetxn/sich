@@ -32,6 +32,8 @@ pub struct AppSettings {
     /// Closing the window hides it to the system tray instead of quitting.
     pub close_to_tray: bool,
     pub resume_agents_on_restore: bool,
+    /// Periodically check GitHub Releases for a newer version (official builds only).
+    pub check_updates: bool,
     pub(crate) diff_mode: DiffMode,
     pub(crate) diff_wrap_lines: bool,
 }
@@ -47,6 +49,7 @@ impl Default for AppSettings {
             orchestration_skill: true,
             close_to_tray: true,
             resume_agents_on_restore: true,
+            check_updates: true,
             diff_mode: DiffMode::default(),
             diff_wrap_lines: false,
         }
@@ -164,6 +167,14 @@ pub fn set_resume_agents_on_restore(enabled: bool, cx: &mut App) {
     let mut s = get(cx);
     if s.resume_agents_on_restore != enabled {
         s.resume_agents_on_restore = enabled;
+        store(s, cx);
+    }
+}
+
+pub fn set_check_updates(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.check_updates != enabled {
+        s.check_updates = enabled;
         store(s, cx);
     }
 }
@@ -309,6 +320,18 @@ mod tests {
         assert!(!back.close_to_tray);
         let parsed: AppSettings = serde_json::from_str(r#"{"close_to_tray":false}"#).unwrap();
         assert!(!parsed.close_to_tray);
+    }
+
+    #[test]
+    fn check_updates_defaults_to_true_and_can_be_disabled() {
+        let old: AppSettings = serde_json::from_str(r#"{"language":"uk"}"#).unwrap();
+        assert!(old.check_updates);
+        assert!(AppSettings::default().check_updates);
+        let off = AppSettings { check_updates: false, ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.check_updates);
+        let parsed: AppSettings = serde_json::from_str(r#"{"check_updates":false}"#).unwrap();
+        assert!(!parsed.check_updates);
     }
 
     #[test]

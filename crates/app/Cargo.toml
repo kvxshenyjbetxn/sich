@@ -38,6 +38,10 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 sys-locale = "0.3"
 dunce = "1"
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+ureq = "2"
+semver = "1"
+sha2 = "0.10"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 [target.'cfg(windows)'.dependencies]

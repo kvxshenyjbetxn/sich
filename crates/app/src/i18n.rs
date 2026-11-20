@@ -109,6 +109,15 @@ pub enum Tr {
     MoveToGroup,
     RemoveFromGroup,
     CloseToTray,
+    Close,
+    Update,
+    UpdateTitle,
+    Later,
+    Downloading,
+    Verifying,
+    Installing,
+    CheckUpdates,
+    NoWriteAccess,
     TrayShow,
     TrayQuit,
     TrayRestart,
@@ -239,6 +248,15 @@ impl Tr {
         Tr::MoveToGroup,
         Tr::RemoveFromGroup,
         Tr::CloseToTray,
+        Tr::Close,
+        Tr::Update,
+        Tr::UpdateTitle,
+        Tr::Later,
+        Tr::Downloading,
+        Tr::Verifying,
+        Tr::Installing,
+        Tr::CheckUpdates,
+        Tr::NoWriteAccess,
         Tr::TrayShow,
         Tr::TrayQuit,
         Tr::TrayRestart,
@@ -883,6 +901,51 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "Сворачивать в трей при закрытии",
             En => "Minimize to tray on close",
         },
+        Tr::Update => match lang {
+            Uk => "Оновити",
+            Ru => "Обновить",
+            En => "Update",
+        },
+        Tr::UpdateTitle => match lang {
+            Uk => "Оновлення Sich",
+            Ru => "Обновление Sich",
+            En => "Sich update",
+        },
+        Tr::Later => match lang {
+            Uk => "Пізніше",
+            Ru => "Позже",
+            En => "Later",
+        },
+        Tr::Downloading => match lang {
+            Uk => "Завантаження…",
+            Ru => "Загрузка…",
+            En => "Downloading…",
+        },
+        Tr::Verifying => match lang {
+            Uk => "Перевірка…",
+            Ru => "Проверка…",
+            En => "Verifying…",
+        },
+        Tr::Installing => match lang {
+            Uk => "Встановлення…",
+            Ru => "Установка…",
+            En => "Installing…",
+        },
+        Tr::CheckUpdates => match lang {
+            Uk => "Перевіряти оновлення",
+            Ru => "Проверять обновления",
+            En => "Check for updates",
+        },
+        Tr::NoWriteAccess => match lang {
+            Uk => "Немає прав на запис у теку програми. Перенесіть Sich у теку користувача.",
+            Ru => "Нет прав на запись в папку программы. Перенесите Sich в папку пользователя.",
+            En => "No write access to the program folder. Move Sich to a user folder.",
+        },
+        Tr::Close => match lang {
+            Uk => "Закрити",
+            Ru => "Закрыть",
+            En => "Close",
+        },
         Tr::TrayShow => match lang {
             Uk => "Показати Sich",
             Ru => "Показать Sich",
@@ -1054,6 +1117,32 @@ pub fn connected(lang: Language, pid: u32) -> String {
     }
 }
 
+pub fn update_available(lang: Language, version: &str) -> String {
+    match lang {
+        Language::Uk => format!("Доступна версія {version}"),
+        Language::Ru => format!("Доступна версия {version}"),
+        Language::En => format!("Version {version} available"),
+    }
+}
+
+pub fn update_failed(lang: Language, err: &str) -> String {
+    match lang {
+        Language::Uk => format!("Не вдалося оновити: {err}"),
+        Language::Ru => format!("Не удалось обновить: {err}"),
+        Language::En => format!("Update failed: {err}"),
+    }
+}
+
+/// "{done} / {total} МБ ({pct}%)"; sizes in MiB with one decimal.
+pub fn download_progress(lang: Language, done: u64, total: u64) -> String {
+    let mb = |n: u64| n as f64 / (1024.0 * 1024.0);
+    let unit = match lang {
+        Language::Uk | Language::Ru => "МБ",
+        Language::En => "MB",
+    };
+    format!("{:.1} / {:.1} {unit} ({}%)", mb(done), mb(total), crate::updater::percent(done, total))
+}
+
 pub fn new_worktree_title(lang: Language, project: &str) -> String {
     format!("{} \u{2014} {project}", tr(lang, Tr::NewWorktree))
 }
@@ -1154,6 +1243,9 @@ mod tests {
             assert!(daemon_incompatible(lang, None, 2).contains("v2"));
             assert!(exited_tab(lang, "pwsh").starts_with("pwsh ("));
             assert!(more_subagents(lang, 7).contains('7'));
+            assert!(update_available(lang, "1.2.3").contains("1.2.3"));
+            assert!(update_failed(lang, "boom").contains("boom"));
+            assert!(download_progress(lang, 1024 * 1024, 4 * 1024 * 1024).contains("(25%)"));
             assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains('9'));
             assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains("v2.1.3"));
             assert!(!hooks_installed(lang, None, None).contains('('));
