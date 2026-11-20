@@ -72,7 +72,10 @@ impl AppView {
                 .agent
                 .as_ref()
                 .and_then(badge_for)
-                .map(|b| badge_element(&b, lang, ("tab-badge", id), cx));
+                .map(|b| {
+                    let is_worker = !exited && crate::orch_watch::worker_for_terminal(&self.orch, &entry.info).is_some();
+                    badge_element(&b, is_worker, lang, ("tab-badge", id), cx)
+                });
             let agent_icon = entry
                 .info
                 .agent

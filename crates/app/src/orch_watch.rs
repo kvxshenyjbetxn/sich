@@ -6,7 +6,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use sich_orch::db::{Db, ReleaseMode};
-use sich_orch::model::{AgentObs, OrchSnapshot};
+use sich_orch::model::{AgentObs, OrchSnapshot, WorkerInfo};
 use sich_orch::watch::TermObs;
 use sich_proto::{AgentState, AgentStatus, TermId, TerminalInfo};
 
@@ -103,6 +103,12 @@ pub fn bracketed_paste(text: &str) -> Vec<u8> {
     bytes
 }
 
+/// Matches a worker to its original terminal even when terminal ids are reused.
+pub fn worker_for_terminal<'a>(snapshot: &'a OrchSnapshot, terminal: &TerminalInfo) -> Option<&'a WorkerInfo> {
+    let created_ms = i64::try_from(terminal.created_unix_ms).ok()?;
+    snapshot.workers.get(&terminal.id).filter(|worker| created_ms <= worker.started_ms)
+}
+
 /// The second line of a worker's sidebar row: the existing preview wins, otherwise
 /// `worker · <task title>`.
 pub fn worker_preview(snapshot: &OrchSnapshot, term: TermId, lang: Language, existing: Option<String>) -> Option<String> {
@@ -177,6 +183,31 @@ mod tests {
     #[test]
     fn bracketed_paste_wraps_the_text() {
         assert_eq!(bracketed_paste("hi"), b"\x1b[200~hi\x1b[201~".to_vec());
+    }
+
+    #[test]
+    fn worker_matches_only_its_original_terminal() {
+        let mut snap = OrchSnapshot::default();
+        snap.workers.insert(
+            4,
+            WorkerInfo {
+                task_title: "Fix parser".into(),
+                dispatch_id: "d_1".into(),
+                state: sich_orch::model::DispatchState::Working,
+                started_ms: 1234,
+                ended_ms: None,
+                keep_open: false,
+                auto_close_allowed_ms: None,
+            },
+        );
+        assert!(worker_for_terminal(&snap, &info(5, None, false)).is_none());
+
+        let mut terminal = info(4, None, false);
+        assert_eq!(worker_for_terminal(&snap, &terminal), snap.workers.get(&4));
+        terminal.created_unix_ms -= 1;
+        assert_eq!(worker_for_terminal(&snap, &terminal), snap.workers.get(&4));
+        terminal.created_unix_ms += 2;
+        assert!(worker_for_terminal(&snap, &terminal).is_none());
     }
 
     #[test]

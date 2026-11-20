@@ -1180,8 +1180,8 @@ impl AppView {
         let content = match (diff, active.and_then(|a| self.views.get(&a).map(|view| (a, view)))) {
             (Some(tab), _) => div().flex_1().min_h_0().w_full().child(tab.view.clone()),
             (None, Some((id, view))) => {
-                let banner = self.orch.workers.get(&id)
-                    .filter(|worker| infos.iter().any(|t| t.id == id && t.created_unix_ms as i64 <= worker.started_ms))
+                let banner = infos.iter().find(|t| t.id == id)
+                    .and_then(|t| orch_watch::worker_for_terminal(&self.orch, t))
                     .and_then(|worker| crate::orch_banner::render(worker, self.orch_now_ms, lang, cx));
                 div().relative().flex_1().min_h_0().w_full().child(view.clone()).children(banner)
             }

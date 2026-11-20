@@ -488,7 +488,7 @@ impl AppView {
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child(group.name.clone()),
             )
-            .children(badge.map(|b| badge_element(&b, lang, ("group-agent", gid), cx)))
+            .children(badge.map(|b| badge_element(&b, false, lang, ("group-agent", gid), cx)))
             .child(actions)
             .child(chevron(expanded, muted))
             .context_menu(move |menu, _w, _cx| group_menu(menu, &ctx_app, &ctx_g, lang));
@@ -567,7 +567,7 @@ impl AppView {
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .child(project.name.clone()),
             )
-            .children(collapsed_badge.map(|b| badge_element(&b, lang, ("proj-agent", pid), cx)))
+            .children(collapsed_badge.map(|b| badge_element(&b, false, lang, ("proj-agent", pid), cx)))
             .child(actions)
             .child(chevron(expanded, muted))
             .context_menu(move |menu, w, cx| {
@@ -656,7 +656,7 @@ impl AppView {
         }
         let badge_x = left_badge_x(base + INDENT);
         if let Some(b) = agent.filter(|_| badge_x >= 0.) {
-            let el = badge_element(&b, lang, SharedString::from(format!("wt-agent:{uid}")), cx);
+            let el = badge_element(&b, false, lang, SharedString::from(format!("wt-agent:{uid}")), cx);
             row = row.relative().child(
                 div().absolute().left(px(badge_x)).top(px((ROW_H - BADGE_W) / 2.)).child(el),
             );
@@ -708,7 +708,10 @@ impl AppView {
                     .agent
                     .as_ref()
                     .and_then(badge_for)
-                    .map(|b| badge_element(&b, lang, ("side-term-badge", id), cx));
+                    .map(|b| {
+                        let is_worker = !exited && crate::orch_watch::worker_for_terminal(&self.orch, &entry.info).is_some();
+                        badge_element(&b, is_worker, lang, ("side-term-badge", id), cx)
+                    });
                 let close = Button::new(("side-term-close", id))
                     .ghost()
                     .xsmall()
@@ -852,7 +855,7 @@ impl AppView {
         std::hash::Hash::hash(&(term, &sub.id), &mut hasher);
         let uid = std::hash::Hasher::finish(&hasher);
         let tip = subagent_tooltip(sub);
-        let badge = badge_element(&subagent_badge(sub), lang, ("side-sub-badge", uid), cx);
+        let badge = badge_element(&subagent_badge(sub), false, lang, ("side-sub-badge", uid), cx);
         row_base(("side-sub", uid), false, indent, &theme)
             .h(px(SUB_ROW_H))
             .gap(px(ROW_GAP))

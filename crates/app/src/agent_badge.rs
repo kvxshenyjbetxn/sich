@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use gpui_kit::assets::IconName as Ic;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, Icon, Size, Sizable as _};
+use gpui_kit::component::{ActiveTheme as _, Icon, Size, Sizable as _, Theme};
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, App, Hsla, InteractiveElement as _, IntoElement,
     ParentElement as _, StatefulInteractiveElement as _, Styled as _, Transformation, div,
@@ -200,10 +200,10 @@ pub fn strip_status_glyphs(title: &str) -> &str {
     }
 }
 
-fn badge_color(kind: BadgeKind, cx: &App) -> Hsla {
-    let p = theme::palette(settings::get(cx).theme);
+fn badge_color(kind: BadgeKind, is_worker: bool, theme: &Theme, p: theme::Palette) -> Hsla {
     match kind {
-        BadgeKind::Working => cx.theme().primary,
+        BadgeKind::Working if is_worker => theme.warning,
+        BadgeKind::Working => theme.primary,
         BadgeKind::Waiting => rgb(p.agent_waiting).into(),
         BadgeKind::Done | BadgeKind::SeenDone => rgb(p.agent_done).into(),
         BadgeKind::Failed => rgb(p.agent_failed).into(),
@@ -229,11 +229,13 @@ fn tooltip_text(lang: Language, badge: &Badge) -> String {
 /// The 14px icon with a tooltip. `id` must be unique among siblings.
 pub fn badge_element(
     badge: &Badge,
+    is_worker: bool,
     lang: Language,
     id: impl Into<gpui_kit::ElementId>,
     cx: &App,
 ) -> AnyElement {
-    let color = badge_color(badge.kind, cx);
+    let palette = theme::palette(settings::get(cx).theme);
+    let color = badge_color(badge.kind, is_worker, cx.theme(), palette);
     let size = Size::Size(px(BADGE_ICON_SIZE));
     let text = tooltip_text(lang, badge);
     let id: gpui_kit::ElementId = id.into();
@@ -271,6 +273,28 @@ pub fn badge_element(
 mod tests {
     use super::*;
     use sich_proto::AgentKind;
+
+    #[test]
+    fn only_worker_spinners_use_the_theme_warning_color() {
+        let mut theme = Theme::default();
+        theme.colors.primary = rgb(0x123456).into();
+        theme.colors.warning = rgb(0xabcdef).into();
+        for kind in theme::ThemeKind::ALL {
+            let p = theme::palette(kind);
+            assert_eq!(badge_color(BadgeKind::Working, true, &theme, p), theme.warning);
+            assert_eq!(badge_color(BadgeKind::Working, false, &theme, p), theme.primary);
+            for (kind, color) in [
+                (BadgeKind::Waiting, p.agent_waiting),
+                (BadgeKind::Done, p.agent_done),
+                (BadgeKind::SeenDone, p.agent_done),
+                (BadgeKind::Failed, p.agent_failed),
+            ] {
+                for is_worker in [false, true] {
+                    assert_eq!(badge_color(kind, is_worker, &theme, p), Hsla::from(rgb(color)));
+                }
+            }
+        }
+    }
 
     fn st(state: AgentState, unread: bool, detail: Option<&str>) -> AgentStatus {
         AgentStatus {
