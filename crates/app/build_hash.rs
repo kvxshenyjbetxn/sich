@@ -8,12 +8,13 @@ use std::path::Path;
 
 /// Files/dirs (relative to the workspace root) the daemon's behavior depends on.
 /// The daemon links only `sich-proto` from the workspace.
-pub const DAEMON_INPUTS: [&str; 5] = [
+pub const DAEMON_INPUTS: [&str; 4] = [
     "crates/daemon/src",
     "crates/daemon/Cargo.toml",
     "crates/proto/src",
     "crates/proto/Cargo.toml",
-    "Cargo.lock",
+    // Not Cargo.lock: it changes whenever any crate in the workspace gains a dependency,
+    // which made every UI update look like a daemon update.
 ];
 
 /// Replaces every CRLF with LF so line-ending churn does not change the hash.
