@@ -38,7 +38,7 @@ stopped freely (`sich daemon stop` with `SICH_SOCKET=sich-uitest`, then taskkill
 - Official builds (`SICH_RELEASE=1`) run the GUI in place (one taskbar identity) and check GitHub for updates
   (`crates/app/src/updater.rs`, `update_dialog.rs`): ask first, show progress, rename-swap the 4 files in the
   user's folder, then `--takeover`. Dev builds still relocate the GUI and never check for updates.
-- Note: after a release, `targetelease\sich.exe` is an official build (runs in place, locks the file). For dev
+- Note: after a release, `target\release\sich.exe` is an official build (runs in place, locks the file). For dev
   use, run the normal `cargo build --release` again.
 
 ## Task B — daemons side by side, like Orca (bigger; removes most "restart daemon" prompts)
