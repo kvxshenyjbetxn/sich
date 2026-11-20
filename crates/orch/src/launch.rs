@@ -74,6 +74,14 @@ fn program_text(program: &str) -> Result<String, LaunchError> {
     Ok(if plain { program.to_string() } else { format!("& \"{program}\"") })
 }
 
+/// The agent CLI's documented "no approval prompts" flag.
+pub fn autonomy_flag(agent: Agent) -> &'static str {
+    match agent {
+        Agent::Claude => "--dangerously-skip-permissions",
+        Agent::Codex => "--dangerously-bypass-approvals-and-sandbox",
+    }
+}
+
 /// The exact line (without the trailing Enter) to type into PowerShell.
 pub fn build_command(spec: &LaunchSpec<'_>) -> Result<String, LaunchError> {
     if let Some(model) = spec.model {
@@ -90,11 +98,12 @@ pub fn build_command(spec: &LaunchSpec<'_>) -> Result<String, LaunchError> {
     if !path_is_safe(&path) {
         return Err(LaunchError::BadPath(path.into_owned()));
     }
-    let program = match spec.program {
+    // Workers run unattended (like Orca): the agent's own official full-autonomy flag, so no
+    // per-command approval prompts block the task. Fake test programs get no flag.
+    let mut line = match spec.program {
         Some(p) => program_text(p)?,
-        None => spec.agent.as_str().to_string(),
+        None => format!("{} {}", spec.agent.as_str(), autonomy_flag(spec.agent)),
     };
-    let mut line = program;
     match spec.agent {
         Agent::Claude => {
             if let Some(m) = spec.model {
@@ -132,7 +141,7 @@ mod tests {
         let cmd = build_command(&spec(Agent::Claude, Some("opus"), Some("high"), &file)).unwrap();
         assert_eq!(
             cmd,
-            r#"claude --model opus --effort high "You are a Sich worker. Read your task and instructions in C:\cfg\sich\orch\tasks\t_0a1b2c3d.md and follow them exactly.""#
+            r#"claude --dangerously-skip-permissions --model opus --effort high "You are a Sich worker. Read your task and instructions in C:\cfg\sich\orch\tasks\t_0a1b2c3d.md and follow them exactly.""#
         );
     }
 
@@ -142,7 +151,7 @@ mod tests {
         let cmd = build_command(&spec(Agent::Codex, Some("gpt-5.4"), Some("xhigh"), &file)).unwrap();
         assert_eq!(
             cmd,
-            r#"codex -m gpt-5.4 -c model_reasoning_effort=xhigh "You are a Sich worker. Read your task and instructions in C:\cfg\t_1.md and follow them exactly.""#
+            r#"codex --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort=xhigh "You are a Sich worker. Read your task and instructions in C:\cfg\t_1.md and follow them exactly.""#
         );
     }
 
@@ -150,9 +159,9 @@ mod tests {
     fn plain_commands_without_options() {
         let file = PathBuf::from("/tmp/t.md");
         let claude = build_command(&spec(Agent::Claude, None, None, &file)).unwrap();
-        assert!(claude.starts_with("claude \"You are a Sich worker."), "{claude}");
+        assert!(claude.starts_with("claude --dangerously-skip-permissions \"You are a Sich worker."), "{claude}");
         let codex = build_command(&spec(Agent::Codex, None, None, &file)).unwrap();
-        assert!(codex.starts_with("codex \"You are a Sich worker."), "{codex}");
+        assert!(codex.starts_with("codex --dangerously-bypass-approvals-and-sandbox \"You are a Sich worker."), "{codex}");
     }
 
     #[test]
