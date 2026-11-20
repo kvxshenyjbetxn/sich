@@ -106,7 +106,7 @@ pub fn hook_command(exe: &Path) -> String {
 // ---------------------------------------------------------------------------------------------
 // Version handling
 
-fn parse_version_triple(s: &str) -> Option<Version> {
+pub(crate) fn parse_version_triple(s: &str) -> Option<Version> {
     let core = s.split(['-', '+']).next()?;
     let mut it = core.split('.');
     let a = it.next()?.parse().ok()?;

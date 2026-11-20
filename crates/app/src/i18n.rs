@@ -101,6 +101,20 @@ pub enum Tr {
     CodexTooOld,
     CodexTrustPending,
     CodexTrustCleanupPending,
+    UsageLimits,
+    ClaudeStatuslineWrap,
+    UsageFiveHour,
+    UsageWeek,
+    UsageStale,
+    UsageResetPassed,
+    UsageClaudeNeedsWrap,
+    UsageClaudeEdited,
+    UsageClaudeOld,
+    UsageClaudeFailed,
+    UsageCodexOld,
+    UsageCodexUnsupported,
+    UsageCodexNoLimits,
+    UsageCodexFailed,
     OrchestrationSkill,
     OrchUnattendedWorkers,
     OrchCoordinator,
@@ -261,6 +275,20 @@ impl Tr {
         Tr::CodexTooOld,
         Tr::CodexTrustPending,
         Tr::CodexTrustCleanupPending,
+        Tr::UsageLimits,
+        Tr::ClaudeStatuslineWrap,
+        Tr::UsageFiveHour,
+        Tr::UsageWeek,
+        Tr::UsageStale,
+        Tr::UsageResetPassed,
+        Tr::UsageClaudeNeedsWrap,
+        Tr::UsageClaudeEdited,
+        Tr::UsageClaudeOld,
+        Tr::UsageClaudeFailed,
+        Tr::UsageCodexOld,
+        Tr::UsageCodexUnsupported,
+        Tr::UsageCodexNoLimits,
+        Tr::UsageCodexFailed,
         Tr::OrchestrationSkill,
         Tr::OrchUnattendedWorkers,
         Tr::OrchCoordinator,
@@ -908,6 +936,76 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "Отслеживать состояние Codex (добавляет хуки в ~/.codex/hooks.json)",
             En => "Track Codex status (installs hooks into ~/.codex/hooks.json)",
         },
+        Tr::UsageLimits => match lang {
+            Language::Uk => "Показувати ліміти Codex і Claude Code у рядку стану",
+            Language::Ru => "Показывать лимиты Codex и Claude Code в строке состояния",
+            Language::En => "Show Codex and Claude Code limits in the status bar",
+        },
+        Tr::ClaudeStatuslineWrap => match lang {
+            Language::Uk => "Обгортати мій statusLine Claude Code, щоб бачити ліміти (повертається при вимкненні)",
+            Language::Ru => "Оборачивать мой statusLine Claude Code, чтобы видеть лимиты (возвращается при выключении)",
+            Language::En => "Wrap my Claude Code statusLine to read limits (restored when turned off)",
+        },
+        Tr::UsageFiveHour => match lang {
+            Language::Uk => "5г",
+            Language::Ru => "5ч",
+            Language::En => "5h",
+        },
+        Tr::UsageWeek => match lang {
+            Language::Uk => "тиж",
+            Language::Ru => "нед",
+            Language::En => "wk",
+        },
+        Tr::UsageStale => match lang {
+            Language::Uk => " (застаріло)",
+            Language::Ru => " (устарело)",
+            Language::En => " (stale)",
+        },
+        Tr::UsageResetPassed => match lang {
+            Language::Uk => "Очікування нового показника після скидання",
+            Language::Ru => "Ожидание новых данных после сброса",
+            Language::En => "Waiting for a new reading after reset",
+        },
+        Tr::UsageClaudeNeedsWrap => match lang {
+            Language::Uk => "Увімкніть обгортання statusLine Claude Code у налаштуваннях Sich, щоб бачити ліміти.",
+            Language::Ru => "Включите обёртку statusLine Claude Code в настройках Sich, чтобы видеть лимиты.",
+            Language::En => "Enable Claude Code statusLine wrapping in Sich settings to see limits.",
+        },
+        Tr::UsageClaudeEdited => match lang {
+            Language::Uk => "statusLine Claude Code змінено. Щоб відновити читання лімітів, вимкніть і знову ввімкніть показ лімітів.",
+            Language::Ru => "statusLine Claude Code изменена. Чтобы возобновить чтение лимитов, выключите показ лимитов и включите снова.",
+            Language::En => "Claude Code statusLine changed. Turn usage limits off and on to reconnect.",
+        },
+        Tr::UsageClaudeOld => match lang {
+            Language::Uk => "Ліміти потребують Claude Code 2.1.80 або новішої версії.",
+            Language::Ru => "Для лимитов нужна Claude Code версии 2.1.80 или новее.",
+            Language::En => "Limits require Claude Code 2.1.80 or later.",
+        },
+        Tr::UsageClaudeFailed => match lang {
+            Language::Uk => "Не вдалося налаштувати statusLine Claude Code.",
+            Language::Ru => "Не удалось настроить statusLine Claude Code.",
+            Language::En => "Couldn't configure the Claude Code statusLine.",
+        },
+        Tr::UsageCodexOld => match lang {
+            Language::Uk => "Ліміти потребують Codex 0.48 або новішої версії.",
+            Language::Ru => "Для лимитов нужен Codex версии 0.48 или новее.",
+            Language::En => "Limits require Codex 0.48 or later.",
+        },
+        Tr::UsageCodexUnsupported => match lang {
+            Language::Uk => "Встановлений Codex не підтримує запит лімітів.",
+            Language::Ru => "Установленный Codex не поддерживает запрос лимитов.",
+            Language::En => "The installed Codex doesn't support reading limits.",
+        },
+        Tr::UsageCodexNoLimits => match lang {
+            Language::Uk => "Codex не надав дані про ліміти.",
+            Language::Ru => "Codex не предоставил данные о лимитах.",
+            Language::En => "Codex returned no usage limits.",
+        },
+        Tr::UsageCodexFailed => match lang {
+            Language::Uk => "Не вдалося прочитати ліміти. Перевірте, чи ви ввійшли в Codex.",
+            Language::Ru => "Не удалось прочитать лимиты. Проверьте, выполнен ли вход в Codex.",
+            Language::En => "Couldn't read limits. Check your Codex sign-in.",
+        },
         Tr::OrchestrationSkill => match lang {
             Uk => "Навчити Claude Code керувати воркерами (додає скіл у ~/.claude/skills)",
             Ru => "Научить Claude Code управлять воркерами (добавляет скилл в ~/.claude/skills)",
@@ -1370,6 +1468,44 @@ pub fn process_exited(lang: Language, code: Option<i32>) -> String {
             Language::En => format!("{head} (code {c}). {tail}"),
         },
         None => format!("{head}. {tail}"),
+    }
+}
+
+
+pub fn usage_updated(lang: Language, minutes: i64) -> String {
+    match lang {
+        Language::Uk => format!("оновлено {minutes} хв тому"),
+        Language::Ru => format!("обновлено {minutes} мин назад"),
+        Language::En => format!("updated {minutes} min ago"),
+    }
+}
+
+pub fn usage_window(lang: Language, used: u8, reset: Option<&str>) -> String {
+    let mut details = match lang {
+        Language::Uk => format!("використано {used}%"),
+        Language::Ru => format!("использовано {used}%"),
+        Language::En => format!("{used}% used"),
+    };
+    if let Some(reset) = reset {
+        details.push_str(" · ");
+        details.push_str(reset);
+    }
+    details
+}
+
+pub fn usage_reset(lang: Language, minutes: i64, clock: &str) -> String {
+    let hours = minutes / 60;
+    let minutes = minutes % 60;
+    let (h, m) = match lang {
+        Language::Uk => ("год", "хв"),
+        Language::Ru => ("ч", "мин"),
+        Language::En => ("h", "min"),
+    };
+    let remaining = if hours > 0 { format!("{hours} {h} {minutes} {m}") } else { format!("{minutes} {m}") };
+    match lang {
+        Language::Uk => format!("скидання через {remaining} (о {clock})"),
+        Language::Ru => format!("сброс через {remaining} (в {clock})"),
+        Language::En => format!("resets in {remaining} (at {clock})"),
     }
 }
 

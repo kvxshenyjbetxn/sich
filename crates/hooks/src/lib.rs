@@ -6,6 +6,8 @@ mod codex_app_server;
 pub mod codex_install;
 pub mod codex_trust;
 mod hook;
+pub mod statusline;
+pub mod usage;
 
 pub use hook::{
     HookEnv, HookOutcome, MAX_STDIN_BYTES, append_log, hook_main, log_path, read_capped, run_hook,

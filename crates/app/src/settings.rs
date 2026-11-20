@@ -28,6 +28,8 @@ pub struct AppSettings {
     pub agent_hooks: bool,
     /// Track Codex status through hooks in `~/.codex/hooks.json`.
     pub codex_hooks: bool,
+    pub usage_limits: bool,
+    pub claude_statusline_wrap: bool,
     /// Install the Claude Code skill that teaches a coordinator agent `sich orch`.
     pub orchestration_skill: bool,
     /// Start orchestration workers with the agent's full-autonomy flag.
@@ -53,6 +55,8 @@ impl Default for AppSettings {
             show_external_worktrees: false,
             agent_hooks: true,
             codex_hooks: true,
+            usage_limits: true,
+            claude_statusline_wrap: false,
             orchestration_skill: true,
             orch_unattended_workers: true,
             close_to_tray: true,
@@ -71,11 +75,7 @@ impl Global for AppSettings {}
 /// `<config>/sich/<name>`; SICH_CONFIG_DIR isolates test/dev instances (same override the
 /// daemon uses).
 pub(crate) fn config_file(name: &str) -> Option<PathBuf> {
-    let base = match std::env::var_os("SICH_CONFIG_DIR") {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
-        _ => dirs::config_dir(),
-    };
-    base.map(|d| d.join("sich").join(name))
+    sich_hooks::usage::config_file(name)
 }
 
 fn path() -> Option<PathBuf> {
@@ -171,6 +171,24 @@ pub fn set_codex_hooks(enabled: bool, cx: &mut App) {
     }
     s.codex_hooks = enabled;
     store(s, cx);
+}
+
+pub fn set_usage_limits(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.usage_limits != enabled {
+        s.usage_limits = enabled;
+        store(s, cx);
+        cx.refresh_windows();
+    }
+}
+
+pub fn set_claude_statusline_wrap(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.claude_statusline_wrap != enabled {
+        s.claude_statusline_wrap = enabled;
+        store(s, cx);
+        cx.refresh_windows();
+    }
 }
 
 pub fn set_orchestration_skill(enabled: bool, cx: &mut App) {
@@ -329,6 +347,18 @@ mod tests {
         let s = AppSettings { codex_hooks: false, ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(!back.codex_hooks);
+    }
+
+    #[test]
+    fn usage_limits_defaults_and_round_trip() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(old.usage_limits);
+        assert!(!old.claude_statusline_wrap);
+        let changed = AppSettings { usage_limits: false, claude_statusline_wrap: true, ..old };
+        let saved = serde_json::to_string(&changed).unwrap();
+        let restored: AppSettings = serde_json::from_str(&saved).unwrap();
+        assert!(!restored.usage_limits);
+        assert!(restored.claude_statusline_wrap);
     }
 
     #[test]
