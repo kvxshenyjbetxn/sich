@@ -435,18 +435,14 @@ impl Period {
         }
     }
 
-    fn reset_time(self, lang: Language, at: i64, zone: &impl TimeZone, detailed: bool) -> Option<String> {
+    fn reset_time(self, lang: Language, at: i64, zone: &impl TimeZone) -> Option<String> {
         let local = zone.timestamp_opt(at, 0).single()?;
         let (hour, minute) = (local.hour(), local.minute());
         Some(match self {
             Self::FiveHour => format!("{hour:02}:{minute:02}"),
             Self::Week => {
                 let day = i18n::usage_weekday(lang, local.weekday());
-                if detailed {
-                    format!("{day}, {:02}.{:02}, {hour:02}:{minute:02}", local.day(), local.month())
-                } else {
-                    format!("{day} {hour:02}:{minute:02}")
-                }
+                format!("{day}, {:02}.{:02}, {hour:02}:{minute:02}", local.day(), local.month())
             }
         })
     }
@@ -493,6 +489,12 @@ impl Chip {
         self.resets[period as usize].filter(|&at| self.percentages[period as usize].is_some() && at > self.now)
     }
 
+    fn countdown(&self, period: Period, lang: Language) -> Option<String> {
+        let at = self.reset_at(period)?;
+        chrono::DateTime::from_timestamp(at, 0)?;
+        Some(i18n::usage_countdown(lang, at.saturating_sub(self.now) / 60))
+    }
+
     fn missing(&self, period: Period) -> Tr {
         if self.resets[period as usize].is_some_and(|at| at <= self.now) {
             Tr::UsageResetPassed
@@ -525,7 +527,7 @@ impl Chip {
                             .text_color(self.color(used, theme))
                             .child(used.map_or_else(|| "—".into(), |used| format!("{used}%"))),
                     )
-                    .children(self.reset_at(period).and_then(|at| period.reset_time(lang, at, &Local, false)))
+                    .children(self.countdown(period, lang))
             }))
     }
 
@@ -567,7 +569,7 @@ impl Chip {
         let used = self.percentages[period as usize];
         let color = self.color(used, theme);
         let reset = self.reset_at(period).and_then(|at| {
-            let clock = period.reset_time(lang, at, &Local, true)?;
+            let clock = period.reset_time(lang, at, &Local)?;
             Some(i18n::usage_reset(lang, at.saturating_sub(self.now) / 60, &clock))
         });
         v_flex()
@@ -646,6 +648,35 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_countdowns_are_bracketed_and_relative_for_both_windows() {
+        let now = 1_800_000_000;
+        let sample = Reading {
+            windows: Windows {
+                five_hour: Some(Limit { used_percent: 55., resets_at: Some(now + 80 * 60) }),
+                weekly: Some(Limit { used_percent: 84., resets_at: Some(now + (4 * 24 + 15) * 3600) }),
+            },
+            at: now,
+        };
+        let chip = Chip::new(Some(sample), None, now);
+        assert_eq!(chip.countdown(Period::FiveHour, Language::Uk).as_deref(), Some("[через 1г 20хв]"));
+        assert_eq!(chip.countdown(Period::Week, Language::Uk).as_deref(), Some("[через 4д 15г]"));
+        assert_eq!(chip.countdown(Period::FiveHour, Language::Ru).as_deref(), Some("[через 1ч 20мин]"));
+        assert_eq!(chip.countdown(Period::FiveHour, Language::En).as_deref(), Some("[in 1h 20m]"));
+    }
+
+    #[test]
+    fn status_bar_countdown_handles_the_last_minute_and_missing_timestamps() {
+        let last_minute = Chip::new(Some(reading(30, 55., Some(60))), None, 30);
+        assert_eq!(last_minute.countdown(Period::FiveHour, Language::Uk).as_deref(), Some("[через <1хв]"));
+        let expired = Chip::new(Some(reading(30, 55., Some(60))), None, 60);
+        assert_eq!(expired.countdown(Period::FiveHour, Language::Uk), None);
+        for at in [None, Some(i64::MAX)] {
+            let unknown = Chip::new(Some(reading(30, 55., at)), None, 30);
+            assert_eq!(unknown.countdown(Period::FiveHour, Language::Uk), None);
+        }
+    }
+
+    #[test]
     fn localized_usage_details() {
         assert_eq!(i18n::usage_window(Language::Uk, 18), "використано 18%");
         assert_eq!(i18n::usage_updated(Language::Ru, 2), "обновлено 2 мин назад");
@@ -654,14 +685,14 @@ mod tests {
     }
 
     #[test]
-    fn summary_and_details_use_the_local_day_at_reset() {
+    fn details_use_the_local_day_and_time_at_reset() {
         let utc = chrono::Utc.with_ymd_and_hms(2026, 11, 20, 23, 30, 0).unwrap();
         let zone = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
         let at = utc.timestamp();
-        assert_eq!(Period::FiveHour.reset_time(Language::Uk, at, &zone, false).as_deref(), Some("01:30"));
-        assert_eq!(Period::Week.reset_time(Language::Uk, at, &zone, false).as_deref(), Some("сб 01:30"));
-        assert_eq!(Period::Week.reset_time(Language::En, at, &zone, true).as_deref(), Some("Sat, 21.11, 01:30"));
-        assert_eq!(Period::Week.reset_time(Language::Uk, i64::MAX, &zone, true), None);
+        assert_eq!(Period::FiveHour.reset_time(Language::Uk, at, &zone).as_deref(), Some("01:30"));
+        assert_eq!(Period::Week.reset_time(Language::Uk, at, &zone).as_deref(), Some("сб, 21.11, 01:30"));
+        assert_eq!(Period::Week.reset_time(Language::En, at, &zone).as_deref(), Some("Sat, 21.11, 01:30"));
+        assert_eq!(Period::Week.reset_time(Language::Uk, i64::MAX, &zone), None);
     }
 
     #[test]

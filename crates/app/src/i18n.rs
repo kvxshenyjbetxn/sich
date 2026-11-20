@@ -1545,27 +1545,57 @@ pub fn usage_weekday(lang: Language, day: chrono::Weekday) -> &'static str {
     names[day.num_days_from_monday() as usize]
 }
 
+pub fn usage_countdown(lang: Language, minutes: i64) -> String {
+    format!("[{} {}]", usage_until(lang), usage_remaining(lang, minutes, true))
+}
+
 pub fn usage_reset(lang: Language, minutes: i64, clock: &str) -> String {
+    let reset = match lang {
+        Language::Uk => "Скидання",
+        Language::Ru => "Сброс",
+        Language::En => "Resets",
+    };
+    format!("{reset}: {clock} · {} {}", usage_until(lang), usage_remaining(lang, minutes, false))
+}
+
+fn usage_until(lang: Language) -> &'static str {
+    match lang {
+        Language::Uk | Language::Ru => "через",
+        Language::En => "in",
+    }
+}
+
+fn usage_remaining(lang: Language, minutes: i64, compact: bool) -> impl std::fmt::Display {
     let days = minutes / (24 * 60);
     let hours = minutes / 60 % 24;
     let minutes = minutes % 60;
-    let (d, h, m) = match lang {
-        Language::Uk => ("д", "год", "хв"),
-        Language::Ru => ("д", "ч", "мин"),
-        Language::En => ("d", "h", "min"),
+    let (d, h, m) = match (lang, compact) {
+        (Language::Uk, true) => ("д", "г", "хв"),
+        (Language::Uk, false) => ("д", "год", "хв"),
+        (Language::Ru, _) => ("д", "ч", "мин"),
+        (Language::En, true) => ("d", "h", "m"),
+        (Language::En, false) => ("d", "h", "min"),
     };
-    let remaining = if days > 0 {
-        format!("{days} {d} {hours} {h}")
-    } else if hours > 0 {
-        format!("{hours} {h} {minutes} {m}")
-    } else {
-        format!("{minutes} {m}")
-    };
-    match lang {
-        Language::Uk => format!("Скидання: {clock} · через {remaining}"),
-        Language::Ru => format!("Сброс: {clock} · через {remaining}"),
-        Language::En => format!("Resets: {clock} · in {remaining}"),
-    }
+    let gap = if compact { "" } else { " " };
+    std::fmt::from_fn(move |f| {
+        if days > 0 {
+            write!(f, "{days}{gap}{d}")?;
+            if !compact || hours > 0 {
+                write!(f, " {hours}{gap}{h}")?;
+            }
+            Ok(())
+        } else if hours > 0 {
+            write!(f, "{hours}{gap}{h}")?;
+            if !compact || minutes > 0 {
+                write!(f, " {minutes}{gap}{m}")?;
+            }
+            Ok(())
+        } else if compact && minutes == 0 {
+            write!(f, "<1{m}")
+        } else {
+            write!(f, "{minutes}{gap}{m}")
+        }
+    })
 }
 
 #[cfg(test)]
