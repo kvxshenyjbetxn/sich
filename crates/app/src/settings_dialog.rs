@@ -53,6 +53,12 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                             }),
                     )
                     .child(
+                        Switch::new("orch-unattended-workers")
+                            .checked(settings::get(cx).orch_unattended_workers)
+                            .label(tr(lang, Tr::OrchUnattendedWorkers))
+                            .on_click(|checked, _, cx| settings::set_orch_unattended_workers(*checked, cx)),
+                    )
+                    .child(
                         Switch::new("check-updates")
                             .checked(settings::get(cx).check_updates)
                             .label(tr(lang, Tr::CheckUpdates))

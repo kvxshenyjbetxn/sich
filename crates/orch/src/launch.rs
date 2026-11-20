@@ -52,6 +52,7 @@ pub struct LaunchSpec<'a> {
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
     pub task_file: &'a Path,
+    pub unattended: bool,
     /// Replaces `claude` / `codex` (tests and the hidden `SICH_ORCH_FAKE_AGENT` hook).
     pub program: Option<&'a str>,
 }
@@ -98,11 +99,10 @@ pub fn build_command(spec: &LaunchSpec<'_>) -> Result<String, LaunchError> {
     if !path_is_safe(&path) {
         return Err(LaunchError::BadPath(path.into_owned()));
     }
-    // Workers run unattended (like Orca): the agent's own official full-autonomy flag, so no
-    // per-command approval prompts block the task. Fake test programs get no flag.
     let mut line = match spec.program {
         Some(p) => program_text(p)?,
-        None => format!("{} {}", spec.agent.as_str(), autonomy_flag(spec.agent)),
+        None if spec.unattended => format!("{} {}", spec.agent.as_str(), autonomy_flag(spec.agent)),
+        None => spec.agent.as_str().to_string(),
     };
     match spec.agent {
         Agent::Claude => {
@@ -132,7 +132,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn spec<'a>(agent: Agent, model: Option<&'a str>, effort: Option<&'a str>, file: &'a Path) -> LaunchSpec<'a> {
-        LaunchSpec { agent, model, effort, task_file: file, program: None }
+        LaunchSpec { agent, model, effort, task_file: file, unattended: true, program: None }
     }
 
     #[test]
@@ -156,12 +156,22 @@ mod tests {
     }
 
     #[test]
-    fn plain_commands_without_options() {
+    fn unattended_commands_include_each_agents_autonomy_flag() {
         let file = PathBuf::from("/tmp/t.md");
         let claude = build_command(&spec(Agent::Claude, None, None, &file)).unwrap();
         assert!(claude.starts_with("claude --dangerously-skip-permissions \"You are a Sich worker."), "{claude}");
         let codex = build_command(&spec(Agent::Codex, None, None, &file)).unwrap();
         assert!(codex.starts_with("codex --dangerously-bypass-approvals-and-sandbox \"You are a Sich worker."), "{codex}");
+    }
+
+    #[test]
+    fn attended_commands_use_each_agents_default_approval_behavior() {
+        let file = Path::new("/tmp/t.md");
+        for agent in [Agent::Claude, Agent::Codex] {
+            let launch = LaunchSpec { unattended: false, ..spec(agent, None, None, file) };
+            let cmd = build_command(&launch).unwrap();
+            assert_eq!(cmd, format!("{} \"{}\"", agent.as_str(), initial_prompt("/tmp/t.md")));
+        }
     }
 
     #[test]
@@ -213,9 +223,11 @@ mod tests {
     #[test]
     fn fake_program_replaces_the_agent_command() {
         let file = PathBuf::from("t.md");
+        for agent in [Agent::Claude, Agent::Codex] {
+            let launch = LaunchSpec { program: Some("fake-agent.cmd"), ..spec(agent, None, None, &file) };
+            assert_eq!(build_command(&launch).unwrap(), format!("fake-agent.cmd \"{}\"", initial_prompt("t.md")));
+        }
         let mut s = spec(Agent::Codex, None, None, &file);
-        s.program = Some("fake-agent.cmd");
-        assert!(build_command(&s).unwrap().starts_with("fake-agent.cmd \"You are"));
         s.program = Some(r"C:\Program Files\x\fake.cmd");
         assert!(build_command(&s).unwrap().starts_with(r#"& "C:\Program Files\x\fake.cmd" "You are"#));
         s.program = Some("a\"b");

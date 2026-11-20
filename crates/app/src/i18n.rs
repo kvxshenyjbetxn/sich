@@ -97,6 +97,7 @@ pub enum Tr {
     CodexTooOld,
     CodexApproveHint,
     OrchestrationSkill,
+    OrchUnattendedWorkers,
     OrchCoordinator,
     OrchWorker,
     NewGroup,
@@ -239,6 +240,7 @@ impl Tr {
         Tr::CodexTooOld,
         Tr::CodexApproveHint,
         Tr::OrchestrationSkill,
+        Tr::OrchUnattendedWorkers,
         Tr::OrchCoordinator,
         Tr::OrchWorker,
         Tr::NewGroup,
@@ -831,6 +833,11 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Uk => "Навчити Claude Code керувати воркерами (додає скіл у ~/.claude/skills)",
             Ru => "Научить Claude Code управлять воркерами (добавляет скилл в ~/.claude/skills)",
             En => "Teach Claude Code to orchestrate workers (installs a skill into ~/.claude/skills)",
+        },
+        Tr::OrchUnattendedWorkers => match lang {
+            Uk => "Воркери оркестрації працюють без підтверджень (повна автономія, як в Orca)",
+            Ru => "Воркеры оркестрации работают без подтверждений (полная автономия, как в Orca)",
+            En => "Orchestration workers run without approval prompts (full autonomy, like Orca)",
         },
         Tr::OrchCoordinator => match lang {
             Uk => "коорд",

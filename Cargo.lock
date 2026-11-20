@@ -6178,6 +6178,7 @@ dependencies = [
  "regex",
  "semver",
  "serde",
+ "serde-saphyr",
  "serde_json",
  "sha2 0.10.9",
  "sich-daemon",

@@ -51,3 +51,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphic
 
 [build-dependencies]
 embed-resource = "3"
+
+[dev-dependencies]
+serde-saphyr = "1"
