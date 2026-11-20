@@ -12,7 +12,8 @@ use crate::agent_hooks::auto_install_here;
 use crate::settings;
 
 pub const SKILL_DIR: &str = "sich-orchestration";
-pub const MARKER: &str = "<!-- sich:managed sich-orchestration-skill v1 -->";
+pub const MARKER: &str = "<!-- sich:managed sich-orchestration-skill v2 -->";
+const PREVIOUS_MARKER: &str = "<!-- sich:managed sich-orchestration-skill v1 -->";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
@@ -34,6 +35,10 @@ fn skill_file(claude_dir: &Path) -> PathBuf {
     claude_dir.join("skills").join(SKILL_DIR).join("SKILL.md")
 }
 
+fn is_managed(content: &str) -> bool {
+    content.contains(MARKER) || content.contains(PREVIOUS_MARKER)
+}
+
 /// The exe as a quoted command word that works in bash and (after `&`) PowerShell.
 fn quoted_exe(exe: &Path) -> String {
     format!("\"{}\"", exe.to_string_lossy().replace('\\', "/"))
@@ -41,10 +46,23 @@ fn quoted_exe(exe: &Path) -> String {
 
 pub fn render(exe: &Path) -> String {
     let x = quoted_exe(exe);
+    // Grant permissions only when the quoted command identifies a literal executable.
+    let rules = if exe.is_absolute()
+        && exe.to_str().is_some_and(|path| {
+            !path.contains(['*', '"', '$', '`', '\r', '\n']) && (cfg!(windows) || !path.contains('\\'))
+        })
+    {
+        vec![format!("Bash({x} orch:*)"), format!("PowerShell(& {x} orch *)")]
+    } else {
+        Vec::new()
+    };
+    // JSON string quoting keeps the executable's shell quotes intact in this YAML list.
+    let allowed_tools = serde_json::json!(rules);
     format!(
         "---
 name: sich-orchestration
 description: Use when the user asks to delegate or orchestrate work to Codex or Claude worker agents inside Sich, for example \"start a worker\", \"have codex do X and report back\", \"run these tasks in parallel with workers\" or \"ask claude to review this in another terminal\". Starts worker agents in new Sich terminals, hands them tasks, answers their questions and collects their results.
+allowed-tools: {allowed_tools}
 ---
 {MARKER}
 
@@ -95,7 +113,7 @@ pub fn install(claude_dir: &Path, exe: &Path) -> std::io::Result<InstallOutcome>
     let content = render(exe);
     match std::fs::read_to_string(&file) {
         Ok(existing) if existing == content => return Ok(InstallOutcome::Unchanged),
-        Ok(existing) if !existing.contains(MARKER) => return Ok(InstallOutcome::ForeignFile),
+        Ok(existing) if !is_managed(&existing) => return Ok(InstallOutcome::ForeignFile),
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
@@ -108,7 +126,7 @@ pub fn install(claude_dir: &Path, exe: &Path) -> std::io::Result<InstallOutcome>
 pub fn remove(claude_dir: &Path) -> std::io::Result<RemoveOutcome> {
     let file = skill_file(claude_dir);
     match std::fs::read_to_string(&file) {
-        Ok(existing) if existing.contains(MARKER) => {
+        Ok(existing) if is_managed(&existing) => {
             std::fs::remove_file(&file)?;
             if let Some(dir) = file.parent() {
                 // Only succeeds when empty: never delete files that are not ours.
@@ -154,18 +172,50 @@ mod tests {
     use super::*;
 
     fn exe() -> PathBuf {
-        PathBuf::from(r"C:\Program Files\Sich\sich.exe")
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Program Files\Sich\sich-cli.exe")
+        } else {
+            PathBuf::from("/opt/Sich Tools/sich-cli")
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Frontmatter {
+        name: String,
+        description: String,
+        #[serde(rename = "allowed-tools")]
+        allowed_tools: Vec<String>,
+    }
+
+    fn parse_skill(text: &str) -> (Frontmatter, &str) {
+        let (front, body) = text.strip_prefix("---\n").unwrap().split_once("\n---\n").unwrap();
+        (serde_saphyr::from_str(front).unwrap(), body)
     }
 
     #[test]
     fn rendered_skill_has_frontmatter_marker_and_exe() {
         let text = render(&exe());
         assert!(text.starts_with("---\nname: sich-orchestration\ndescription: "), "{text}");
-        let (front, body) = text[4..].split_once("\n---\n").expect("frontmatter end");
-        assert_eq!(front.lines().count(), 2);
+        let (front, body) = parse_skill(&text);
+        assert_eq!(front.name, SKILL_DIR);
+        assert!(front.description.starts_with("Use when the user asks to delegate or orchestrate"));
         assert!(body.trim_start().starts_with(MARKER));
-        assert!(text.contains("\"C:/Program Files/Sich/sich.exe\" orch <command>"));
-        assert!(text.contains("& \"C:/Program Files/Sich/sich.exe\" orch <command>"));
+        let path = if cfg!(windows) { "C:/Program Files/Sich/sich-cli.exe" } else { "/opt/Sich Tools/sich-cli" };
+        assert!(body.contains(&format!("`\"{path}\" orch <command>`")));
+        assert!(body.contains(&format!("`& \"{path}\" orch <command>`")));
+        assert_eq!(
+            front.allowed_tools,
+            [format!("Bash(\"{path}\" orch:*)"), format!("PowerShell(& \"{path}\" orch *)")],
+        );
+    }
+
+    #[test]
+    fn skill_grants_no_permissions_for_paths_that_are_not_literal() {
+        for exe in [PathBuf::from("sich-cli"), exe().with_file_name("sich-cli*.exe")] {
+            let text = render(&exe);
+            assert!(parse_skill(&text).0.allowed_tools.is_empty(), "{text}");
+        }
     }
 
     #[test]
@@ -189,14 +239,17 @@ mod tests {
     }
 
     #[test]
-    fn install_updates_an_existing_skill_with_the_worker_autonomy_setting() {
+    fn install_upgrades_the_previous_managed_skill() {
         let dir = tempfile::tempdir().unwrap();
         let file = skill_file(dir.path());
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, format!("{MARKER}\n\n# Sich orchestration\n")).unwrap();
+        std::fs::write(&file, format!("{PREVIOUS_MARKER}\n\n# Sich orchestration\n")).unwrap();
 
         assert_eq!(install(dir.path(), &exe()).unwrap(), InstallOutcome::Written);
-        assert!(std::fs::read_to_string(file).unwrap().contains(
+        let new = std::fs::read_to_string(file).unwrap();
+        assert!(new.contains(MARKER));
+        assert_eq!(parse_skill(&new).0.allowed_tools.len(), 2);
+        assert!(new.contains(
             "Workers start with the agent's full-autonomy flag unless the user turned that off in Sich settings."
         ));
     }
@@ -239,5 +292,16 @@ mod tests {
         assert_eq!(remove(dir.path()).unwrap(), RemoveOutcome::Removed);
         assert!(dir.path().join("skills").join(SKILL_DIR).join("notes.txt").exists());
         assert!(other.exists());
+    }
+
+    #[test]
+    fn remove_recognizes_the_previous_managed_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = skill_file(dir.path());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, PREVIOUS_MARKER).unwrap();
+
+        assert_eq!(remove(dir.path()).unwrap(), RemoveOutcome::Removed);
+        assert!(!file.exists());
     }
 }
