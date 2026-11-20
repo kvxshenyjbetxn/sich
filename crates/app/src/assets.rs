@@ -27,6 +27,7 @@ gpui_kit::assets::icon_assets!(ExtraIcons, [
     CircleAlert,
     CircleCheck,
     CircleX,
+    Timer,
 ]);
 
 /// Agent icons (single-color SVGs, tinted at render time): `(asset path, bytes)`.
@@ -63,6 +64,12 @@ impl AssetSource for AppAssets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_banner_timer_icon_is_registered() {
+        let svg = AppAssets.load("icons/timer.svg").unwrap().expect("timer icon must be registered");
+        assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
+    }
 
     #[test]
     fn agent_svgs_are_valid_looking_and_loadable() {
