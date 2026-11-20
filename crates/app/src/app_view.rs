@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::assets::IconName as Ic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::tooltip::Tooltip;
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
@@ -20,6 +20,7 @@ use gpui_kit::{
 };
 use sich_git::Repo;
 use sich_git::compare::CompareKey;
+use sich_orch::auto_close::{AutoClose, countdown_seconds};
 use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
@@ -117,8 +118,9 @@ pub struct AppView {
     save_scheduled: bool,
     restarting_daemon: bool,
     restart_dialog_shown: bool,
-    /// Orchestration data for the sidebar, refreshed by the watcher (never queried in render).
+    /// Orchestration data for the sidebar and banner, refreshed by the watcher.
     pub(crate) orch: sich_orch::OrchSnapshot,
+    orch_now_ms: i64,
     /// Sidebar width in logical pixels (drag the handle on its right edge).
     pub(crate) sidebar_w: f32,
     /// The sidebar handle is being dragged.
@@ -185,20 +187,24 @@ impl AppView {
         })
         .detach();
 
-        // Orchestration watcher: wakes idle agents that have mail, raises escalations and keeps
-        // the sidebar data fresh. Cheap while the database does not exist.
+        // The watcher wakes agents with mail, raises escalations and releases finished workers.
+        let orch_socket = socket.clone();
         cx.spawn(async move |this, cx| {
             let mut watcher = Some(sich_orch::watch::Watcher::new(sich_orch::paths::db_path()));
+            let mut closing: Option<gpui_kit::Task<()>> = None;
             loop {
                 cx.background_executor().timer(orch_watch::TICK).await;
-                let Ok(data) = this.update(cx, |this, _| this.orch_tick_data()) else { break };
+                let Ok((data, auto_close_workers)) = this.update(cx, |this, cx| {
+                    (this.orch_tick_data(), settings::get(cx).orch_auto_close_workers)
+                }) else { break };
                 let Some(mut w) = watcher.take() else { break };
-                let (w, out) = cx
+                let (w, mut out) = cx
                     .background_executor()
                     .spawn(async move {
                         let input = sich_orch::watch::TickInput {
                             terms: &data.terms,
                             synced: data.synced,
+                            auto_close_workers,
                             now_ms: data.now_ms,
                             exe: &data.exe,
                         };
@@ -207,8 +213,20 @@ impl AppView {
                     })
                     .await;
                 watcher = Some(w);
-                if this.update(cx, |this, cx| this.apply_orch(out, cx)).is_err() {
-                    break;
+                let due = std::mem::take(&mut out.due);
+                let Ok(should_close) = this.update(cx, |this, cx| {
+                    this.apply_orch(out, cx);
+                    settings::get(cx).orch_auto_close_workers && this.client.terminals_synced()
+                }) else { break };
+                if closing.as_mut().is_some_and(|close| close.now_or_never().is_some()) {
+                    closing = None;
+                }
+                if should_close && !due.is_empty() && closing.is_none() {
+                    let socket = orch_socket.clone();
+                    let rt = rt.clone();
+                    closing = Some(cx.background_executor().spawn(async move {
+                        orch_watch::release_due(&due, &socket, &rt);
+                    }));
                 }
             }
         })
@@ -258,6 +276,7 @@ impl AppView {
             restarting_daemon: false,
             restart_dialog_shown: false,
             orch: sich_orch::OrchSnapshot::default(),
+            orch_now_ms: sich_orch::paths::now_ms(),
             sidebar_w,
             sidebar_dragging: false,
             git_panel,
@@ -279,8 +298,25 @@ impl AppView {
     /// Applies one watcher result: sidebar data, and wake-up pointers typed like a user would
     /// (a bracketed paste, then Enter a moment later).
     fn apply_orch(&mut self, out: sich_orch::watch::TickOutput, cx: &mut Context<Self>) {
+        let now_ms = sich_orch::paths::now_ms();
+        let countdown_changed = !self.hidden_to_tray
+            && self.active_diff().is_none()
+            && self.focused
+                .and_then(|id| self.orch.workers.get(&id))
+                .and_then(|worker| worker.auto_close_state(settings::get(cx).orch_auto_close_workers))
+                .is_some_and(|state| match state {
+                    AutoClose::ClosesAt(deadline) => {
+                        countdown_seconds(deadline.saturating_sub(self.orch_now_ms))
+                            != countdown_seconds(deadline.saturating_sub(now_ms))
+                    }
+                    _ => false,
+                });
+        self.orch_now_ms = now_ms;
+        let snapshot_changed = out.snapshot.is_some();
         if let Some(snapshot) = out.snapshot {
             self.orch = snapshot;
+        }
+        if snapshot_changed || countdown_changed {
             cx.notify();
         }
         for pointer in out.pointers {
@@ -1116,9 +1152,14 @@ impl AppView {
         let diff = self.active_diff();
         let active = if diff.is_none() { self.ws.active_in(&self.ws.selected, &ids) } else { None };
         let tab_bar = self.render_tab_bar(snap, &ids, active, lang, cx);
-        let content = match (diff, active.and_then(|a| self.views.get(&a))) {
+        let content = match (diff, active.and_then(|a| self.views.get(&a).map(|view| (a, view)))) {
             (Some(tab), _) => div().flex_1().min_h_0().w_full().child(tab.view.clone()),
-            (None, Some(view)) => div().flex_1().min_h_0().w_full().child(view.clone()),
+            (None, Some((id, view))) => {
+                let banner = self.orch.workers.get(&id)
+                    .filter(|worker| infos.iter().any(|t| t.id == id && t.created_unix_ms as i64 <= worker.started_ms))
+                    .and_then(|worker| crate::orch_banner::render(worker, self.orch_now_ms, lang, cx));
+                div().relative().flex_1().min_h_0().w_full().child(view.clone()).children(banner)
+            }
             (None, None) => div()
                 .flex_1()
                 .min_h_0()

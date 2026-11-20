@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+use sich_orch::db::{Db, ReleaseMode};
 use sich_orch::model::{AgentObs, OrchSnapshot};
 use sich_orch::watch::TermObs;
 use sich_proto::{AgentState, AgentStatus, TermId, TerminalInfo};
@@ -67,6 +68,22 @@ pub fn tick_data(terminals: &[TerminalInfo], synced: bool, now_ms: i64, exe: Str
         })
         .collect();
     TickData { terms, synced, now_ms, exe }
+}
+
+pub fn release_due(dispatches: &[String], socket: &str, rt: &tokio::runtime::Handle) {
+    let Some(path) = sich_orch::paths::db_path().filter(|p| p.is_file()) else { return };
+    let mut db = match Db::open(&path) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("could not open orchestration database for worker auto-close: {e:#}");
+            return;
+        }
+    };
+    for dispatch in dispatches {
+        if let Err(e) = crate::orch_cli::release_worker(&mut db, dispatch, ReleaseMode::AutoClose, socket, rt) {
+            tracing::warn!("could not auto-close worker {dispatch}: {e:#}");
+        }
+    }
 }
 
 /// The text typed into a terminal: a bracketed paste, so the agent's TUI takes it as one block.
@@ -163,6 +180,9 @@ mod tests {
                 dispatch_id: "d_1".into(),
                 state: sich_orch::model::DispatchState::Working,
                 started_ms: 0,
+                ended_ms: None,
+                keep_open: false,
+                auto_close_allowed_ms: None,
             },
         );
         assert_eq!(worker_preview(&snap, 4, Language::En, None).as_deref(), Some("worker \u{b7} Fix parser"));

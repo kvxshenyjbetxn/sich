@@ -2,6 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::auto_close::{self, AutoClose};
+
 macro_rules! string_enum {
     ($(#[$m:meta])* $name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
         $(#[$m])*
@@ -88,6 +90,14 @@ pub struct Dispatch {
     pub outcome: Option<String>,
     pub started_ms: i64,
     pub ended_ms: Option<i64>,
+    pub keep_open: bool,
+    pub auto_close_allowed_ms: Option<i64>,
+}
+
+impl Dispatch {
+    pub fn auto_close_state(&self, enabled: bool) -> Option<AutoClose> {
+        auto_close::auto_close_state(self.state, self.keep_open, self.ended_ms, self.auto_close_allowed_ms, enabled)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +152,15 @@ pub struct WorkerInfo {
     pub dispatch_id: String,
     pub state: DispatchState,
     pub started_ms: i64,
+    pub ended_ms: Option<i64>,
+    pub keep_open: bool,
+    pub auto_close_allowed_ms: Option<i64>,
+}
+
+impl WorkerInfo {
+    pub fn auto_close_state(&self, enabled: bool) -> Option<AutoClose> {
+        auto_close::auto_close_state(self.state, self.keep_open, self.ended_ms, self.auto_close_allowed_ms, enabled)
+    }
 }
 
 /// What the sidebar shows; refreshed by the watcher, never queried from `render()`.

@@ -184,7 +184,7 @@ async fn coordinator_and_worker_round_trip_through_the_cli() {
     assert!(text.contains("Make parse() handle empty input.\nAdd a test."));
 
     let db_path = base.join("cfg").join("sich").join("orchestration.db");
-    let db = Db::open(&db_path).unwrap();
+    let mut db = Db::open(&db_path).unwrap();
     let d = db.get_dispatch(&dispatch).unwrap().expect("dispatch row");
     assert_eq!((d.worker_term, d.state), (worker, DispatchState::Working));
     assert_eq!((d.model.as_deref(), d.effort.as_deref()), (Some("gpt-5.4"), Some("high")));
@@ -251,8 +251,22 @@ async fn coordinator_and_worker_round_trip_through_the_cli() {
     h.pump_for(Duration::from_millis(300)).await;
     assert_eq!(h.created.len(), terminals_before, "no terminal for an invalid request");
 
-    // release kills the worker terminal.
-    let released = h.orch_ok(coord, &["release", "--dispatch", &dispatch]).await;
+    // Release is refused while the user wants the worker kept open.
+    let release = ["release", "--dispatch", &dispatch];
+    db.set_keep_open(&dispatch, true, sich_orch::paths::now_ms()).unwrap();
+    let kept = h.orch(Some(coord), &release, &[]).await;
+    assert_eq!(kept.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&kept.stderr).trim(),
+        "sich orch: the user chose Keep open for this worker; it stays open until they allow auto-close",
+    );
+    h.pump_for(Duration::from_millis(100)).await;
+    assert!(!h.removed.contains(&worker));
+    assert_eq!(db.get_dispatch(&dispatch).unwrap().unwrap().state, DispatchState::Working);
+
+    // Once the user allows auto-close, release can close the worker early.
+    db.set_keep_open(&dispatch, false, sich_orch::paths::now_ms()).unwrap();
+    let released = h.orch_ok(coord, &release).await;
     assert!(released.contains("Released"), "{released}");
     h.pump_for(Duration::from_millis(500)).await;
     assert!(h.removed.contains(&worker), "terminal {worker} should be gone; removed: {:?}", h.removed);

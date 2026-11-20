@@ -2,6 +2,7 @@
 
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::button::Button;
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
@@ -42,6 +43,12 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                             .checked(settings::get(cx).resume_agents_on_restore)
                             .label(tr(lang, Tr::ResumeAgentsOnRestore))
                             .on_click(|checked, _, cx| settings::set_resume_agents_on_restore(*checked, cx)),
+                    )
+                    .child(
+                        Checkbox::new("orch-auto-close-workers")
+                            .checked(settings::get(cx).orch_auto_close_workers)
+                            .label(tr(lang, Tr::OrchAutoCloseWorkers))
+                            .on_click(|checked, _, cx| settings::set_orch_auto_close_workers(*checked, cx)),
                     )
                     .child(
                         Switch::new("orchestration-skill")
