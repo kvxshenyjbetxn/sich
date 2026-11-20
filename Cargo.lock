@@ -6156,6 +6156,7 @@ dependencies = [
  "embed-resource",
  "futures",
  "gpui-kit",
+ "image",
  "interprocess",
  "parking_lot",
  "raw-window-handle",
@@ -6256,6 +6257,9 @@ name = "sich-term"
 version = "0.0.1"
 dependencies = [
  "alacritty_terminal",
+ "base64",
+ "flate2",
+ "image",
  "parking_lot",
  "tokio",
 ]

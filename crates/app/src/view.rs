@@ -14,7 +14,7 @@ use gpui_kit::component::ActiveTheme as _;
 use sich_term::alacritty_terminal::index::{Column, Line, Point, Side};
 use sich_term::alacritty_terminal::selection::SelectionType;
 use sich_term::alacritty_terminal::term::TermMode;
-use sich_proto::TermId;
+use sich_proto::{AgentKind, TermId};
 use sich_term::{
     KeyMods, MouseAction, MouseButton as TermButton, MouseMods, TermSession,
     key_to_bytes, mouse_report,
@@ -24,6 +24,7 @@ use crate::colors;
 use crate::element::{SharedCaret, SharedGeometry, TerminalElement};
 use crate::input::{Route, route_keystroke};
 use crate::links::Link;
+use crate::paste_image;
 use crate::term_settings;
 use crate::win_caret::Caret;
 
@@ -43,6 +44,8 @@ pub struct TerminalView {
     /// IME composition text (not yet sent to the PTY).
     marked: Option<String>,
     caret: SharedCaret,
+    /// Agent running in this terminal (decides how a pasted image path is delivered).
+    agent: Option<AgentKind>,
     _subs: Vec<Subscription>,
 }
 
@@ -65,8 +68,13 @@ impl TerminalView {
             hover_link: None,
             marked: None,
             caret: Rc::new(RefCell::new(Caret::new())),
+            agent: None,
             _subs: subs,
         }
+    }
+
+    pub fn set_agent(&mut self, agent: Option<AgentKind>) {
+        self.agent = agent;
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -115,7 +123,7 @@ impl TerminalView {
         if m.control && m.shift {
             match ks.key.as_str() {
                 "v" => {
-                    Self::paste_clipboard(&session, cx);
+                    Self::paste_clipboard(&session, self.agent, cx);
                     cx.notify();
                     return;
                 }
@@ -132,7 +140,7 @@ impl TerminalView {
                 return;
             }
             if m.shift && !m.control {
-                Self::paste_clipboard(&session, cx);
+                Self::paste_clipboard(&session, self.agent, cx);
                 cx.notify();
                 return;
             }
@@ -167,11 +175,28 @@ impl TerminalView {
         }
     }
 
-    fn paste_clipboard(session: &TermSession, cx: &mut App) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|i| i.text()) {
+    /// Pastes clipboard text, or (when it holds only an image) the path of a PNG saved from it.
+    fn paste_clipboard(session: &TermSession, agent: Option<AgentKind>, cx: &mut App) {
+        let Some(item) = cx.read_from_clipboard() else { return };
+        if let Some(text) = item.text() {
             session.clear_selection();
             session.scroll_to_bottom();
             session.paste(&text);
+            return;
+        }
+        let Some(image) = paste_image::clipboard_image(&item) else { return };
+        match paste_image::save(image, &paste_image::paste_dir(), paste_image::now_ms()) {
+            Ok(path) => {
+                let text = paste_image::path_text(&path);
+                session.clear_selection();
+                session.scroll_to_bottom();
+                if paste_image::force_bracketed(agent) {
+                    session.paste_bracketed(&text);
+                } else {
+                    session.paste(&text);
+                }
+            }
+            Err(e) => tracing::warn!("cannot paste the clipboard image: {e}"),
         }
     }
 
@@ -415,7 +440,7 @@ impl TerminalView {
             session.clear_selection();
         } else {
             crate::orch_watch::note_user_input(self.term_id);
-            Self::paste_clipboard(&session, cx);
+            Self::paste_clipboard(&session, self.agent, cx);
         }
         cx.notify();
     }

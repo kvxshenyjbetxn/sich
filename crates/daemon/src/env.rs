@@ -17,6 +17,8 @@ fn forced_vars() -> Vec<(OsString, OsString)> {
         ("COLORTERM".into(), "truecolor".into()),
         ("TERM_PROGRAM".into(), "sich".into()),
         ("TERM_PROGRAM_VERSION".into(), env!("CARGO_PKG_VERSION").into()),
+        // Makes Claude Code render images inline (Sich supports the kitty/iTerm2 protocols).
+        ("CLAUDE_CODE_FORCE_TERMINAL_IMAGES".into(), "1".into()),
     ]
 }
 
@@ -245,6 +247,20 @@ mod tests {
         assert_eq!(get(&env, "TERM_PROGRAM"), Some(&os("sich")));
         assert_eq!(get(&env, "TERM_PROGRAM_VERSION"), Some(&os(env!("CARGO_PKG_VERSION"))));
         assert_eq!(env.iter().filter(|(k, _)| k == "TERM").count(), 1);
+    }
+
+    #[test]
+    fn terminal_images_flag_is_forced_over_inherited_and_user_values() {
+        let env = build_env(pairs(&[("CLAUDE_CODE_FORCE_TERMINAL_IMAGES", "0"), ("KEEP", "1")]));
+        assert_eq!(get(&env, "CLAUDE_CODE_FORCE_TERMINAL_IMAGES"), Some(&os("1")));
+        assert_eq!(env.iter().filter(|(k, _)| k == "CLAUDE_CODE_FORCE_TERMINAL_IMAGES").count(), 1);
+        // The Windows registry path keeps user variables but still forces ours.
+        let env = with_forced(pairs(&[("CLAUDE_CODE_FORCE_TERMINAL_IMAGES", "0"), ("CLAUDE_CODE_PLUGIN_DIRS", "x")]));
+        assert_eq!(get(&env, "CLAUDE_CODE_FORCE_TERMINAL_IMAGES"), Some(&os("1")));
+        assert_eq!(get(&env, "CLAUDE_CODE_PLUGIN_DIRS"), Some(&os("x")));
+        // Other CLAUDE_CODE_* values from the launcher are still stripped.
+        let env = build_env(pairs(&[("CLAUDE_CODE_ENTRYPOINT", "cli")]));
+        assert!(get(&env, "CLAUDE_CODE_ENTRYPOINT").is_none());
     }
 
     #[cfg(windows)]

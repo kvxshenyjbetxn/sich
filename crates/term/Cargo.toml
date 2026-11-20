@@ -7,3 +7,6 @@ edition.workspace = true
 alacritty_terminal.workspace = true
 tokio.workspace = true
 parking_lot.workspace = true
+base64 = "0.22"
+flate2 = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }

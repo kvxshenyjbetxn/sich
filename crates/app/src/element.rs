@@ -2,14 +2,15 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::vte::ansi::{CursorShape, Rgb};
 use gpui_kit::{
     App, BorderStyle, Bounds, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
-    FocusHandle, Font, FontStyle,
+    Corners, FocusHandle, Font, FontStyle,
     FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, MouseMoveEvent,
-    Pixels, Point, SharedString,
+    Pixels, Point, RenderImage, SharedString,
     StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point,
     px, relative, size,
 };
@@ -17,6 +18,7 @@ use sich_term::TermSession;
 
 use crate::colors::{self, to_gpui};
 use crate::links::Span;
+use crate::term_images::{self, ImageCell};
 use crate::view::TerminalView;
 use crate::win_caret::{self, Caret};
 
@@ -128,6 +130,16 @@ pub struct Prepaint {
     cursor: Option<CursorLayout>,
     link: Vec<Span>,
     link_color: Rgb,
+    images: Vec<ImageDraw>,
+    /// Atlas entries of images that fell out of the render cache.
+    released: Vec<Arc<RenderImage>>,
+}
+
+/// One inline image strip ready to paint (window coordinates).
+struct ImageDraw {
+    clip: term_images::Rect,
+    image: term_images::Rect,
+    data: Arc<RenderImage>,
 }
 
 fn font_for(family: &SharedString, bold: bool, italic: bool) -> Font {
@@ -223,6 +235,8 @@ impl Element for TerminalElement {
         let cursor_row = cursor_pt.line.0 + display_offset;
         let cursor_col = cursor_pt.column.0;
         let mut cursor_cell: Option<(char, Rgb, Rgb, Flags)> = None;
+        let mut image_cells: Vec<ImageCell> = Vec::new();
+        let mut prev_placeholder: Option<ImageCell> = None;
 
         fn flush(cur: &mut Option<BatchedTextRun>, runs: &mut Vec<BatchedTextRun>) {
             if let Some(mut run) = cur.take() {
@@ -275,7 +289,22 @@ impl Element for TerminalElement {
                 }
             }
 
-            let ch = if flags.contains(Flags::HIDDEN) { ' ' } else { cell.c };
+            // Inline image cells (kitty placeholders) are drawn as images, never as text.
+            let placeholder = sich_term::parse_cell(
+                cell.c,
+                cell.fg,
+                cell.underline_color(),
+                cell.zerowidth().unwrap_or(&[]),
+            );
+            if let Some(raw) = placeholder {
+                let prev = prev_placeholder
+                    .filter(|p| p.row == row && p.col + 1 == col)
+                    .map(|p| p.cell);
+                let ic = ImageCell { row, col, cell: raw.resolve(prev.as_ref()) };
+                prev_placeholder = Some(ic);
+                image_cells.push(ic);
+            }
+            let ch = if flags.contains(Flags::HIDDEN) || placeholder.is_some() { ' ' } else { cell.c };
             let ch = if ch == '\0' || ch == '\t' { ' ' } else { ch };
 
             if row as i32 == cursor_row && col == cursor_col {
@@ -284,7 +313,7 @@ impl Element for TerminalElement {
 
             let underline = flags.intersects(Flags::ALL_UNDERLINES);
             let strike = flags.contains(Flags::STRIKEOUT);
-            let zerowidth = cell.zerowidth();
+            let zerowidth = if placeholder.is_some() { None } else { cell.zerowidth() };
             let is_blank = ch == ' ' && !underline && !strike;
             if is_blank && zerowidth.is_none() {
                 // Blank cells only terminate/extend nothing; keep spaces inside an active batch.
@@ -369,6 +398,24 @@ impl Element for TerminalElement {
         }
         drop(term);
 
+        // Inline images: the placeholder cells found above become drawable strips.
+        let released = term_images::begin_frame();
+        let mut images: Vec<ImageDraw> = Vec::new();
+        if !image_cells.is_empty() {
+            let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+            let cell = (f32::from(cell_w), f32::from(line_h));
+            for strip in term_images::build_strips(&image_cells) {
+                let Some((data, placement)) = self.session.image_lookup(strip.image, strip.placement) else {
+                    continue;
+                };
+                let Some(render) = term_images::render_image(&data) else { continue };
+                let (clip, image) = term_images::strip_geometry(origin, cell, &strip, &placement);
+                if clip.2 > 0.0 && clip.3 > 0.0 {
+                    images.push(ImageDraw { clip, image, data: render });
+                }
+            }
+        }
+
         // Cursor cell for IME positioning and the system caret (even when the shape is hidden).
         let cursor_cell_pos = (cursor_row >= 0 && (cursor_row as usize) < max_rows)
             .then(|| (cursor_row as usize, cursor_col.min(max_cols.saturating_sub(1))));
@@ -403,6 +450,8 @@ impl Element for TerminalElement {
             cursor,
             link,
             link_color: default_fg,
+            images,
+            released,
         }
     }
 
@@ -443,6 +492,23 @@ impl Element for TerminalElement {
                 Bounds::new(o, size(cw * r.cols as f32, lh)),
                 to_gpui(r.color),
             ));
+        }
+
+        for old in prepaint.released.drain(..) {
+            let _ = window.drop_image(old);
+        }
+        for img in &prepaint.images {
+            let rect = |r: term_images::Rect| {
+                Bounds::new(point(px(r.0), px(r.1)), size(px(r.2), px(r.3)))
+            };
+            let _ = window.paint_image(
+                rect(img.clip),
+                rect(img.image),
+                Corners::default(),
+                img.data.clone(),
+                0,
+                false,
+            );
         }
 
         for run in &prepaint.runs {

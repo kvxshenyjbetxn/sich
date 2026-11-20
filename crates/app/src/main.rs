@@ -14,6 +14,7 @@ mod daemon_restart;
 mod diff_tabs;
 mod diff_view;
 mod element;
+mod paste_image;
 mod git_panel;
 mod group_dialogs;
 mod groups;
@@ -31,6 +32,7 @@ mod settings_dialog;
 mod sidebar;
 mod single_instance;
 mod tab_bar;
+mod term_images;
 mod term_settings;
 mod theme;
 mod tray;
@@ -80,6 +82,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
+    // Pasted clipboard images are temporary: drop old ones in the background.
+    std::thread::spawn(|| {
+        paste_image::prune(&paste_image::paste_dir(), std::time::SystemTime::now(), paste_image::MAX_AGE);
+    });
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

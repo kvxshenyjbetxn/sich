@@ -908,7 +908,9 @@ impl AppView {
     fn sync(&mut self, snap: &Snapshot, infos: &[TerminalInfo], window: &mut Window, cx: &mut Context<Self>) {
         for entry in &snap.terminals {
             let id = entry.info.id;
-            if self.views.contains_key(&id) {
+            if let Some(view) = self.views.get(&id) {
+                let agent = entry.info.agent.as_ref().map(|a| a.kind);
+                view.update(cx, |v, _| v.set_agent(agent));
                 continue;
             }
             let session = entry.session.clone();

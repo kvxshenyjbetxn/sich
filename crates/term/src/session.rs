@@ -11,7 +11,10 @@ use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use parking_lot::{Mutex, MutexGuard};
 use tokio::runtime::Handle;
 
+use crate::images::{ImageData, ImageStore, Placement};
+use crate::inline::Inline;
 use crate::keys::paste_bytes;
+use crate::placeholder::strip_placeholders;
 
 static OSC52_WRITE: AtomicBool = AtomicBool::new(true);
 
@@ -129,6 +132,8 @@ type SyncProcessor = Processor<StdSyncHandler>;
 pub struct TermSession {
     term: Arc<Mutex<Term<Listener>>>,
     processor: Arc<Mutex<SyncProcessor>>,
+    inline: Arc<Mutex<Inline>>,
+    store: Arc<Mutex<ImageStore>>,
     timer_armed: Arc<AtomicBool>,
     rt: Handle,
     shared: Arc<Shared>,
@@ -163,9 +168,12 @@ impl TermSession {
             ..Config::default()
         };
         let term = Arc::new(Mutex::new(Term::new(config, &dims, Listener(shared.clone()))));
+        let store = Arc::new(Mutex::new(ImageStore::default()));
         TermSession {
             term,
             processor: Arc::new(Mutex::new(Processor::new())),
+            inline: Arc::new(Mutex::new(Inline::new(store.clone()))),
+            store,
             timer_armed: Arc::new(AtomicBool::new(false)),
             rt: rt.clone(),
             shared,
@@ -187,10 +195,18 @@ impl TermSession {
             &bytes[skip..]
         };
         {
+            let cell = {
+                let s = self.shared.size.lock();
+                (u32::from(s.cell_w), u32::from(s.cell_h))
+            };
+            let mut inline = self.inline.lock();
             let mut proc = self.processor.lock();
-            {
+            let replies = {
                 let mut t = self.term.lock();
-                proc.advance(&mut *t, data);
+                inline.feed(&mut t, &mut proc, data, cell)
+            };
+            if !replies.is_empty() {
+                self.shared.write(replies);
             }
             // A DEC 2026 block may be pending: make sure it is flushed after the timeout.
             if proc.sync_timeout().sync_timeout().is_some()
@@ -208,7 +224,13 @@ impl TermSession {
         let mut term = self.term.lock();
         self.shared.replaying.store(true, Ordering::Relaxed);
         let mut processor = SyncProcessor::new();
-        processor.advance(&mut *term, bytes);
+        let cell = {
+            let s = self.shared.size.lock();
+            (u32::from(s.cell_w), u32::from(s.cell_h))
+        };
+        // Images in the history are restored too; replies to their commands are dropped.
+        let mut inline = Inline::new(self.store.clone());
+        let _ = inline.feed(&mut term, &mut processor, bytes, cell);
         // Cancel a partial sequence, end synchronized output and leave any alternate screen.
         processor.advance(&mut *term, b"\x18\x1b[?2026l\x1b[?1049l\x1b[0m");
         for line in lines {
@@ -262,6 +284,17 @@ impl TermSession {
     pub fn paste(&self, text: &str) {
         let mode = *self.term.lock().mode();
         self.write(paste_bytes(text, mode));
+    }
+
+    /// Pastes with bracketed paste forced on (used for file paths handed to agent CLIs).
+    pub fn paste_bracketed(&self, text: &str) {
+        let mode = *self.term.lock().mode() | TermMode::BRACKETED_PASTE;
+        self.write(paste_bytes(text, mode));
+    }
+
+    /// Image data and geometry of a placeholder cell's (image, placement); `None` when unknown.
+    pub fn image_lookup(&self, image: u32, placement: u32) -> Option<(Arc<ImageData>, Placement)> {
+        self.store.lock().lookup(image, placement)
     }
 
     pub fn mode(&self) -> TermMode {
@@ -350,7 +383,7 @@ impl TermSession {
     }
 
     pub fn selection_text(&self) -> Option<String> {
-        self.term.lock().selection_to_string().filter(|s| !s.is_empty())
+        self.term.lock().selection_to_string().map(|s| strip_placeholders(&s)).filter(|s| !s.is_empty())
     }
 
     fn spawn_sync_timer(&self) {
@@ -390,6 +423,7 @@ impl TermSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placeholder::PLACEHOLDER;
 
     fn session(rt: &tokio::runtime::Runtime) -> TermSession {
         TermSession::new(rt.handle(), 80, 24, Arc::new(|_| {}), Arc::new(|_, _| {}), || {})
@@ -409,6 +443,86 @@ mod tests {
         s.feed(0, b"live\x1b[6n");
         assert_eq!(s.last_seq(), 8);
         assert!(rx.try_recv().is_ok());
+    }
+
+    fn capture_session(rt: &tokio::runtime::Runtime) -> (TermSession, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = TermSession::new(
+            rt.handle(), 80, 24, Arc::new(move |bytes| tx.send(bytes).unwrap()),
+            Arc::new(|_, _| {}), || {},
+        );
+        (s, rx)
+    }
+
+    fn png_b64(w: u32, h: u32) -> String {
+        use base64::Engine as _;
+        let mut out = Vec::new();
+        image::RgbaImage::from_pixel(w, h, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(out)
+    }
+
+    #[test]
+    fn pixel_size_reports_use_the_cell_size_from_resize() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (s, rx) = capture_session(&rt);
+        s.resize(80, 24, 9, 18);
+        s.feed(0, b"\x1b[14t\x1b[16t");
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[4;432;720t");
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[6;18;9t");
+    }
+
+    fn cell_char(s: &TermSession, line: i32, col: usize) -> char {
+        use alacritty_terminal::index::{Column, Line};
+        s.lock_term().grid()[Point::new(Line(line), Column(col))].c
+    }
+
+    #[test]
+    fn kitty_image_flows_through_the_session() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (s, rx) = capture_session(&rt);
+        s.resize(80, 24, 10, 20);
+        let cmd = format!("hi\x1b_Ga=T,f=100,i=3,p=1,c=4,r=2;{}\x1b\\after", png_b64(10, 10));
+        s.feed(0, cmd.as_bytes());
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b_Gi=3,p=1;OK\x1b\\");
+        let (img, p) = s.image_lookup(3, 1).unwrap();
+        assert_eq!((img.width, p.cols, p.rows), (10, 4, 2));
+        assert_eq!(cell_char(&s, 0, 2), PLACEHOLDER);
+        assert_eq!(cell_char(&s, 1, 6), 'a', "text continues right of the image on its last row");
+        assert!(s.image_lookup(3, 2).is_none() && s.image_lookup(4, 1).is_none());
+    }
+
+    #[test]
+    fn selection_text_drops_placeholder_cells() {
+        use alacritty_terminal::index::{Column, Line};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (s, _rx) = capture_session(&rt);
+        s.feed(0, format!("x\x1b_Ga=T,f=100,i=3,c=2,r=1;{}\x1b\\y", png_b64(10, 10)).as_bytes());
+        s.start_selection(Point::new(Line(0), Column(0)), Side::Left, SelectionType::Simple);
+        s.update_selection(Point::new(Line(0), Column(20)), Side::Right);
+        let text = s.selection_text().unwrap();
+        assert!(!text.contains(PLACEHOLDER) && text.starts_with('x') && text.contains('y'), "{text:?}");
+    }
+
+    #[test]
+    fn replayed_history_restores_images_without_replies() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (s, rx) = capture_session(&rt);
+        let hist = format!("\x1b_Ga=T,f=100,i=8,c=2,r=1;{}\x1b\\", png_b64(10, 10));
+        s.replay_history(hist.as_bytes(), &[]);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(cell_char(&s, 0, 0), PLACEHOLDER);
+    }
+
+    #[test]
+    fn forced_bracketed_paste_wraps_even_when_the_app_did_not_ask() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (s, rx) = capture_session(&rt);
+        s.paste("a b");
+        assert_eq!(rx.try_recv().unwrap(), b"a b");
+        s.paste_bracketed("a b");
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[200~a b\x1b[201~");
     }
 
     #[test]
