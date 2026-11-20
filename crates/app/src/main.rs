@@ -66,6 +66,7 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(orch_cli::run(&args[1..]));
     }
     // The GUI runs from a private copy so rebuilding the user-facing exe never hits a lock.
+    let _ = daemon_host::launcher_exe(); // pin the path before an update can rename the exe
     if daemon_host::relocate_gui(&args) {
         return Ok(());
     }

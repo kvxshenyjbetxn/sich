@@ -26,7 +26,9 @@ pub const NO_RELOCATE_ENV: &str = "SICH_NO_RELOCATE";
 /// else the current exe. Use this for anything the user or other programs should launch
 /// (hook commands, tray restart, messages).
 pub fn launcher_exe() -> Option<PathBuf> {
-    resolve_launcher(std::env::var_os(LAUNCHER_ENV), std::env::current_exe().ok())
+    // Cached: after an update renames the running exe to `*.old`, `current_exe()` may follow it.
+    static LAUNCHER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    LAUNCHER.get_or_init(|| resolve_launcher(std::env::var_os(LAUNCHER_ENV), std::env::current_exe().ok())).clone()
 }
 
 const CLI_EXE: &str = if cfg!(windows) { "sich-cli.exe" } else { "sich-cli" };
@@ -98,7 +100,10 @@ fn canonical_or(path: &Path) -> PathBuf {
 /// cwd and env plus `SICH_LAUNCHER_EXE`, and returns true when the caller should exit. Returns
 /// false (running in place) when not applicable or on any failure.
 pub fn relocate_gui(args: &[String]) -> bool {
-    let no_relocate = std::env::var_os(NO_RELOCATE_ENV).is_some_and(|v| !v.is_empty() && v != "0");
+    // Official releases run the GUI in place (one taskbar identity); the updater renames the
+    // running exe instead. Dev builds relocate so `cargo build` can overwrite target\.
+    let no_relocate = crate::updater::OFFICIAL
+        || std::env::var_os(NO_RELOCATE_ENV).is_some_and(|v| !v.is_empty() && v != "0");
     if no_relocate || !is_gui_args(args) {
         return false;
     }

@@ -420,14 +420,15 @@ fn rollback(done: &[Swapped]) {
     }
 }
 
+/// Files a release ships; only their `.old` leftovers are ever deleted.
+const SHIPPED_FILES: [&str; 4] = ["sich.exe", "sich-cli.exe", "conpty.dll", "OpenConsole.exe"];
+
 fn is_old_name(name: &str) -> bool {
-    if name.ends_with(".old") {
-        return true;
-    }
-    match name.rsplit_once('.') {
-        Some((rest, n)) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && rest.ends_with(".old"),
-        None => false,
-    }
+    let base = match name.rsplit_once('.') {
+        Some((rest, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => rest,
+        _ => name,
+    };
+    base.strip_suffix(".old").is_some_and(|file| SHIPPED_FILES.iter().any(|s| s.eq_ignore_ascii_case(file)))
 }
 
 /// Best-effort removal of leftovers from a previous update.
@@ -682,10 +683,10 @@ mod tests {
 
     #[test]
     fn old_names_are_recognised() {
-        for yes in ["sich.exe.old", "sich.exe.old.1", "a.old.23"] {
+        for yes in ["sich.exe.old", "sich.exe.old.1", "OpenConsole.exe.old.23", "conpty.dll.old"] {
             assert!(is_old_name(yes), "{yes}");
         }
-        for no in ["sich.exe", "old", "a.old.x", "a.old.", "sich.exe.older"] {
+        for no in ["sich.exe", "old", "a.old", "a.old.23", "notes.txt.old", "sich.exe.old.x", "sich.exe.old.", "sich.exe.older"] {
             assert!(!is_old_name(no), "{no}");
         }
     }
