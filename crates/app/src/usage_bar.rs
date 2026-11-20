@@ -367,6 +367,7 @@ impl UsageBar {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tone {
     Muted,
+    Good,
     Warning,
     Danger,
 }
@@ -375,7 +376,8 @@ fn tone(used: Option<u8>, stale: bool) -> Tone {
     match used.filter(|_| !stale) {
         Some(90..) => Tone::Danger,
         Some(80..=89) => Tone::Warning,
-        _ => Tone::Muted,
+        Some(_) => Tone::Good,
+        None => Tone::Muted,
     }
 }
 
@@ -457,6 +459,7 @@ impl Chip {
         let meter = |label: Tr, used| {
             let color = match tone(used, self.stale) {
                 Tone::Muted => theme.muted_foreground,
+                Tone::Good => theme.success,
                 Tone::Warning => theme.warning,
                 Tone::Danger => theme.danger,
             };
@@ -504,7 +507,9 @@ mod tests {
 
     #[test]
     fn tone_thresholds_and_staleness() {
-        assert_eq!(tone(Some(79), false), Tone::Muted);
+        assert_eq!(tone(Some(0), false), Tone::Good);
+        assert_eq!(tone(Some(79), false), Tone::Good);
+        assert_eq!(tone(None, false), Tone::Muted);
         assert_eq!(tone(Some(80), false), Tone::Warning);
         assert_eq!(tone(Some(89), false), Tone::Warning);
         assert_eq!(tone(Some(90), false), Tone::Danger);
