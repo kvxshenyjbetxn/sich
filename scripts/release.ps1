@@ -90,7 +90,13 @@ try {
         Invoke-Native 'git push master' { git push origin master }
         Invoke-Native 'git push tag' { git push origin $tag }
         $notesArgs = if ($Notes) { @('--notes', $Notes) } else { @('--generate-notes') }
-        Invoke-Native 'gh release create' { gh release create $tag $zip $shaFile --title "Sich v$Version" @notesArgs }
+        # GitHub sometimes fails right after the tag push; retry a few times.
+        foreach ($attempt in 1..3) {
+            gh release create $tag $zip $shaFile --title "Sich v$Version" @notesArgs
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq 3) { throw "gh release create failed (exit code $LASTEXITCODE)" }
+            Start-Sleep -Seconds (5 * $attempt)
+        }
         $url = (gh release view $tag --json url --jq .url | Out-String).Trim()
     }
 }
