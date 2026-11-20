@@ -1,15 +1,16 @@
-//! Background quota updates and the status-bar chips.
+//! Background quota updates, status-bar summary and provider details.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::TimeZone as _;
+use chrono::{Datelike as _, Local, TimeZone, Timelike as _};
 use futures::FutureExt as _;
-use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::popover::Popover;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, StyledExt as _, Theme, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, App, Context, InteractiveElement as _, IntoElement as _, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, Window, div,
+    Anchor, App, Context, Div, Hsla, InteractiveElement as _, ParentElement as _,
+    StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
 use sich_hooks::claude_install::{self, StatuslineState};
 use sich_hooks::statusline::{self, SNAPSHOT_FILE, Snapshot};
@@ -27,7 +28,6 @@ const FOCUS_AGE: Duration = Duration::from_secs(5 * 60);
 const RETRY: Duration = Duration::from_secs(30);
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const STALE_SECS: i64 = 30 * 60;
-const NARROW: f32 = 680.;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Options {
@@ -331,9 +331,9 @@ impl UsageBar {
         .detach();
     }
 
-    pub(crate) fn render(&self, lang: Language, width: f32, cx: &App) -> Vec<AnyElement> {
+    pub(crate) fn render(&self, lang: Language, cx: &App) -> Option<Popover> {
         if !Options::get(cx).enabled {
-            return Vec::new();
+            return None;
         }
         let claude_reason = match self.claude.state {
             Some(StatuslineState::NeedsWrap) => Some(Tr::UsageClaudeNeedsWrap),
@@ -349,18 +349,48 @@ impl UsageBar {
             CodexUnavailable::ReadFailed => Tr::UsageCodexFailed,
         });
 
-        [
-            (AgentKind::Claude, self.claude.reading, claude_reason),
-            (AgentKind::Codex, self.codex, codex_reason),
-        ]
-        .into_iter()
-        .filter_map(|(kind, reading, reason)| {
-            let chip = Chip::new(reading, reason, self.now);
-            let has_hint = matches!(reason, Some(Tr::UsageClaudeNeedsWrap | Tr::UsageClaudeEdited));
-            chip.visible(width, reading.is_some() || has_hint)
-                .then(|| chip.render(kind, reading, reason, lang, cx))
-        })
-        .collect()
+        let chips = [
+            Chip::new(self.claude.reading, claude_reason, self.now),
+            Chip::new(self.codex, codex_reason, self.now),
+        ];
+        if !chips.iter().any(Chip::shows_summary) {
+            return None;
+        }
+        let providers = [AgentKind::Claude, AgentKind::Codex];
+        let theme = cx.theme();
+        let summary = h_flex()
+            .text_xs()
+            .font_normal()
+            .gap_2()
+            .child(chips[0].summary(providers[0], lang, theme))
+            .child(div().h(px(12.)).w(px(1.)).bg(theme.border))
+            .child(chips[1].summary(providers[1], lang, theme));
+        Some(
+            Popover::new("usage-limits-popover")
+                .anchor(Anchor::BottomRight)
+                .offset(px(6.))
+                .trigger(
+                    Button::new("usage-limits")
+                        .ghost()
+                        .xsmall()
+                        .compact()
+                        .accessibility_label(tr(lang, Tr::UsageTitle))
+                        .child(summary),
+                )
+                .content(move |_, window, cx| {
+                    let theme = cx.theme();
+                    v_flex()
+                        .id("usage-limits-details")
+                        .max_h((window.viewport_size().height - px(56.)).max(px(80.)))
+                        .overflow_y_scroll()
+                        .w(px(312.))
+                        .gap_3()
+                        .child(div().text_sm().font_semibold().child(tr(lang, Tr::UsageTitle)))
+                        .children(
+                            providers.into_iter().zip(chips).map(|(kind, chip)| chip.details(kind, lang, theme)),
+                        )
+                }),
+        )
     }
 }
 
@@ -387,111 +417,184 @@ fn current(limit: Option<Limit>, now: i64) -> Option<u8> {
         .map(|limit| limit.used_percent.round().clamp(0., 100.) as u8)
 }
 
+#[derive(Clone, Copy)]
+enum Period {
+    FiveHour,
+    Week,
+}
+
+impl Period {
+    const ALL: [Self; 2] = [Self::FiveHour, Self::Week];
+
+    fn label(self, detailed: bool) -> Tr {
+        match (self, detailed) {
+            (Self::FiveHour, false) => Tr::UsageFiveHour,
+            (Self::Week, false) => Tr::UsageWeek,
+            (Self::FiveHour, true) => Tr::UsageFiveHourDetail,
+            (Self::Week, true) => Tr::UsageWeekDetail,
+        }
+    }
+
+    fn reset_time(self, lang: Language, at: i64, zone: &impl TimeZone, detailed: bool) -> Option<String> {
+        let local = zone.timestamp_opt(at, 0).single()?;
+        let (hour, minute) = (local.hour(), local.minute());
+        Some(match self {
+            Self::FiveHour => format!("{hour:02}:{minute:02}"),
+            Self::Week => {
+                let day = i18n::usage_weekday(lang, local.weekday());
+                if detailed {
+                    format!("{day}, {:02}.{:02}, {hour:02}:{minute:02}", local.day(), local.month())
+                } else {
+                    format!("{day} {hour:02}:{minute:02}")
+                }
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
 struct Chip {
     now: i64,
+    recorded_at: Option<i64>,
+    reason: Option<Tr>,
     stale: bool,
+    resets: [Option<i64>; 2],
     percentages: [Option<u8>; 2],
 }
 
 impl Chip {
     fn new(reading: Option<Reading>, reason: Option<Tr>, now: i64) -> Self {
         let windows = reading.map(|reading| reading.windows).unwrap_or_default();
+        let limits = [windows.five_hour, windows.weekly];
         Self {
             now,
+            recorded_at: reading.map(|reading| reading.at),
+            reason,
             stale: reading.is_some_and(|reading| now.saturating_sub(reading.at) > STALE_SECS),
-            percentages: if reason.is_some() {
-                [None, None]
-            } else {
-                [current(windows.five_hour, now), current(windows.weekly, now)]
-            },
+            resets: limits.map(|limit| limit.and_then(|limit| limit.resets_at)),
+            percentages: if reason.is_some() { [None; 2] } else { limits.map(|limit| current(limit, now)) },
         }
     }
 
-    fn visible(&self, width: f32, has_data_or_hint: bool) -> bool {
-        has_data_or_hint && (width >= NARROW || self.percentages.iter().flatten().any(|&used| used >= 80))
+    fn shows_summary(&self) -> bool {
+        self.recorded_at.is_some() || matches!(self.reason, Some(Tr::UsageClaudeNeedsWrap | Tr::UsageClaudeEdited))
     }
 
-    fn tooltip(
-        &self,
-        provider: &str,
-        reading: Option<Reading>,
-        reason: Option<Tr>,
-        lang: Language,
-    ) -> Vec<String> {
-        let mut lines = vec![provider.to_owned()];
-        let labels = [Tr::UsageFiveHour, Tr::UsageWeek];
-        if let Some(reading) = reading {
-            let windows = [reading.windows.five_hour, reading.windows.weekly];
-            for ((label, window), used) in labels.into_iter().zip(windows).zip(self.percentages) {
-                let details = if let Some(used) = used {
-                    i18n::usage_window(lang, used, reset_detail(lang, window, self.now).as_deref())
-                } else if window.is_some_and(|window| window.resets_at.is_some_and(|at| at <= self.now)) {
-                    tr(lang, Tr::UsageResetPassed).into()
-                } else {
-                    "—".into()
-                };
-                lines.push(format!("{}  {details}", tr(lang, label)));
-            }
-            let minutes = self.now.saturating_sub(reading.at).max(0) / 60;
-            let stale = if self.stale { tr(lang, Tr::UsageStale) } else { "" };
-            lines.push(format!("{}{stale}", i18n::usage_updated(lang, minutes)));
+    fn updated(&self, lang: Language) -> Option<String> {
+        let minutes = self.now.saturating_sub(self.recorded_at?).max(0) / 60;
+        let mut label = i18n::usage_updated(lang, minutes);
+        if self.stale {
+            label.push_str(tr(lang, Tr::UsageStale));
         }
-        if let Some(reason) = reason {
-            lines.push(tr(lang, reason).into());
-        }
-        lines
+        Some(label)
     }
 
-    fn render(
-        &self,
-        kind: AgentKind,
-        reading: Option<Reading>,
-        reason: Option<Tr>,
-        lang: Language,
-        cx: &App,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        let (id, name) = match kind {
-            AgentKind::Claude => ("usage-claude", "Claude Code"),
-            _ => ("usage-codex", "Codex"),
-        };
-        let tooltip = self.tooltip(name, reading, reason, lang);
-        let meter = |label: Tr, used| {
-            let color = match tone(used, self.stale) {
-                Tone::Muted => theme.muted_foreground,
-                Tone::Good => theme.success,
-                Tone::Warning => theme.warning,
-                Tone::Danger => theme.danger,
-            };
-            let percent = used.map_or_else(|| "—".to_string(), |used| format!("{used}%"));
-            h_flex().gap_1().child(tr(lang, label)).child(div().text_color(color).child(percent))
-        };
+    fn reset_at(&self, period: Period) -> Option<i64> {
+        self.resets[period as usize].filter(|&at| self.percentages[period as usize].is_some() && at > self.now)
+    }
+
+    fn missing(&self, period: Period) -> Tr {
+        if self.resets[period as usize].is_some_and(|at| at <= self.now) {
+            Tr::UsageResetPassed
+        } else {
+            Tr::UsageNoReading
+        }
+    }
+
+    fn color(&self, used: Option<u8>, theme: &Theme) -> Hsla {
+        match tone(used, self.stale) {
+            Tone::Muted => theme.muted_foreground,
+            Tone::Good => theme.success,
+            Tone::Warning => theme.warning,
+            Tone::Danger => theme.danger,
+        }
+    }
+
+    fn summary(&self, kind: AgentKind, lang: Language, theme: &Theme) -> Div {
         h_flex()
-            .id(id)
-            .flex_shrink_0()
-            .gap_1()
-            .items_center()
+            .gap_2()
             .text_color(theme.muted_foreground)
             .child(agent_icon_element(kind, 12., theme.muted_foreground, theme.muted_foreground))
-            .child(meter(Tr::UsageFiveHour, self.percentages[0]))
-            .child("·")
-            .child(meter(Tr::UsageWeek, self.percentages[1]))
-            .tooltip(move |window, cx| {
-                let lines = tooltip.clone();
-                Tooltip::element(move |_, _| {
-                    v_flex().children(lines.iter().cloned().map(|line| div().child(line)))
-                })
-                .build(window, cx)
-            })
-            .into_any_element()
+            .children(Period::ALL.map(|period| {
+                let used = self.percentages[period as usize];
+                h_flex()
+                    .gap_1()
+                    .child(tr(lang, period.label(false)))
+                    .child(
+                        div()
+                            .text_color(self.color(used, theme))
+                            .child(used.map_or_else(|| "—".into(), |used| format!("{used}%"))),
+                    )
+                    .children(self.reset_at(period).and_then(|at| period.reset_time(lang, at, &Local, false)))
+            }))
     }
-}
 
-fn reset_detail(lang: Language, window: Option<Limit>, now: i64) -> Option<String> {
-    let at = window?.resets_at?;
-    let clock = chrono::Local.timestamp_opt(at, 0).single()?.format("%H:%M").to_string();
-    let minutes = at.saturating_sub(now).max(0) / 60;
-    Some(i18n::usage_reset(lang, minutes, &clock))
+    fn details(&self, kind: AgentKind, lang: Language, theme: &Theme) -> Div {
+        let name = if kind == AgentKind::Claude { "Claude Code" } else { "Codex" };
+        v_flex()
+            .w_full()
+            .gap_2()
+            .pt_2()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(agent_icon_element(kind, 14., theme.foreground, theme.foreground))
+                            .child(div().text_sm().font_semibold().child(name)),
+                    )
+                    .children(self.updated(lang).map(|text| div().text_xs().text_color(theme.muted_foreground).child(text))),
+            )
+            .children(
+                self.recorded_at
+                    .filter(|_| self.reason.is_none())
+                    .into_iter()
+                    .flat_map(|_| Period::ALL)
+                    .map(|period| self.meter(period, lang, theme)),
+            )
+            .children(
+                self.reason
+                    .or_else(|| self.recorded_at.is_none().then_some(Tr::UsageNoReading))
+                    .map(|key| div().text_xs().text_color(theme.muted_foreground).child(tr(lang, key))),
+            )
+    }
+
+    fn meter(&self, period: Period, lang: Language, theme: &Theme) -> Div {
+        let used = self.percentages[period as usize];
+        let color = self.color(used, theme);
+        let reset = self.reset_at(period).and_then(|at| {
+            let clock = period.reset_time(lang, at, &Local, true)?;
+            Some(i18n::usage_reset(lang, at.saturating_sub(self.now) / 60, &clock))
+        });
+        v_flex()
+            .w_full()
+            .gap_1()
+            .text_xs()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(tr(lang, period.label(true)))
+                    .child(div().text_color(color).child(used.map_or_else(
+                        || "—".into(),
+                        |used| i18n::usage_window(lang, used),
+                    ))),
+            )
+            .child(
+                div().w_full().h(px(5.)).rounded_full().bg(theme.border).children(
+                    used.filter(|&used| used > 0)
+                        .map(|used| div().h_full().w(relative(f32::from(used) / 100.)).rounded_full().bg(color)),
+                ),
+            )
+            .children(
+                reset.or_else(|| used.is_none().then(|| tr(lang, self.missing(period)).into()))
+                    .map(|label| div().text_color(theme.muted_foreground).child(label)),
+            )
+    }
 }
 
 #[cfg(test)]
@@ -521,39 +624,44 @@ mod tests {
         let stale = Chip::new(Some(sample), None, STALE_SECS + 1);
         assert!(stale.stale);
         assert_eq!(tone(stale.percentages[0], stale.stale), Tone::Muted);
-        let lines = stale.tooltip("Codex", Some(sample), None, Language::Uk);
-        assert!(lines.contains(&"оновлено 30 хв тому (застаріло)".into()));
+        assert_eq!(stale.updated(Language::Uk).as_deref(), Some("оновлено 30 хв тому (застаріло)"));
     }
 
     #[test]
-    fn reset_passed_and_narrow_width() {
+    fn expired_or_unavailable_samples_have_no_active_reset_or_progress() {
         let nearly_full = reading(0, 90.0, Some(200));
         let active = Chip::new(Some(nearly_full), None, 199);
         assert_eq!(active.percentages, [Some(90), None]);
-        assert!(active.visible(NARROW - 1., true));
+        assert_eq!(active.reset_at(Period::FiveHour), Some(200));
+        assert_eq!(active.reset_at(Period::Week), None);
 
         let passed = Chip::new(Some(nearly_full), None, 200);
         assert_eq!(passed.percentages, [None, None]);
-        assert!(!passed.visible(NARROW - 1., true));
-        assert!(passed.visible(NARROW, true));
-        assert_eq!(
-            passed.tooltip("Codex", Some(nearly_full), None, Language::En)[1],
-            "5h  Waiting for a new reading after reset"
-        );
+        assert_eq!(passed.reset_at(Period::FiveHour), None);
+        assert_eq!(tr(Language::En, passed.missing(Period::FiveHour)), "Waiting for a new reading after reset");
+        assert_eq!(tr(Language::En, passed.missing(Period::Week)), "No usage data");
         let unavailable = Chip::new(Some(nearly_full), Some(Tr::UsageCodexFailed), 100);
         assert_eq!(unavailable.percentages, [None, None]);
-        assert!(!unavailable.visible(NARROW - 1., true));
+        assert_eq!(unavailable.reset_at(Period::FiveHour), None);
     }
 
     #[test]
     fn localized_usage_details() {
-        let reset = i18n::usage_reset(Language::Uk, 134, "18:40");
-        assert_eq!(
-            i18n::usage_window(Language::Uk, 18, Some(&reset)),
-            "використано 18% · скидання через 2 год 14 хв (о 18:40)"
-        );
+        assert_eq!(i18n::usage_window(Language::Uk, 18), "використано 18%");
         assert_eq!(i18n::usage_updated(Language::Ru, 2), "обновлено 2 мин назад");
-        assert_eq!(i18n::usage_reset(Language::En, 8, "18:40"), "resets in 8 min (at 18:40)");
+        assert_eq!(i18n::usage_reset(Language::En, 8, "18:40"), "Resets: 18:40 · in 8 min");
+        assert_eq!(i18n::usage_reset(Language::Uk, 1560, "сб, 21.11, 01:30"), "Скидання: сб, 21.11, 01:30 · через 1 д 2 год");
+    }
+
+    #[test]
+    fn summary_and_details_use_the_local_day_at_reset() {
+        let utc = chrono::Utc.with_ymd_and_hms(2026, 11, 20, 23, 30, 0).unwrap();
+        let zone = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        let at = utc.timestamp();
+        assert_eq!(Period::FiveHour.reset_time(Language::Uk, at, &zone, false).as_deref(), Some("01:30"));
+        assert_eq!(Period::Week.reset_time(Language::Uk, at, &zone, false).as_deref(), Some("сб 01:30"));
+        assert_eq!(Period::Week.reset_time(Language::En, at, &zone, true).as_deref(), Some("Sat, 21.11, 01:30"));
+        assert_eq!(Period::Week.reset_time(Language::Uk, i64::MAX, &zone, true), None);
     }
 
     #[test]

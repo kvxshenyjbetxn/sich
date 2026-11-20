@@ -105,6 +105,10 @@ pub enum Tr {
     OmpNotFound,
     OmpTooOld,
     UsageLimits,
+    UsageTitle,
+    UsageFiveHourDetail,
+    UsageWeekDetail,
+    UsageNoReading,
     ClaudeStatuslineWrap,
     UsageFiveHour,
     UsageWeek,
@@ -282,6 +286,10 @@ impl Tr {
         Tr::OmpNotFound,
         Tr::OmpTooOld,
         Tr::UsageLimits,
+        Tr::UsageTitle,
+        Tr::UsageFiveHourDetail,
+        Tr::UsageWeekDetail,
+        Tr::UsageNoReading,
         Tr::ClaudeStatuslineWrap,
         Tr::UsageFiveHour,
         Tr::UsageWeek,
@@ -962,6 +970,26 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Language::Ru => "Показывать лимиты Codex и Claude Code в строке состояния",
             Language::En => "Show Codex and Claude Code limits in the status bar",
         },
+        Tr::UsageTitle => match lang {
+            Uk => "Ліміти використання",
+            Ru => "Лимиты использования",
+            En => "Usage limits",
+        },
+        Tr::UsageFiveHourDetail => match lang {
+            Uk => "5-годинний ліміт",
+            Ru => "5-часовой лимит",
+            En => "5-hour limit",
+        },
+        Tr::UsageWeekDetail => match lang {
+            Uk => "7-денний ліміт",
+            Ru => "7-дневный лимит",
+            En => "7-day limit",
+        },
+        Tr::UsageNoReading => match lang {
+            Uk => "Немає даних",
+            Ru => "Нет данных",
+            En => "No usage data",
+        },
         Tr::ClaudeStatuslineWrap => match lang {
             Language::Uk => "Обгортати мій statusLine Claude Code, щоб бачити ліміти (повертається при вимкненні)",
             Language::Ru => "Оборачивать мой statusLine Claude Code, чтобы видеть лимиты (возвращается при выключении)",
@@ -973,9 +1001,8 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Language::En => "5h",
         },
         Tr::UsageWeek => match lang {
-            Language::Uk => "тиж",
-            Language::Ru => "нед",
-            Language::En => "wk",
+            Language::Uk | Language::Ru => "7д",
+            Language::En => "7d",
         },
         Tr::UsageStale => match lang {
             Language::Uk => " (застаріло)",
@@ -1501,32 +1528,43 @@ pub fn usage_updated(lang: Language, minutes: i64) -> String {
     }
 }
 
-pub fn usage_window(lang: Language, used: u8, reset: Option<&str>) -> String {
-    let mut details = match lang {
+pub fn usage_window(lang: Language, used: u8) -> String {
+    match lang {
         Language::Uk => format!("використано {used}%"),
         Language::Ru => format!("использовано {used}%"),
         Language::En => format!("{used}% used"),
-    };
-    if let Some(reset) = reset {
-        details.push_str(" · ");
-        details.push_str(reset);
     }
-    details
+}
+
+pub fn usage_weekday(lang: Language, day: chrono::Weekday) -> &'static str {
+    let names = match lang {
+        Language::Uk => ["пн", "вт", "ср", "чт", "пт", "сб", "нд"],
+        Language::Ru => ["пн", "вт", "ср", "чт", "пт", "сб", "вс"],
+        Language::En => ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+    };
+    names[day.num_days_from_monday() as usize]
 }
 
 pub fn usage_reset(lang: Language, minutes: i64, clock: &str) -> String {
-    let hours = minutes / 60;
+    let days = minutes / (24 * 60);
+    let hours = minutes / 60 % 24;
     let minutes = minutes % 60;
-    let (h, m) = match lang {
-        Language::Uk => ("год", "хв"),
-        Language::Ru => ("ч", "мин"),
-        Language::En => ("h", "min"),
+    let (d, h, m) = match lang {
+        Language::Uk => ("д", "год", "хв"),
+        Language::Ru => ("д", "ч", "мин"),
+        Language::En => ("d", "h", "min"),
     };
-    let remaining = if hours > 0 { format!("{hours} {h} {minutes} {m}") } else { format!("{minutes} {m}") };
+    let remaining = if days > 0 {
+        format!("{days} {d} {hours} {h}")
+    } else if hours > 0 {
+        format!("{hours} {h} {minutes} {m}")
+    } else {
+        format!("{minutes} {m}")
+    };
     match lang {
-        Language::Uk => format!("скидання через {remaining} (о {clock})"),
-        Language::Ru => format!("сброс через {remaining} (в {clock})"),
-        Language::En => format!("resets in {remaining} (at {clock})"),
+        Language::Uk => format!("Скидання: {clock} · через {remaining}"),
+        Language::Ru => format!("Сброс: {clock} · через {remaining}"),
+        Language::En => format!("Resets: {clock} · in {remaining}"),
     }
 }
 

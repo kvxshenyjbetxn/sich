@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use gpui_kit::component::input::CursorBlink;
 use gpui_kit::component::{Theme, ThemeMode};
-use gpui_kit::{App, Hsla, rgb};
+use gpui_kit::{Anchor, App, Hsla, px, rgb};
 use serde::{Deserialize, Serialize};
 
 use crate::colors;
@@ -88,6 +88,8 @@ pub fn apply(cx: &mut App) {
     Theme::update(cx, |t| {
         // Every caret blink repaints the view; stop blinking when idle so an idle window costs nothing.
         t.cursor_blink = CursorBlink::default().with_idle_timeout(Duration::from_secs(10));
+        t.notification.placement = Anchor::BottomRight;
+        t.notification.margins.bottom = px(36.); // Status bar (24px) + gap.
 
         let c = &mut t.colors;
         let (bg, panel, border) = (h(p.bg), h(p.panel), h(p.border));

@@ -1,10 +1,17 @@
-//! Turns daemon operation failures into one-shot error notifications.
+//! Themed, in-app notifications for daemon failures and available updates.
 
 use std::time::Instant;
 
 use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::notification::Notification;
-use gpui_kit::{App, Window};
+use gpui_kit::{App, WeakEntity, Window};
+
+use crate::app_view::AppView;
+use crate::i18n::{self, Tr, tr};
+use crate::{settings, update_dialog};
+
+struct AvailableUpdate;
 
 /// Message of `last` if it was not shown yet; remembers it in `shown`.
 pub fn take_new_error(
@@ -21,6 +28,34 @@ pub fn take_new_error(
 
 pub fn show_error(message: String, window: &mut Window, cx: &mut App) {
     window.push_notification(Notification::error(message), cx);
+}
+
+pub(crate) fn show_update(
+    app: WeakEntity<AppView>,
+    version: &semver::Version,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let lang = settings::language(cx);
+    let notification = Notification::info(i18n::update_available(lang, &version.to_string()))
+        .id::<AvailableUpdate>()
+        .title(tr(lang, Tr::UpdateTitle))
+        .action(move |_, _, cx| {
+            let app = app.clone();
+            Button::new("open-update")
+                .primary()
+                .label(tr(settings::language(cx), Tr::Update))
+                .on_click(move |_, window, cx| {
+                    if let Some(app) = app.upgrade() {
+                        update_dialog::open(app, window, cx);
+                    }
+                })
+        });
+    window.push_notification(notification, cx);
+}
+
+pub(crate) fn clear_update(window: &mut Window, cx: &mut App) {
+    window.remove_notification::<AvailableUpdate>(cx);
 }
 
 #[cfg(test)]

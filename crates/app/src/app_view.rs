@@ -126,7 +126,7 @@ pub struct AppView {
     pub(crate) right_panel: RightPanelState,
     right_dragging: bool,
     hidden_to_tray: bool,
-    /// Newer release found by the periodic check.
+    /// Newer release found by an update check; retained if the toast is dismissed.
     update_available: Option<updater::Release>,
     update_flow: Option<Arc<UpdateFlow>>,
 }
@@ -248,7 +248,6 @@ impl AppView {
         })
         .detach();
 
-        Self::start_update_checks(cx);
         Self {
             client,
             views: HashMap::new(),
@@ -369,6 +368,7 @@ impl AppView {
     /// window-bounds tracking for the session.
     pub fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.usage_bar.watch(window, cx);
+        Self::start_update_checks(window, cx);
         cx.observe(&self.git_panel, |this, panel, cx| {
             let collapsed = panel.read(cx).history_collapsed();
             if this.right_panel.history_collapsed != collapsed {
@@ -497,14 +497,14 @@ impl AppView {
     // ---- updates -----------------------------------------------------------------------------
 
     /// Periodic release check (official builds only). Errors are logged and ignored.
-    fn start_update_checks(cx: &mut Context<Self>) {
+    fn start_update_checks(window: &mut Window, cx: &mut Context<Self>) {
         if !updater::OFFICIAL {
             return;
         }
         if let Some(dir) = updater::install_dir() {
             cx.background_executor().spawn(async move { updater::cleanup_old(&dir) }).detach();
         }
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(updater::FIRST_CHECK_DELAY).await;
             loop {
                 let wanted = this
@@ -517,7 +517,13 @@ impl AppView {
                     if let Err(err) = &found {
                         tracing::debug!("update check failed: {err:#}");
                     }
-                    if this.update(cx, |this, cx| this.apply_check(&found, cx)).is_err() {
+                    if this.update_in(cx, |this, window, cx| {
+                        if this.apply_check(found, window, cx)
+                            && let Some(release) = &this.update_available
+                        {
+                            notifications::show_update(cx.weak_entity(), &release.version, window, cx);
+                        }
+                    }).is_err() {
                         break;
                     }
                 }
@@ -527,26 +533,27 @@ impl AppView {
         .detach();
     }
 
-    /// Records a check result: sets the pending release (unless an update flow is running)
-    /// and the status shown in settings. Returns the release when a newer one exists.
-    fn apply_check(&mut self, result: &anyhow::Result<Option<updater::Release>>, cx: &mut Context<Self>) -> Option<updater::Release> {
-        let release = match result {
-            Ok(release) => {
-                if self.update_flow.is_none() {
-                    self.update_available = release.clone();
-                    cx.notify();
-                }
-                release.clone()
-            }
-            Err(_) => None,
-        };
-        let status = match result {
+    /// Keep the last known release after a failed check; an unchanged version does not re-toast.
+    fn apply_check(
+        &mut self,
+        result: anyhow::Result<Option<updater::Release>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let status = match &result {
             Ok(Some(r)) => CheckStatus::Available(r.version.to_string()),
             Ok(None) => CheckStatus::UpToDate,
             Err(err) => CheckStatus::Failed(format!("{err:#}")),
         };
         update_status::set(status, cx);
-        release
+        let Ok(release) = result else { return false };
+        if self.update_flow.is_some() {
+            return false;
+        }
+        if release.is_none() {
+            notifications::clear_update(window, cx);
+        }
+        record_release(&mut self.update_available, release)
     }
 
     /// Manual "check now" from settings. Works regardless of the auto-check toggle.
@@ -568,10 +575,11 @@ impl AppView {
         cx.spawn_in(window, async move |this, cx| {
             let found = cx.background_executor().spawn(fetch_latest_now()).await;
             let _ = this.update_in(cx, |this, window, cx| {
-                if let Some(release) = this.apply_check(&found, cx) {
+                let has_release = matches!(&found, Ok(Some(_)));
+                this.apply_check(found, window, cx);
+                if has_release {
                     // Dialogs can't coexist: close settings, then show the update dialog.
                     window.close_dialog(cx);
-                    this.update_available = Some(release);
                     let app = cx.entity();
                     window.defer(cx, move |window, cx| update_dialog::open(app, window, cx));
                 }
@@ -1235,7 +1243,6 @@ impl AppView {
         &self,
         snap: &Snapshot,
         lang: i18n::Language,
-        window_width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
@@ -1261,7 +1268,6 @@ impl AppView {
             }
             StatusLine::Text { text, .. } => text.into_any_element(),
         };
-        let app = cx.entity();
         h_flex()
             .h(px(24.))
             .w_full()
@@ -1274,22 +1280,8 @@ impl AppView {
             .border_color(theme.status_bar_border)
             .text_size(px(12.))
             .text_color(theme.muted_foreground)
-            .child(div().flex_1().child(indicator))
-            .children(self.usage_bar.render(lang, window_width, cx))
-            .children(self.update_available.as_ref().map(|release| {
-                let app = app.clone();
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(i18n::update_available(lang, &release.version.to_string())),
-                    )
-                    .child(Button::new("update-available").xsmall().label(tr(lang, Tr::Update)).on_click(
-                        move |_, window, cx| update_dialog::open(app.clone(), window, cx),
-                    ))
-            }))
+            .child(div().flex_1().min_w_0().truncate().child(indicator))
+            .children(self.usage_bar.render(lang, cx))
             .child(
                 Button::new("open-settings")
                     .ghost()
@@ -1301,6 +1293,15 @@ impl AppView {
                     })),
             )
     }
+}
+
+/// Replace the cached release and report a change worth announcing.
+fn record_release(available: &mut Option<updater::Release>, found: Option<updater::Release>) -> bool {
+    let changed = found.as_ref().is_some_and(|latest| {
+        available.as_ref().is_none_or(|previous| latest.version != previous.version)
+    });
+    *available = found;
+    changed
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1471,7 +1472,7 @@ impl Render for AppView {
         let right_w = clamp_right_w(self.right_panel.width.unwrap_or(DEFAULT_RIGHT_W), window_w, sidebar_w);
         let sidebar = self.render_sidebar(&snap, &infos, lang, sidebar_w, cx);
         let main = self.render_main(&snap, &infos, lang, cx);
-        let status_bar = self.render_status_bar(&snap, lang, window_w, cx);
+        let status_bar = self.render_status_bar(&snap, lang, cx);
         if matches!(snap.status, ConnStatus::Incompatible { .. })
             && !self.restarting_daemon && !self.restart_dialog_shown
         {
@@ -1566,6 +1567,27 @@ mod tests {
         pid: None,
         version: None,
     };
+
+    #[test]
+    fn periodic_checks_do_not_reannounce_a_dismissed_version() {
+        let release = |patch| updater::Release {
+            version: semver::Version::new(1, 0, patch),
+            notes: String::new(),
+            zip_name: String::new(),
+            zip_url: String::new(),
+            zip_size: 0,
+            sha_url: String::new(),
+        };
+        let mut available = None;
+        assert!(!record_release(&mut available, None));
+        assert!(record_release(&mut available, Some(release(1))));
+        let reread = updater::Release { notes: "Updated release notes".into(), ..release(1) };
+        assert!(!record_release(&mut available, Some(reread.clone())));
+        assert_eq!(available.as_ref(), Some(&reread));
+        assert!(record_release(&mut available, Some(release(2))));
+        assert!(!record_release(&mut available, None));
+        assert!(available.is_none());
+    }
 
     #[test]
     fn connected_with_matching_build_shows_dot_with_pid() {

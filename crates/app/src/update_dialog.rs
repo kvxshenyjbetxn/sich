@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 
 use crate::app_view::AppView;
 use crate::i18n::{self, Language, Tr, tr};
-use crate::settings;
+use crate::{notifications, settings};
 use crate::updater::{self, Cancelled, NoWriteAccess, Progress, Release, Stage};
 
 const POLL: Duration = Duration::from_millis(100);
@@ -83,6 +83,7 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
         return;
     }
     let Some(flow) = app.update(cx, |this, _| this.update_flow_for_dialog()) else { return };
+    notifications::clear_update(window, cx);
     window.open_dialog(cx, move |dialog, _window, cx| {
         let lang = settings::language(cx);
         let state = flow.state();
@@ -115,9 +116,15 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                     }
                 };
                 footer = footer
-                    .child(Button::new("update-later").label(tr(lang, Tr::Later)).on_click(
-                        |_, window, cx| window.close_dialog(cx),
-                    ))
+                    .child({
+                        let app = app.clone();
+                        Button::new("update-later").label(tr(lang, Tr::Later)).on_click(
+                            move |_, window, cx| {
+                                app.update(cx, |this, _| this.finish_update_flow());
+                                window.close_dialog(cx);
+                            },
+                        )
+                    })
                     .child(Button::new("update-start").primary().label(tr(lang, Tr::Update)).on_click(start));
             }
             FlowState::Running(stage) => {
@@ -161,6 +168,10 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
             }
         }
         let mut dialog = dialog.title(tr(lang, Tr::UpdateTitle)).w(px(480.)).child(body).footer(footer);
+        let on_close = app.clone();
+        dialog = dialog.on_close(move |_, _, cx| {
+            on_close.update(cx, |this, _| this.finish_update_flow());
+        });
         if running {
             dialog = dialog.close_button(false).overlay_closable(false).keyboard(false);
         }
