@@ -12,7 +12,7 @@ use gpui_kit::{
     IntoElement, MouseButton, ParentElement as _, PathPromptOptions, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, div, px,
 };
-use sich_proto::{GroupId, GroupInfo, ProjectId, ProjectInfo, SubagentStatus, TermId, TerminalInfo, WorktreeInfo};
+use sich_proto::{AgentStatus, GroupId, GroupInfo, ProjectId, ProjectInfo, SubagentActivityKey, SubagentStatus, TermId, TerminalInfo, WorktreeInfo};
 
 use crate::agent_badge::{
     Badge, agent_icon_element, agent_preview, badge_element, badge_for, rollup, shorten_model, subagent_badge,
@@ -816,7 +816,7 @@ impl AppView {
                 let (shown, hidden) = visible_subagents(&status.subagents, MAX_VISIBLE_SUBAGENTS);
                 let mut children: Vec<AnyElement> = shown
                     .iter()
-                    .map(|sub| self.render_subagent_row(key_for_sub.clone(), id, sub, indent, lang, cx))
+                    .map(|sub| self.render_subagent_row(key_for_sub.clone(), id, status, sub, indent, lang, cx))
                     .collect();
                 if hidden > 0 {
                     children.push(
@@ -844,6 +844,7 @@ impl AppView {
         &self,
         key: WorkspaceKey,
         term: TermId,
+        agent: &AgentStatus,
         sub: &SubagentStatus,
         indent: f32,
         lang: Language,
@@ -852,9 +853,17 @@ impl AppView {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&(term, &sub.id), &mut hasher);
+        std::hash::Hash::hash(&(term, &sub.id, sub.since_unix_ms), &mut hasher);
         let uid = std::hash::Hasher::finish(&hasher);
-        let tip = subagent_tooltip(sub);
+        let tip = format!("{} — {}", tr(lang, Tr::ActivityOpen), subagent_tooltip(sub));
+        let label = SharedString::from(subagent_label(sub));
+        let row_label = label.clone();
+        let activity = SubagentActivityKey {
+            agent: agent.kind,
+            session_id: agent.session_id.clone(),
+            id: sub.id.clone(),
+            since_unix_ms: sub.since_unix_ms,
+        };
         let badge = badge_element(&subagent_badge(sub), false, lang, ("side-sub-badge", uid), cx);
         row_base(("side-sub", uid), false, indent, &theme)
             .h(px(SUB_ROW_H))
@@ -862,7 +871,7 @@ impl AppView {
             .text_color(theme.sidebar_foreground)
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.activate_terminal_in(key.clone(), term, window, cx)
+                this.open_subagent_activity(key.clone(), term, activity.clone(), label.clone(), window, cx)
             }))
             .child(
                 h_flex()
@@ -878,7 +887,7 @@ impl AppView {
                     .max_w(gpui_kit::relative(0.6))
                     .truncate()
                     .text_size(px(12.))
-                    .child(subagent_label(sub)),
+                    .child(row_label),
             )
             .child(
                 div()

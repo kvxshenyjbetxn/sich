@@ -1,19 +1,17 @@
-//! Diff tab selection belongs to the UI and is kept per workspace.
+//! Tab selection for the non-terminal views of a workspace.
 
-use sich_git::compare::CompareKey;
-
-pub(crate) struct DiffTab<T> {
+pub(crate) struct WorkspaceTab<K, T> {
     pub id: u64,
-    pub key: CompareKey,
+    pub key: K,
     pub view: T,
 }
 
-pub(crate) struct DiffTabs<T> {
-    pub tabs: Vec<DiffTab<T>>,
+pub(crate) struct WorkspaceTabs<K, T> {
+    pub tabs: Vec<WorkspaceTab<K, T>>,
     pub active: Option<u64>,
 }
 
-impl<T> Default for DiffTabs<T> {
+impl<K, T> Default for WorkspaceTabs<K, T> {
     fn default() -> Self {
         Self {
             tabs: Vec::new(),
@@ -22,15 +20,15 @@ impl<T> Default for DiffTabs<T> {
     }
 }
 
-impl<T> DiffTabs<T> {
-    pub fn open(&mut self, id: u64, key: CompareKey, create: impl FnOnce() -> T) -> &DiffTab<T> {
+impl<K: Eq, T> WorkspaceTabs<K, T> {
+    pub fn open(&mut self, id: u64, key: K, create: impl FnOnce() -> T) -> &WorkspaceTab<K, T> {
         let index = self
             .tabs
             .iter()
             .position(|tab| tab.key == key)
             .unwrap_or_else(|| {
                 let index = self.tabs.len();
-                self.tabs.push(DiffTab {
+                self.tabs.push(WorkspaceTab {
                     id,
                     key,
                     view: create(),
@@ -42,7 +40,7 @@ impl<T> DiffTabs<T> {
         tab
     }
 
-    pub fn active(&self) -> Option<&DiffTab<T>> {
+    pub fn active(&self) -> Option<&WorkspaceTab<K, T>> {
         self.tabs.iter().find(|tab| Some(tab.id) == self.active)
     }
 
@@ -70,7 +68,7 @@ impl<T> DiffTabs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sich_git::compare::CompareSource;
+    use sich_git::compare::{CompareKey, CompareSource};
 
     fn key(source: CompareSource) -> CompareKey {
         CompareKey {
@@ -81,7 +79,7 @@ mod tests {
 
     #[test]
     fn reopening_selects_existing_file_and_source_with_its_view() {
-        let mut tabs = DiffTabs::default();
+        let mut tabs = WorkspaceTabs::default();
         tabs.open(1, key(CompareSource::Working), || "working view");
         tabs.open(2, key(CompareSource::Staged), || "staged view");
         let working = tabs.open(3, key(CompareSource::Working), || panic!("duplicate view"));
@@ -92,7 +90,7 @@ mod tests {
 
     #[test]
     fn closing_an_active_tab_selects_the_neighbor_or_returns_to_the_terminal() {
-        let mut tabs = DiffTabs::default();
+        let mut tabs = WorkspaceTabs::default();
         tabs.open(1, key(CompareSource::Working), || ());
         tabs.open(2, key(CompareSource::Staged), || ());
         tabs.open(3, key(CompareSource::Conflict), || ());
@@ -107,7 +105,7 @@ mod tests {
 
     #[test]
     fn closing_a_background_tab_keeps_the_current_selection() {
-        let mut tabs = DiffTabs::default();
+        let mut tabs = WorkspaceTabs::default();
         tabs.open(1, key(CompareSource::Working), || ());
         tabs.open(2, key(CompareSource::Staged), || ());
         tabs.close(1);

@@ -7,6 +7,24 @@ let owner;
 const clip = (text) => typeof text === "string" ? text.slice(0, 2048).toWellFormed() : undefined;
 const label = (text) => typeof text === "string" ? text.trim().slice(0, 120).toWellFormed() || undefined : undefined;
 const MAX_SUBAGENTS = 16; // Same roster limit as the daemon's Claude/Codex integrations.
+const MAX_ACTIVITY_BATCH = 32;
+const MAX_ACTIVITY_QUEUE = 128;
+const MAX_ACTIVITY_TEXT = 2048;
+const LIFECYCLE = new Set(["started", "completed", "failed", "aborted"]);
+
+// The native task widget also reads only text blocks from finalized results. Never
+// include args, tool details, provider metadata, reasoning, or streamed updates.
+function activityText(content) {
+    if (!Array.isArray(content)) return;
+    let text = "";
+    for (const block of content) {
+        if (block?.type !== "text" || typeof block.text !== "string" || !block.text) continue;
+        if (text) text += "\n";
+        text += block.text.slice(0, MAX_ACTIVITY_TEXT - text.length);
+        if (text.length >= MAX_ACTIVITY_TEXT) break;
+    }
+    return text.toWellFormed().replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "").trim() || undefined;
+}
 
 export default function sichStatus(pi) {
     const { SICH_OMP_HOOK: exe, SICH_SOCKET: socket, SICH_TERM_ID: term } = process.env;
@@ -14,11 +32,13 @@ export default function sichStatus(pi) {
 
     let pending, draining, prompt, reply, detail, context, relay, reportedWait;
     let settled = "idle", finished, lastFinished = 0;
+    let rootSessionId, lastRunSince = 0;
     let working = false;
     const approvals = new Map();
     const plans = new Map();
     const questions = new Set();
     const roster = new Map();
+    const activity = [];
     // Keep ownership for idle agents too: their detached children can still report progress.
     const known = new Map();
 
@@ -28,6 +48,16 @@ export default function sichStatus(pi) {
             relay.unref();
         }
         return relay;
+    }
+
+    function record(id, run, kind, title, text) {
+        if (activity.length === MAX_ACTIVITY_QUEUE) {
+            // Keep starts and outcomes even when ordinary activity floods the bridge.
+            const ordinary = activity.findIndex((entry) => !LIFECYCLE.has(entry.kind));
+            if (ordinary < 0 && !LIFECYCLE.has(kind)) return;
+            activity.splice(Math.max(0, ordinary), 1);
+        }
+        activity.push({ id, since_unix_ms: run.since, kind, title, text });
     }
 
     function receive(frame, sender) {
@@ -42,16 +72,27 @@ export default function sichStatus(pi) {
         if (frame.kind === "wait") {
             if (!sender || sender.id !== id || !run || run.waiting === frame.detail) return;
             run.waiting = frame.detail;
+            if (frame.detail) record(id, run, "waiting", frame.detail);
+        } else if (frame.kind === "activity") {
+            // Native events have only an id, no call or file; the spawning bus
+            // and its ordering with lifecycle frames identify the active run.
+            if (!run || run.parent !== sender?.id) return;
+            record(id, run, frame.activityKind, frame.title, frame.text);
+            if (frame.activityKind === "tool_started" && frame.title === "wait") {
+                record(id, run, "waiting", frame.title);
+            }
         } else {
             if (run && run.parent !== sender?.id) return;
             const sameRun = run && (call && run.call ? call === run.call : !file || !run.file || file === run.file);
             if (status === "started") {
                 if (sameRun) return;
                 roster.delete(id);
-                roster.set(id, {
+                const started = {
                     parent: sender?.id, file, call, type: frame.agent, description: frame.description,
-                    since: Date.now(), tool: undefined, waiting: undefined,
-                });
+                    since: lastRunSince = Math.max(Date.now(), lastRunSince + 1), tool: undefined, waiting: undefined,
+                };
+                roster.set(id, started);
+                record(id, started, "started", started.description ?? started.type);
                 known.set(id, file);
             } else if (!sameRun) {
                 return; // Progress and settle frames cannot resurrect an old run.
@@ -61,6 +102,7 @@ export default function sichStatus(pi) {
                 run.description = description;
                 run.tool = frame.detail;
             } else {
+                record(id, run, status);
                 roster.delete(id);
             }
         }
@@ -79,7 +121,7 @@ export default function sichStatus(pi) {
     }
 
     pi.events.on("task:subagent:lifecycle", (event) => {
-        if (!["started", "completed", "failed", "aborted"].includes(event?.status)) return;
+        if (!LIFECYCLE.has(event?.status)) return;
         observe({
             kind: "lifecycle", id: event.id, status: event.status, agent: label(event.agent),
             description: label(event.description), file: event.sessionFile, call: event.parentToolCallId,
@@ -92,6 +134,37 @@ export default function sichStatus(pi) {
             kind: "progress", id: item.id, description: label(item.description), detail: label(item.currentTool),
             file: event.sessionFile, call: event.parentToolCallId,
         });
+    });
+    pi.events.on("task:subagent:event", (payload) => {
+        const { id, event } = payload ?? {};
+        if (!context || typeof id !== "string" || !id) return;
+        let activityKind, title, text;
+        switch (event?.type) {
+            case "tool_execution_start":
+                activityKind = "tool_started";
+                title = label(event.toolName);
+                break;
+            case "tool_execution_end":
+                activityKind = event.isError === true ? "tool_failed" : "tool_finished";
+                title = label(event.toolName);
+                // Unlike ordinary widget output, ask's result can be direct user input.
+                if (event.toolName !== "ask") text = activityText(event.result?.content);
+                break;
+            case "message_end":
+                if (event.message?.role !== "assistant") return;
+                text = activityText(event.message.content);
+                if (!text) return;
+                activityKind = "message";
+                break;
+            case "agent_pause":
+                if (event.awaiting !== true) return;
+                activityKind = "waiting";
+                break;
+            default:
+                // The task lifecycle status, not the model loop's end, settles a run.
+                return;
+        }
+        observe({ kind: "activity", id, activityKind, title, text });
     });
 
     function waitingOn() {
@@ -115,12 +188,13 @@ export default function sichStatus(pi) {
         questions.clear();
     }
 
-    // One process in flight, one latest snapshot waiting. No event waits on IPC except
-    // shutdown, and intermediate updates can be dropped without losing session metadata.
+    // One process in flight; the roster coalesces independently of the activity FIFO.
+    // No event waits on IPC except shutdown.
     async function drain() {
         while (pending !== undefined) {
-            const body = pending;
-            pending = undefined;
+            const batch = activity.length ? activity.splice(0, MAX_ACTIVITY_BATCH) : undefined;
+            const body = JSON.stringify({ ...pending, activity: batch });
+            if (!activity.length) pending = undefined;
             await new Promise((resolve) => {
                 try {
                     const child = spawn(exe, ["hook", "omp"], {
@@ -149,13 +223,13 @@ export default function sichStatus(pi) {
             });
             if (subagents.length === MAX_SUBAGENTS) break;
         }
-        pending = JSON.stringify({
-            session_id: ctx.sessionManager.getSessionId(),
+        pending = {
+            session_id: rootSessionId,
             state: state ?? (waiting ? "waiting" : working ? "working" : settled),
             model: clip(ctx.model?.id), title: clip(pi.getSessionName()), prompt,
             detail: waiting ?? detail, message: reply?.text,
             finished_unix_ms: finished, subagents: subagents.length ? subagents : undefined,
-        });
+        };
         draining ??= drain();
     }
 
@@ -183,6 +257,10 @@ export default function sichStatus(pi) {
         clearWaits();
         roster.clear();
         known.clear();
+        // In-flight snapshots retain their captured session id; never carry old
+        // pending activity into a snapshot of a replacement session.
+        activity.length = 0;
+        rootSessionId = ctx.sessionManager.getSessionId();
         publish(ctx);
     }
 
@@ -269,19 +347,24 @@ export default function sichStatus(pi) {
         if (settled !== "idle") finished = lastFinished = Math.max(Date.now(), lastFinished + 1);
         publish(ctx);
     }, true);
-    on("session_shutdown", (_event, ctx) => {
-        if (ctx.agent.kind === "main") {
-            roster.clear();
-            known.clear();
-            publish(ctx, "exited");
-            owner = undefined;
-        } else {
+    on("session_shutdown", async (_event, ctx) => {
+        const main = ctx.agent.kind === "main";
+        if (!main) {
             clearWaits();
             reportWait(ctx);
         }
         context = undefined;
         relay?.close();
         relay = undefined;
+        if (main) {
+            // Deliver queued activity while the old session is still live in
+            // Sich, then close it with a single final snapshot.
+            await draining;
+            roster.clear();
+            known.clear();
+            publish(ctx, "exited");
+            owner = undefined;
+        }
         return draining;
     }, true);
 }

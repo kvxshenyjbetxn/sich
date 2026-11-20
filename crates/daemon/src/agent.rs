@@ -7,10 +7,11 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use sich_proto::{AgentKind, AgentState, AgentStatus, SubagentStatus};
+use sich_proto::{AgentKind, AgentState, AgentStatus, SubagentActivity, SubagentActivityKey, SubagentStatus};
 
 use crate::codex_rollout::{IdentityPlan, IdentityRead, IdentityResult};
 
+mod activity;
 mod omp;
 
 /// `AgentStatus::detail` is cut to this many characters.
@@ -83,6 +84,7 @@ pub struct ClaudeHook {
     pub spawn_tool_type: Option<String>,
     /// `Stop` / `SubagentStop` inventory: `None` when absent or not an array.
     pub background_tasks: Option<Vec<BgAgentTask>>,
+    activity: Option<activity::Note>,
 }
 
 /// A queued request to start a subagent (from the main agent's `Agent`/`Task` tool call).
@@ -249,6 +251,7 @@ pub fn parse_claude_payload(json: &str) -> Option<ClaudeHook> {
         }),
         _ => None,
     };
+    let activity = activity::hook_note(&event, agent_id.as_deref(), tool_name.as_deref(), obj);
     Some(ClaudeHook {
         session_id: get("session_id").filter(|id| !id.is_empty()),
         event,
@@ -267,6 +270,7 @@ pub fn parse_claude_payload(json: &str) -> Option<ClaudeHook> {
         session_title: get("session_title").and_then(|s| normalize_text(&s, false)),
         prompt: get("prompt").and_then(|s| normalize_text(&s, true)),
         last_assistant_message: get("last_assistant_message").and_then(|s| normalize_text(&s, false)),
+        activity,
     })
 }
 
@@ -303,6 +307,7 @@ pub struct CodexHook {
     pub agent_type: Option<String>,
     /// Rollout file of the agent that fired the event (a child's own rollout for child events).
     pub transcript_path: Option<String>,
+    activity: Option<activity::Note>,
 }
 
 impl CodexHook {
@@ -338,18 +343,22 @@ pub fn parse_codex_payload(json: &str) -> Option<CodexHook> {
     let nonempty = |k: &str| get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let description =
         input.and_then(|i| i.get("description")).and_then(|x| x.as_str()).and_then(|s| normalize_text(s, false));
+    let event = get("hook_event_name")?;
+    let agent_id = nonempty("agent_id").map(|s| s.chars().take(MAX_AGENT_ID_CHARS).collect::<String>());
+    let activity = activity::hook_note(&event, agent_id.as_deref(), tool_name.as_deref(), obj);
     Some(CodexHook {
         session_id: get("session_id").filter(|id| !id.is_empty()),
-        event: get("hook_event_name")?,
+        event,
         tool_name,
         tool_label,
         description,
         model: get("model").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         prompt: get("prompt").and_then(|s| normalize_text(&s, true)),
         last_assistant_message: get("last_assistant_message").and_then(|s| normalize_text(&s, false)),
-        agent_id: nonempty("agent_id").map(|s| s.chars().take(MAX_AGENT_ID_CHARS).collect::<String>()),
+        agent_id,
         agent_type: nonempty("agent_type"),
         transcript_path: get("transcript_path"),
+        activity,
     })
 }
 
@@ -824,6 +833,7 @@ pub struct AgentTracker {
     pending_spawns: VecDeque<SubagentSpawn>,
     /// Codex subagent rollout identity bookkeeping (agent_id -> state); roster members only.
     identities: HashMap<String, IdentityState>,
+    activity: activity::Book,
 }
 
 /// Where the rollout identity read of one Codex subagent stands.
@@ -871,7 +881,34 @@ impl AgentTracker {
         self.hooks_seen = h.event != "SessionEnd";
         let old = self.status.clone();
         self.status = apply_with(self.status.take(), AgentInput::Claude(h), now, &mut self.pending_spawns);
+        // SessionStart normally sets this; a first observed Claude hook can be SubagentStart.
+        if let Some(status) = self.status.as_mut().filter(|s| s.kind == AgentKind::Claude && s.session_id.is_none()) {
+            status.session_id.clone_from(&h.session_id);
+        }
+        self.record_hook(AgentKind::Claude, old.as_ref(), h.session_id.as_deref(), h.agent_id.as_deref(), h.activity.as_ref(), now);
         self.status != old
+    }
+
+    pub(crate) fn subagent_activity(&mut self, key: &SubagentActivityKey, after_seq: u64, now: u64) -> Option<SubagentActivity> {
+        self.activity.delta(key, after_seq, now)
+    }
+
+    fn record_hook(
+        &mut self, kind: AgentKind, previous: Option<&AgentStatus>, session: Option<&str>, id: Option<&str>,
+        note: Option<&activity::Note>, now: u64,
+    ) {
+        let matches = |s: &&AgentStatus| s.kind == kind
+            && (session.is_none() || s.session_id.is_none() || s.session_id.as_deref() == session);
+        let child = id.zip(note);
+        self.activity.distinguish_reused_ids(self.status.as_mut());
+        if let Some((id, note)) = child.filter(|(_, note)| activity::terminal(note.kind)) {
+            // Explicit stop is applied while the prior roster key is still available.
+            self.activity.hook(previous.filter(matches), id, note.clone(), now);
+        }
+        self.activity.sync(self.status.as_ref(), now);
+        if let Some((id, note)) = child.filter(|(_, note)| !activity::terminal(note.kind)) {
+            self.activity.hook(self.status.as_ref().filter(matches), id, note.clone(), now);
+        }
     }
 
     /// Returns true if the status changed.
@@ -881,7 +918,7 @@ impl AgentTracker {
     }
 
     pub(crate) fn on_omp_hook(&mut self, payload: &str, now: u64) -> bool {
-        let Some(snapshot) = omp::Snapshot::parse(payload) else {
+        let Some(mut snapshot) = omp::Snapshot::parse(payload) else {
             return false;
         };
         let owns_current = self.status.as_ref().is_some_and(|status| snapshot.owns(status));
@@ -889,6 +926,8 @@ impl AgentTracker {
         if status.is_none() && !owns_current {
             return false;
         }
+        snapshot.record_activity(&mut self.activity, now);
+        self.activity.sync(status.as_ref(), now);
         self.hooks_seen = status.is_some();
         let changed = self.status != status;
         self.status = status;
@@ -930,7 +969,10 @@ impl AgentTracker {
             return false;
         }
         self.hooks_seen = h.event != "SessionEnd";
-        let mut changed = self.update(|prev| apply(prev, AgentInput::Codex(h), now));
+        let old = self.status.clone();
+        self.status = apply(self.status.take(), AgentInput::Codex(h), now);
+        self.record_hook(AgentKind::Codex, old.as_ref(), h.session_id.as_deref(), h.agent_id.as_deref(), h.activity.as_ref(), now);
+        let mut changed = self.status != old;
         if let Some(r) = ident {
             changed |= self.apply_identity(r, now);
         }
@@ -969,10 +1011,11 @@ impl AgentTracker {
         self.update(|prev| apply(prev, AgentInput::Title { title, hooks_seen }, now))
     }
 
-    pub fn on_exit(&mut self) -> bool {
+    pub fn on_exit(&mut self, now: u64) -> bool {
         self.hooks_seen = false;
         self.pending_spawns.clear();
         self.identities.clear();
+        self.activity.sync(None, now);
         self.update(|prev| apply(prev, AgentInput::ProcessExit, 0))
     }
 
@@ -1533,8 +1576,8 @@ mod tests {
     fn tracker_exit_resets_hooks_seen() {
         let mut t = AgentTracker::default();
         t.on_claude_hook(&hook(&payload("UserPromptSubmit", "")), T0);
-        assert!(t.on_exit());
-        assert!(!t.on_exit());
+        assert!(t.on_exit(T0));
+        assert!(!t.on_exit(T0));
         assert!(t.on_title("\u{2802} x", T0 + 1));
     }
 
@@ -1959,7 +2002,7 @@ mod tests {
         // Process exit too.
         t.on_codex_hook(&start, T0 + 8);
         t.on_codex_hook_with(&tool_ev(&p), T0 + 9, Some(res(&p, 5, IdentityRead::Miss)));
-        t.on_exit();
+        t.on_exit(T0 + 10);
         assert!(t.identities.is_empty());
     }
 
@@ -2386,7 +2429,7 @@ mod tests {
         let s = t.status().unwrap();
         assert_eq!(s.subagents[0].description.as_deref(), Some("D"));
         t.on_claude_hook(&spawn, T0 + 2);
-        t.on_exit();
+        t.on_exit(T0 + 3);
         assert!(t.pending_spawns().is_empty());
     }
 }

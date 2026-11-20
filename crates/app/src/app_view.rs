@@ -21,11 +21,10 @@ use gpui_kit::{
 use sich_git::Repo;
 use sich_git::compare::CompareKey;
 use sich_orch::auto_close::{AutoClose, countdown_seconds};
-use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
+use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, SubagentActivityKey, TermId, TerminalInfo};
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonPool, RestartResult, RestoreData, Snapshot};
-use crate::diff_tabs::{DiffTab, DiffTabs};
 use crate::diff_view::DiffView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
 use crate::i18n::{self, Tr, tr};
@@ -35,6 +34,7 @@ use crate::sidebar::{DEFAULT_SIDEBAR_W, clamp_sidebar_w};
 use crate::session::{self, RightPanelState, RightTab, SavedWindow, Session, SessionInput};
 use crate::settings;
 use crate::settings_dialog;
+use crate::subagent_activity::{ActivityTarget, ActivityView};
 use crate::tray::{self, Tray, UiEvent};
 use crate::update_dialog::{self, UpdateFlow};
 use crate::update_status::{self, CheckStatus};
@@ -43,6 +43,7 @@ use crate::view::TerminalView;
 use crate::workspace::{
     WorkspaceKey, Workspaces, cycle_id, restore_selection, terminals_in, workspace_exists,
 };
+use crate::workspace_tabs::{WorkspaceTab, WorkspaceTabs};
 use crate::win_flash;
 use crate::win_show;
 use crate::worktree_dialogs;
@@ -67,12 +68,24 @@ struct RestoreTarget {
     active: usize,
 }
 
+#[derive(PartialEq, Eq)]
+pub(crate) enum TabKey {
+    Diff(CompareKey),
+    Activity(ActivityTarget),
+}
+
+pub(crate) enum TabView {
+    Diff(Entity<DiffView>),
+    Activity(Entity<ActivityView>),
+}
+
 pub struct AppView {
     pub(crate) client: DaemonPool,
     views: HashMap<TermId, Entity<TerminalView>>,
-    diff_tabs: HashMap<WorkspaceKey, DiffTabs<Entity<DiffView>>>,
-    next_diff_id: u64,
-    focused_diff: Option<u64>,
+    workspace_tabs: HashMap<WorkspaceKey, WorkspaceTabs<TabKey, TabView>>,
+    next_tab_id: u64,
+    focused_tab: Option<u64>,
+    activity_rt: tokio::runtime::Handle,
     pub(crate) tab_scroll: ScrollHandle,
     pub(crate) ws: Workspaces,
     /// Saved workspace to restore when the first `Projects` update arrives.
@@ -185,6 +198,7 @@ impl AppView {
         // The watcher delivers mail, raises escalations, closes workers and cleans up merged worktrees.
         let orch_socket = socket;
         let worktree_socket = client.primary_socket().to_owned();
+        let orch_rt = rt.clone();
         cx.spawn(async move |this, cx| {
             let mut watcher = Some(sich_orch::watch::Watcher::new(sich_orch::paths::db_path()));
             let mut closing: Option<gpui_kit::Task<()>> = None;
@@ -228,7 +242,7 @@ impl AppView {
                 }
                 if should_close && !due.is_empty() && closing.is_none() {
                     let socket = orch_socket.clone();
-                    let rt = rt.clone();
+                    let rt = orch_rt.clone();
                     closing = Some(cx.background_executor().spawn(async move {
                         orch_watch::release_due(&due, &socket, &rt);
                     }));
@@ -239,7 +253,7 @@ impl AppView {
                 if let Some(terminals) = cleanup_terminals {
                     last_cleanup = Some(Instant::now());
                     let socket = worktree_socket.clone();
-                    let rt = rt.clone();
+                    let rt = orch_rt.clone();
                     cleanup = Some(cx.background_executor().spawn(async move {
                         orch_watch::cleanup_worktrees(&socket, &terminals, &rt);
                     }));
@@ -251,9 +265,10 @@ impl AppView {
         Self {
             client,
             views: HashMap::new(),
-            diff_tabs: HashMap::new(),
-            next_diff_id: 0,
-            focused_diff: None,
+            workspace_tabs: HashMap::new(),
+            next_tab_id: 0,
+            focused_tab: None,
+            activity_rt: rt,
             tab_scroll: ScrollHandle::new(),
             ws: Workspaces::default(),
             // The session's selection wins over the older `last_workspace` setting.
@@ -320,7 +335,7 @@ impl AppView {
     fn apply_orch(&mut self, out: sich_orch::watch::TickOutput, cx: &mut Context<Self>) {
         let now_ms = sich_orch::paths::now_ms();
         let countdown_changed = !self.hidden_to_tray
-            && self.active_diff().is_none()
+            && self.active_tab().is_none()
             && self.focused
                 .and_then(|id| self.orch.workers.get(&id))
                 .and_then(|worker| worker.auto_close_state(settings::get(cx).orch_auto_close_workers))
@@ -439,7 +454,7 @@ impl AppView {
     fn track_agents(&mut self, snap: &Snapshot) {
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
         let ws_ids = self.workspace_ids(&infos);
-        let active = self.ws.active_in(&self.ws.selected, &ws_ids);
+        let active = if self.active_tab().is_none() { self.ws.active_in(&self.ws.selected, &ws_ids) } else { None };
         let mut flash = false;
         for t in &snap.terminals {
             let id = t.info.id;
@@ -449,7 +464,7 @@ impl AppView {
             if let Some(prev) = self.attention.insert(id, now) {
                 flash |= !self.window_active && should_flash(prev, now);
             }
-            if should_mark_seen(active == Some(id) && self.active_diff().is_none(), self.window_active, status) {
+            if should_mark_seen(active == Some(id), self.window_active, status) {
                 let since = status.map_or(0, |s| s.since_unix_ms);
                 if self.seen_sent.get(&id) != Some(&since) {
                     self.seen_sent.insert(id, since);
@@ -878,7 +893,7 @@ impl AppView {
     pub(crate) fn activate_terminal(&mut self, id: TermId, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.ws.selected.clone();
         self.ws.set_active(&key, id);
-        self.deactivate_diff(&key, cx);
+        self.deactivate_tab(&key, cx);
         self.focused = Some(id);
         if let Some(view) = self.views.get(&id) {
             view.update(cx, |v, cx| v.focus(window, cx));
@@ -898,24 +913,27 @@ impl AppView {
         self.activate_terminal(id, window, cx);
     }
 
-    pub(crate) fn workspace_diffs(&self) -> Option<&DiffTabs<Entity<DiffView>>> {
-        self.diff_tabs.get(&self.ws.selected)
+    pub(crate) fn workspace_tabs(&self) -> Option<&WorkspaceTabs<TabKey, TabView>> {
+        self.workspace_tabs.get(&self.ws.selected)
     }
 
-    fn active_diff(&self) -> Option<&DiffTab<Entity<DiffView>>> {
-        self.workspace_diffs()?.active()
+    fn active_tab(&self) -> Option<&WorkspaceTab<TabKey, TabView>> {
+        self.workspace_tabs()?.active()
     }
 
     fn sync_diff_highlight(&self, cx: &mut Context<Self>) {
-        let key = self.active_diff().map(|tab| tab.key.clone());
+        let key = self.active_tab().and_then(|tab| match &tab.key {
+            TabKey::Diff(key) => Some(key.clone()),
+            TabKey::Activity(_) => None,
+        });
         self.git_panel.update(cx, |panel, cx| panel.set_active_diff(key, cx));
     }
 
-    fn deactivate_diff(&mut self, key: &WorkspaceKey, cx: &mut Context<Self>) {
-        if let Some(tabs) = self.diff_tabs.get_mut(key) {
+    fn deactivate_tab(&mut self, key: &WorkspaceKey, cx: &mut Context<Self>) {
+        if let Some(tabs) = self.workspace_tabs.get_mut(key) {
             tabs.active = None;
         }
-        self.focused_diff = None;
+        self.focused_tab = None;
         self.sync_diff_highlight(cx);
     }
 
@@ -935,16 +953,17 @@ impl AppView {
                 if let GitPanelEvent::Mutated { branch_switched: true, .. } = event {
                     self.client.refresh_projects();
                 }
-                if let Some(tabs) = self.diff_tabs.get(&WorkspaceKey::of(Some(worktree))) {
+                if let Some(tabs) = self.workspace_tabs.get(&WorkspaceKey::of(Some(worktree))) {
                     for tab in &tabs.tabs {
+                        let (TabKey::Diff(key), TabView::Diff(view)) = (&tab.key, &tab.view) else { continue };
                         if let GitPanelEvent::Mutated { diff_tab: Some(id), error, .. } = event {
                             if tab.id == *id {
-                                tab.view.update(cx, |view, cx| view.mutation_finished(error.clone(), cx));
+                                view.update(cx, |view, cx| view.mutation_finished(error.clone(), cx));
                             }
                         }
-                        if tab.key.source.is_live() {
-                            let rename = self.git_panel.read(cx).diff_rename(worktree, &tab.key);
-                            tab.view.update(cx, |view, cx| view.refresh_live(rename, cx));
+                        if key.source.is_live() {
+                            let rename = self.git_panel.read(cx).diff_rename(worktree, key);
+                            view.update(cx, |view, cx| view.refresh_live(rename, cx));
                         }
                     }
                 }
@@ -961,50 +980,87 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = self.next_diff_id;
+        let id = self.next_tab_id;
         let panel = self.git_panel.clone();
-        let tabs = self.diff_tabs.entry(self.ws.selected.clone()).or_default();
-        let tab = tabs.open(id, key.clone(), || {
-            cx.new(|cx| DiffView::new(id, worktree, repo, key, original, panel, cx))
+        let tabs = self.workspace_tabs.entry(self.ws.selected.clone()).or_default();
+        let tab = tabs.open(id, TabKey::Diff(key.clone()), || {
+            TabView::Diff(cx.new(|cx| DiffView::new(id, worktree, repo, key, original, panel, cx)))
         });
         let opened = tab.id;
         if opened == id {
-            self.next_diff_id += 1;
-            tab.view.update(cx, DiffView::reload);
+            self.next_tab_id += 1;
+            if let TabView::Diff(view) = &tab.view {
+                view.update(cx, DiffView::reload);
+            }
         }
-        self.activate_diff(opened, window, cx);
+        self.activate_tab(opened, window, cx);
     }
 
-    pub(crate) fn activate_diff(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tabs) = self.diff_tabs.get_mut(&self.ws.selected) {
+    pub(crate) fn open_subagent_activity(
+        &mut self,
+        workspace: WorkspaceKey,
+        term: TermId,
+        key: SubagentActivityKey,
+        label: gpui_kit::SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = self.client.owner(term) else {
+            notifications::show_error(tr(settings::language(cx), Tr::ActivityUnavailable).into(), window, cx);
+            return;
+        };
+        let target = ActivityTarget { owner, key };
+        let key = TabKey::Activity(target.clone());
+        // A terminal can be moved to another workspace while its original activity tab stays open.
+        if let Some((workspace, id)) = self.workspace_tabs.iter().find_map(|(workspace, tabs)| {
+            tabs.tabs.iter().find(|tab| tab.key == key).map(|tab| (workspace.clone(), tab.id))
+        }) {
+            self.set_selected(workspace, cx);
+            self.activate_tab(id, window, cx);
+            return;
+        }
+        self.set_selected(workspace.clone(), cx);
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let tabs = self.workspace_tabs.entry(workspace).or_default();
+        tabs.open(id, key, || {
+            TabView::Activity(cx.new(|cx| ActivityView::new(target, label, &self.activity_rt, cx)))
+        });
+        self.activate_tab(id, window, cx);
+    }
+
+    pub(crate) fn activate_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tabs) = self.workspace_tabs.get_mut(&self.ws.selected) {
             tabs.activate(id);
         }
-        self.focus_diff(window, cx);
+        self.focus_tab(window, cx);
         self.sync_diff_highlight(cx);
         cx.notify();
     }
 
-    pub(crate) fn close_diff(&mut self, id: u64, cx: &mut Context<Self>) {
-        if let Some(tabs) = self.diff_tabs.get_mut(&self.ws.selected) {
+    pub(crate) fn close_tab(&mut self, id: u64, cx: &mut Context<Self>) {
+        if let Some(tabs) = self.workspace_tabs.get_mut(&self.ws.selected) {
             tabs.close(id);
         }
         self.sync_diff_highlight(cx);
         cx.notify();
     }
 
-    fn focus_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.active_diff() {
-            let id = tab.id;
-            let view = tab.view.clone();
-            // The tab bar measures terminal children before diff children on the next frame.
-            let snapshot = self.client.snapshot();
-            let index = snapshot.terminals.iter().filter(|term| self.ws.selected.contains(term.info.worktree.as_deref())).count()
-                + self.workspace_diffs().and_then(|tabs| tabs.tabs.iter().position(|tab| tab.id == id)).unwrap_or(0);
-            self.tab_scroll.scroll_to_item(index);
-            self.focused_diff = Some(id);
-            self.focused = None;
-            view.update(cx, |view, cx| view.focus(window, cx));
+    fn focus_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        let id = tab.id;
+        match &tab.view {
+            TabView::Diff(view) => view.update(cx, |view, cx| view.focus(window, cx)),
+            TabView::Activity(view) => view.update(cx, |view, cx| view.focus(window, cx)),
         }
+        // Terminal tabs are rendered before the other workspace tabs.
+        let terminals = self.client.snapshot().terminals.iter()
+            .filter(|term| self.ws.selected.contains(term.info.worktree.as_deref())).count();
+        let index = self.workspace_tabs()
+            .and_then(|tabs| tabs.tabs.iter().position(|tab| tab.id == id)).unwrap_or(0);
+        self.tab_scroll.scroll_to_item(terminals + index);
+        self.focused_tab = Some(id);
+        self.focused = None;
     }
 
     fn workspace_ids(&self, infos: &[TerminalInfo]) -> Vec<TermId> {
@@ -1093,7 +1149,7 @@ impl AppView {
                 self.pending_creates.remove(pos);
                 self.ws.set_active(&key, id);
                 self.set_selected(key.clone(), cx);
-                self.deactivate_diff(&key, cx);
+                self.deactivate_tab(&key, cx);
                 self.focused = None;
             }
         }
@@ -1112,12 +1168,12 @@ impl AppView {
         self.maybe_restore_terminals(infos, cx);
         self.finish_restore_targets(infos);
 
-        if let Some(id) = self.active_diff().map(|tab| tab.id) {
-            if self.focused_diff != Some(id) {
-                self.focus_diff(window, cx);
+        if let Some(id) = self.active_tab().map(|tab| tab.id) {
+            if self.focused_tab != Some(id) {
+                self.focus_tab(window, cx);
             }
         } else {
-            self.focused_diff = None;
+            let had_nonterminal_focus = self.focused_tab.take().is_some();
             let ws_ids = self.workspace_ids(infos);
             let active = self.ws.active_in(&self.ws.selected, &ws_ids);
             if active != self.focused {
@@ -1126,6 +1182,9 @@ impl AppView {
                     view.update(cx, |v, cx| v.focus(window, cx));
                 }
             }
+            if active.is_none() && had_nonterminal_focus {
+                window.blur(cx);
+            }
         }
         self.track_agents(snap);
         self.update_tray(infos, cx);
@@ -1133,7 +1192,7 @@ impl AppView {
     }
 
     fn on_projects_changed(&mut self, created: Vec<(PathBuf, PathBuf)>, cx: &mut Context<Self>) {
-        self.diff_tabs.retain(|key, _| workspace_exists(key, &self.projects));
+        self.workspace_tabs.retain(|key, _| workspace_exists(key, &self.projects));
         if let Some(saved) = self.restore.take() {
             if let Some(session) = &self.saved {
                 let (projects, groups) = session::resolve_collapsed(session, &self.projects, &self.groups);
@@ -1172,11 +1231,12 @@ impl AppView {
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let ids = self.workspace_ids(infos);
-        let diff = self.active_diff();
-        let active = if diff.is_none() { self.ws.active_in(&self.ws.selected, &ids) } else { None };
+        let tab = self.active_tab();
+        let active = if tab.is_none() { self.ws.active_in(&self.ws.selected, &ids) } else { None };
         let tab_bar = self.render_tab_bar(snap, &ids, active, lang, cx);
-        let content = match (diff, active.and_then(|a| self.views.get(&a).map(|view| (a, view)))) {
-            (Some(tab), _) => div().flex_1().min_h_0().w_full().child(tab.view.clone()),
+        let content = match (tab.map(|tab| &tab.view), active.and_then(|a| self.views.get(&a).map(|view| (a, view)))) {
+            (Some(TabView::Diff(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
+            (Some(TabView::Activity(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
             (None, Some((id, view))) => {
                 let banner = infos.iter().find(|t| t.id == id)
                     .and_then(|t| orch_watch::worker_for_terminal(&self.orch, t))
@@ -1567,6 +1627,37 @@ mod tests {
         pid: None,
         version: None,
     };
+
+    #[test]
+    fn activity_selects_one_tab_per_run_and_closes_back_to_a_diff_or_terminal() {
+        use crate::daemon_client::TerminalOwner;
+        use sich_git::compare::CompareSource;
+        use sich_proto::AgentKind;
+
+        let mut tabs = WorkspaceTabs::default();
+        let diff = TabKey::Diff(CompareKey { path: "src/main.rs".into(), source: CompareSource::Working });
+        tabs.open(1, diff, || ());
+        let run = |pid, since| TabKey::Activity(ActivityTarget {
+            owner: TerminalOwner { socket: "test".into(), id: 1, pid, created_ms: 10 },
+            key: SubagentActivityKey {
+                agent: AgentKind::Omp, session_id: Some("session".into()), id: "worker".into(), since_unix_ms: since,
+            },
+        });
+        tabs.open(2, run(7, 30), || ());
+        assert_eq!(tabs.open(3, run(7, 30), || panic!("duplicate activity view")).id, 2);
+        tabs.open(3, run(7, 31), || ());
+        tabs.open(4, run(8, 30), || ());
+        assert_eq!(tabs.tabs.len(), 4);
+        tabs.activate(1);
+        tabs.close(3);
+        assert_eq!(tabs.active, Some(1));
+        tabs.close(4);
+        tabs.activate(2);
+        tabs.close(2);
+        assert_eq!(tabs.active, Some(1));
+        tabs.close(1);
+        assert!(tabs.active().is_none());
+    }
 
     #[test]
     fn periodic_checks_do_not_reannounce_a_dismissed_version() {

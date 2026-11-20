@@ -520,6 +520,7 @@ mod tests {
             proto_version,
             started_ms: 0,
             omp_status: false,
+            subagent_activity: false,
         }
     }
 

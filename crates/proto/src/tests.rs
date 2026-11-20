@@ -76,6 +76,15 @@ fn project() -> ProjectInfo {
     }
 }
 
+fn activity_key() -> SubagentActivityKey {
+    SubagentActivityKey {
+        agent: AgentKind::Omp,
+        session_id: Some("parent".into()),
+        id: "Review.Parser".into(),
+        since_unix_ms: 17,
+    }
+}
+
 #[test]
 fn client_msgs_round_trip() {
     let msgs = vec![
@@ -127,6 +136,7 @@ fn client_msgs_round_trip() {
         ClientMsg::RestoreTerminal {
             request_id: 7, cwd: None, cols: 80, rows: 24, worktree: Some("/test".into()),
         },
+        ClientMsg::GetSubagentActivity { id: 3, created_unix_ms: 10, key: activity_key(), after_seq: 9 },
         ClientMsg::SetProjectGroup { project_id: 1, group: None },
     ];
     for m in msgs {
@@ -161,6 +171,20 @@ fn server_msgs_round_trip() {
         ServerMsg::ScrollbackSaved { files: Vec::new() },
         ServerMsg::TerminalRestored { request_id: 7, terminal: Some(info()) },
         ServerMsg::TerminalRestored { request_id: 8, terminal: None },
+        ServerMsg::SubagentActivity { activity: None },
+        ServerMsg::SubagentActivity { activity: Some(SubagentActivity {
+            running: true,
+            first_seq: 3,
+            entries: [
+                SubagentActivityKind::Started, SubagentActivityKind::ToolStarted,
+                SubagentActivityKind::ToolFinished, SubagentActivityKind::ToolFailed,
+                SubagentActivityKind::Waiting, SubagentActivityKind::Message,
+                SubagentActivityKind::Completed, SubagentActivityKind::Failed,
+                SubagentActivityKind::Aborted, SubagentActivityKind::Ended,
+            ].into_iter().enumerate().map(|(i, kind)| SubagentActivityEntry {
+                seq: 3 + i as u64, unix_ms: 100, kind, title: Some("read".into()), text: Some("result".into()),
+            }).collect(),
+        }) },
     ];
     for m in msgs {
         let bytes = encode(&m).unwrap();

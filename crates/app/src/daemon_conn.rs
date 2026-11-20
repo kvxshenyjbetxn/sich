@@ -434,6 +434,8 @@ impl Conn {
                 }
             }
             ServerMsg::ScrollbackSaved { .. } | ServerMsg::TerminalRestored { .. } => {}
+            // Requested only on a dedicated activity connection.
+            ServerMsg::SubagentActivity { .. } => return Ok(out),
             ServerMsg::Terminals(list) => self.reconcile(list, &mut out),
             ServerMsg::TerminalCreated(info) => {
                 let mut st = self.state.lock();

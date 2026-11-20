@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 use parking_lot::Mutex;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
-use sich_proto::{AgentKind, MAX_OUTPUT_CHUNK, ServerMsg, TermId, TerminalInfo};
+use sich_proto::{AgentKind, MAX_OUTPUT_CHUNK, ServerMsg, SubagentActivity, SubagentActivityKey, TermId, TerminalInfo};
 
 use crate::agent::{self, AgentTracker};
 use crate::codex_rollout;
@@ -154,7 +154,7 @@ impl Terminal {
                 let agent_cleared = {
                     let mut st = sh.state.lock();
                     st.exited = Some(code);
-                    st.agent.on_exit()
+                    st.agent.on_exit(now_ms())
                 };
                 sh.hub.broadcast(ServerMsg::TerminalExited { id: sh.id, code });
                 if agent_cleared {
@@ -188,6 +188,11 @@ impl Terminal {
             worktree: self.shared.worktree.clone(),
             agent: st.agent.status().cloned(),
         }
+    }
+
+    pub fn subagent_activity(&self, created_unix_ms: u64, key: &SubagentActivityKey, after_seq: u64) -> Option<SubagentActivity> {
+        if created_unix_ms != self.shared.created_unix_ms { return None; }
+        self.shared.state.lock().agent.subagent_activity(key, after_seq, now_ms())
     }
 
     pub fn scrollback_tail(&self) -> Option<Vec<u8>> {
@@ -236,7 +241,7 @@ impl Terminal {
 
     /// Drops the agent status (terminal removed).
     pub fn clear_agent(&self) {
-        self.shared.update_agent(AgentTracker::on_exit);
+        self.shared.update_agent(|agent| agent.on_exit(now_ms()));
     }
 
     /// Atomically replays the buffered output (from `resume_from_seq`, clamped to the retained

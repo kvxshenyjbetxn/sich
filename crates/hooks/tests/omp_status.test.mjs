@@ -50,6 +50,7 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
     const emitChild = (name, event = {}) => childExtension.handlers.get(name)(event, child);
     const lifecycle = (source, payload) => source.get("task:subagent:lifecycle")(payload);
     const progress = (source, payload) => source.get("task:subagent:progress")(payload);
+    const native = (source, id, event) => source.get("task:subagent:event")({ id, event });
     let seen = 0;
     const events = async () => {
         let text;
@@ -65,7 +66,7 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
             const rows = await events();
             if (rows.length > seen) {
                 const row = rows[seen++];
-                assert.equal(row.state, state);
+                if (state) assert.equal(row.state, state);
                 return row;
             }
             await delay(15);
@@ -102,6 +103,9 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
     const withScout = await next("done");
     assert.equal(withScout.subagents[0].description, "Scout");
     assert.equal(withScout.subagents[0].state, "working");
+    const since = withScout.subagents[0].since_unix_ms;
+    const scoutEvent = (kind, fields = {}) => ({ id: "Scout", since_unix_ms: since, kind, ...fields });
+    assert.deepEqual(withScout.activity, [scoutEvent("started", { title: "scout" })]);
 
     const toolProgress = { id: "Scout", description: "Check parser", currentTool: "read", currentToolArgs: "private" };
     progress(bus, { ...scout, progress: toolProgress });
@@ -116,31 +120,121 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
     const withWaiting = await next("done");
     assert.equal(withWaiting.subagents[0].state, "waiting");
     assert.equal(withWaiting.subagents[0].detail, "write");
+    assert.deepEqual(withWaiting.activity, [scoutEvent("waiting", { title: "write" })]);
+
+    native(bus, "Scout", {
+        type: "tool_execution_start", toolCallId: "read-1", toolName: "read",
+        args: { credential: "PRIVATE_ARGUMENT" }, intent: "PRIVATE_INTENT",
+    });
+    native(bus, "Scout", {
+        type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "PRIVATE_DELTA" }] },
+    });
+    native(bus, "Scout", {
+        type: "tool_execution_update", partialResult: { content: [{ type: "text", text: "PRIVATE_PARTIAL" }] },
+    });
+    native(bus, "Scout", {
+        type: "message_end", message: { role: "user", content: [{ type: "text", text: "PRIVATE_PROMPT" }] },
+    });
+    native(bus, "Scout", {
+        type: "message_end", message: {
+            role: "assistant",
+            content: [
+                { type: "thinking", thinking: "PRIVATE_REASONING", text: "PRIVATE_REASONING" },
+                { type: "text", text: "Found a parser issue", textSignature: "PRIVATE_SIGNATURE" },
+                { type: "toolCall", name: "read", arguments: { key: "PRIVATE_TOOL_CALL" } },
+                { type: "text", text: "Checking the edge case" },
+            ],
+        },
+    });
+    native(bus, "Scout", {
+        type: "tool_execution_end", toolName: "read", toolCallId: "read-1", isError: false,
+        result: {
+            content: [{ type: "image", data: "PRIVATE_IMAGE" }, { type: "text", text: "x".repeat(2048) + "PRIVATE_OVERFLOW" }],
+            details: { token: "PRIVATE_METADATA" },
+        },
+    });
+    native(bus, "Scout", {
+        type: "tool_execution_end", toolName: "edit", toolCallId: "edit-1", isError: true,
+        result: { content: [{ type: "text", text: "Context did not match" }] },
+    });
+    native(bus, "Scout", {
+        type: "tool_execution_end", toolName: "ask", toolCallId: "ask-1",
+        result: { content: [{ type: "text", text: "PRIVATE_ASK_ANSWER" }] },
+    });
+    native(bus, "Scout", { type: "tool_execution_start", toolName: "wait", toolCallId: "wait-1" });
+    native(bus, "Scout", { type: "agent_pause", awaiting: false, messages: ["PRIVATE_CONTINUATION"] });
+    native(bus, "Scout", { type: "agent_pause", awaiting: true, messages: ["PRIVATE_PAUSE_CONTEXT"] });
+    native(bus, "Scout", { type: "agent_end", messages: ["PRIVATE_END_CONTEXT"] });
+    const nativeActivity = [];
+    let toolResults;
+    while (nativeActivity.length < 8) {
+        toolResults = await next("done");
+        nativeActivity.push(...(toolResults.activity ?? []));
+    }
+    assert.deepEqual(nativeActivity, [
+        scoutEvent("tool_started", { title: "read" }),
+        scoutEvent("message", { text: "Found a parser issue\nChecking the edge case" }),
+        scoutEvent("tool_finished", { title: "read", text: "x".repeat(2048) }),
+        scoutEvent("tool_failed", { title: "edit", text: "Context did not match" }),
+        scoutEvent("tool_finished", { title: "ask" }),
+        scoutEvent("tool_started", { title: "wait" }),
+        scoutEvent("waiting", { title: "wait" }),
+        scoutEvent("waiting"),
+    ]);
+    assert.equal(toolResults.subagents[0].state, "waiting", "native events do not replace the roster's approval state");
+    assert.ok(!JSON.stringify(await events()).includes("PRIVATE_"));
 
     const nested = { id: "Scout.Deep", status: "started", agent: "scout", parentToolCallId: "call-2" };
     lifecycle(childExtension.bus, nested);
     const withNested = await next("done");
     assert.deepEqual(withNested.subagents.map(({ id, state }) => [id, state]), [["Scout", "waiting"], ["Scout.Deep", "working"]]);
+    const nestedSince = withNested.subagents[1].since_unix_ms;
+    native(bus, nested.id, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "PRIVATE_WRONG_PARENT" }] } });
+    native(childExtension.bus, nested.id, {
+        type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Nested result" }] },
+    });
+    assert.deepEqual((await next("done")).activity, [
+        { id: nested.id, since_unix_ms: nestedSince, kind: "message", text: "Nested result" },
+    ]);
     emitChild("tool_approval_resolved", { toolCallId: "permission" });
     assert.equal((await next("done")).subagents[0].detail, "read");
     lifecycle(bus, { ...scout, status: "completed" });
-    assert.deepEqual((await next("done")).subagents.map(({ id }) => id), ["Scout.Deep"]);
+    const completed = await next("done");
+    assert.deepEqual(completed.subagents.map(({ id }) => id), ["Scout.Deep"]);
+    assert.deepEqual(completed.activity, [scoutEvent("completed")]);
     lifecycle(childExtension.bus, { ...nested, status: "aborted" });
-    assert.equal((await next("done")).subagents, undefined);
+    const aborted = await next("done");
+    assert.equal(aborted.subagents, undefined);
+    assert.deepEqual(aborted.activity, [{ id: nested.id, since_unix_ms: nestedSince, kind: "aborted" }]);
     lifecycle(bus, { ...scout, status: "started", parentToolCallId: "follow-up" });
-    assert.equal((await next("done")).subagents[0].id, "Scout");
+    const followup = await next("done");
+    assert.equal(followup.subagents[0].id, "Scout");
+    assert.ok(followup.subagents[0].since_unix_ms > since);
+    assert.equal(followup.activity[0].since_unix_ms, followup.subagents[0].since_unix_ms);
 
     emit("before_agent_start", { reason: "prompt", prompt: "Next" });
     await next("working");
     emit("message_end", { message: { role: "assistant", stopReason: "aborted", content: [] } });
     emit("agent_end");
     assert.equal((await next("idle")).prompt, "Next");
+    emit("before_agent_start", { reason: "prompt", prompt: "Switch soon" });
+    native(bus, "Scout", {
+        type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "PRIVATE_QUEUED_OLD_SESSION" }] },
+    });
     id = "second";
     emit("session_switch");
-    const switched = await next("idle");
+    let switched = await next();
+    if (switched.state === "working") {
+        assert.equal(switched.session_id, "first");
+        switched = await next("idle");
+    }
+    assert.equal(switched.state, "idle");
+    assert.equal(switched.session_id, "second");
     assert.equal(switched.prompt, undefined);
     assert.equal(switched.subagents, undefined);
+    assert.equal(switched.activity, undefined);
     lifecycle(childExtension.bus, nested); // Old cascading event must not enter the new roster.
+    native(childExtension.bus, nested.id, { type: "tool_execution_start", toolName: "PRIVATE_STALE_NESTED" });
     await emitChild("session_shutdown");
 
     const batch = Array.from({ length: 17 }, (_, index) => ({ id: `Worker${index}`, status: "started", agent: "scout" }));
@@ -148,8 +242,38 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
     assert.deepEqual((await next("idle")).subagents.map(({ id }) => id), ["Worker0"]);
     assert.deepEqual((await next("idle")).subagents.map(({ id }) => id), batch.slice(0, 16).map(({ id }) => id));
     lifecycle(bus, { ...batch[0], status: "failed" });
-    assert.deepEqual((await next("idle")).subagents.map(({ id }) => id), batch.slice(1).map(({ id }) => id));
+    const failed = await next("idle");
+    assert.deepEqual(failed.subagents.map(({ id }) => id), batch.slice(1).map(({ id }) => id));
+    assert.equal(failed.activity[0].kind, "failed");
+
+    // The first event occupies the bridge; the remaining roster updates coalesce.
+    // Lifecycle edges for runs that start and finish in that window must survive a burst.
+    const quick = { id: "Quick", status: "started", parentToolCallId: "same-call" };
+    const beforeBurst = seen;
+    emit("before_agent_start", { reason: "prompt", prompt: "Busy bridge" });
+    lifecycle(bus, quick);
+    lifecycle(bus, { ...quick, status: "completed" });
+    lifecycle(bus, quick);
+    for (let index = 0; index < 200; index++) {
+        native(bus, "Quick", { type: "tool_execution_start", toolName: "read", toolCallId: String(index) });
+    }
+    lifecycle(bus, { ...quick, status: "failed" });
     await emit("session_shutdown");
-    assert.equal((await events()).at(-1).state, "exited", "shutdown waits for delivery");
+    const rows = await events();
+    const burst = rows.slice(beforeBurst, -1).filter((row) => row.activity);
+    assert.ok(burst.every(({ state, subagents, activity }) => state === "working" &&
+        subagents.every(({ id }) => id !== "Quick") && activity.length <= 32));
+    const activity = burst.flatMap((row) => row.activity);
+    assert.equal(activity.length, 128);
+    const edges = activity.filter(({ kind }) => kind !== "tool_started");
+    assert.deepEqual(edges.map(({ id, kind }) => [id, kind]), [
+        ["Quick", "started"], ["Quick", "completed"], ["Quick", "started"], ["Quick", "failed"],
+    ]);
+    assert.equal(edges[0].since_unix_ms, edges[1].since_unix_ms);
+    assert.equal(edges[2].since_unix_ms, edges[3].since_unix_ms);
+    assert.ok(edges[2].since_unix_ms > edges[0].since_unix_ms);
+    assert.ok(!JSON.stringify(rows).includes("PRIVATE_"));
+    seen = rows.length - 1;
+    assert.equal(rows.at(-1).state, "exited", "shutdown waits for delivery");
     assert.equal((await next("exited")).session_id, "second");
 });

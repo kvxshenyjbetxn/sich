@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
-use sich_proto::{AgentKind, AgentStatus, ClientMsg, OMP_CLIENT_SUFFIX, PROTO_VERSION, ServerMsg, decode, encode, frame_codec};
+use sich_proto::{
+    AgentKind, AgentStatus, ClientMsg, OMP_CLIENT_SUFFIX, PROTO_VERSION, SUBAGENT_ACTIVITY_CLIENT, ServerMsg,
+    decode, encode, frame_codec,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
@@ -65,6 +68,23 @@ where
             anyhow::bail!(message);
         }
     };
+
+    if client_name == SUBAGENT_ACTIVITY_CLIENT {
+        sink.send(encode(&ServerMsg::Welcome { proto_version: PROTO_VERSION, daemon_pid: std::process::id() })?).await?;
+        loop {
+            let Some(frame) = (tokio::select! {
+                _ = mgr.shutdown.cancelled() => return Ok(()),
+                frame = source.next() => frame,
+            }) else { return Ok(()) };
+            let msg = match decode(&frame.context("read activity request")?).context("decode activity request")? {
+                ClientMsg::GetSubagentActivity { id, created_unix_ms, key, after_seq } => ServerMsg::SubagentActivity {
+                    activity: mgr.get(id).and_then(|t| t.subagent_activity(created_unix_ms, &key, after_seq)),
+                },
+                _ => ServerMsg::Error { message: "expected an activity request".into() },
+            };
+            sink.send(encode(&msg)?).await?;
+        }
+    }
 
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(WRITE_QUEUE);
     let cancel = CancellationToken::new();
@@ -214,6 +234,9 @@ async fn handle_msg(msg: ClientMsg, mgr: &Arc<Manager>, conn: &ConnHandle) {
             mgr.agent_hook(term_id, agent, &payload);
         }
         ClientMsg::MarkSeen { id } => mgr.mark_seen(id),
+        ClientMsg::GetSubagentActivity { .. } => {
+            conn.send(ServerMsg::Error { message: "activity requests require a dedicated connection".into() });
+        }
         ClientMsg::GetDaemonInfo => {
             conn.send(ServerMsg::DaemonInfo {
                 build_id: mgr.build_id.clone(),

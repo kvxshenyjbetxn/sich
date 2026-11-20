@@ -54,6 +54,8 @@ pub enum ClientMsg {
     SaveScrollback,
     /// Create a session restore shell with an acknowledgment specific to the requester.
     RestoreTerminal { request_id: u64, cwd: Option<PathBuf>, cols: u16, rows: u16, worktree: Option<PathBuf> },
+    /// Optional v7 capability; send only to generations advertising subagent activity.
+    GetSubagentActivity { id: TermId, created_unix_ms: u64, key: SubagentActivityKey, after_seq: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +83,8 @@ pub enum ServerMsg {
     DaemonInfo { build_id: String, proto_version: u32, started_unix_ms: u64 },
     ScrollbackSaved { files: Vec<(TermId, String)> },
     TerminalRestored { request_id: u64, terminal: Option<TerminalInfo> },
+    /// A private reply to `GetSubagentActivity`; never broadcast to existing clients.
+    SubagentActivity { activity: Option<SubagentActivity> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +143,48 @@ pub struct SubagentStatus {
     pub detail: Option<String>,
     /// When the subagent started.
     pub since_unix_ms: u64,
+}
+
+/// An individual run within a terminal, not just an agent name which may be reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentActivityKey {
+    pub agent: AgentKind,
+    pub session_id: Option<String>,
+    pub id: String,
+    pub since_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentActivity {
+    pub running: bool,
+    /// First sequence still retained, even when this delta has no entries.
+    pub first_seq: u64,
+    pub entries: Vec<SubagentActivityEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentActivityEntry {
+    pub seq: u64,
+    pub unix_ms: u64,
+    pub kind: SubagentActivityKind,
+    pub title: Option<String>,
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentActivityKind {
+    Started,
+    ToolStarted,
+    ToolFinished,
+    ToolFailed,
+    Waiting,
+    Message,
+    Completed,
+    Failed,
+    Aborted,
+    /// Removed from the roster without an explicit outcome.
+    Ended,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

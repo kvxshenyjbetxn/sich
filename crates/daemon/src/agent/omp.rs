@@ -1,9 +1,9 @@
 //! Snapshots emitted by Sich's omp extension. No transcripts or agent config are read.
 
 use serde::Deserialize;
-use sich_proto::{AgentKind, AgentState, AgentStatus, SubagentStatus};
+use sich_proto::{AgentKind, AgentState, AgentStatus, SubagentActivityKind, SubagentStatus};
 
-use super::{MAX_SUBAGENTS, normalize_text};
+use super::{MAX_SUBAGENTS, activity, normalize_text};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +28,21 @@ pub(super) struct Snapshot<'a> {
     finished_unix_ms: Option<u64>,
     #[serde(default)]
     subagents: Vec<Subagent>,
+    #[serde(default)]
+    activity: Vec<Activity>,
+}
+
+#[derive(Deserialize)]
+struct Activity {
+    id: String,
+    since_unix_ms: u64,
+    kind: SubagentActivityKind,
+    title: Option<String>,
+    text: Option<String>,
+}
+
+fn valid_id(id: &str) -> bool {
+    !id.trim().is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
 }
 
 #[derive(Deserialize)]
@@ -47,7 +62,7 @@ impl Subagent {
             State::Waiting => AgentState::Waiting,
             _ => return None,
         };
-        if self.id.trim().is_empty() || self.id.len() > 256 || self.id.chars().any(char::is_control) {
+        if !valid_id(&self.id) {
             return None;
         }
         Some(SubagentStatus {
@@ -56,7 +71,7 @@ impl Subagent {
             agent_type: self.agent_type.as_deref().and_then(|text| normalize_text(text, false)),
             description: self.description.as_deref().and_then(|text| normalize_text(text, false)),
             detail: super::non_empty(&self.detail),
-            since_unix_ms: self.since_unix_ms.unwrap_or(now).min(now),
+            since_unix_ms: self.since_unix_ms.unwrap_or(now),
         })
     }
 }
@@ -73,7 +88,16 @@ impl<'a> Snapshot<'a> {
         status.kind == AgentKind::Omp && status.session_id.as_deref() == Some(self.session_id)
     }
 
-    pub(super) fn status(self, prev: Option<&AgentStatus>, now: u64) -> Option<AgentStatus> {
+    pub(super) fn record_activity(&mut self, book: &mut activity::Book, now: u64) {
+        for row in std::mem::take(&mut self.activity).into_iter().take(128) {
+            if valid_id(&row.id) {
+                let note = activity::Note::new(row.kind, row.title.as_deref(), row.text.as_deref());
+                book.omp(self.session_id, row.id, row.since_unix_ms, note, now);
+            }
+        }
+    }
+
+    pub(super) fn status(&mut self, prev: Option<&AgentStatus>, now: u64) -> Option<AgentStatus> {
         let state = match self.state {
             State::Idle => AgentState::Idle,
             State::Working => AgentState::Working,
@@ -90,7 +114,7 @@ impl<'a> Snapshot<'a> {
         });
         let since_unix_ms = same_state.map_or_else(|| finish_time.unwrap_or(now), |s| s.since_unix_ms);
         let mut subagents: Vec<SubagentStatus> = Vec::with_capacity(self.subagents.len().min(MAX_SUBAGENTS));
-        for subagent in self.subagents.into_iter().filter_map(|s| s.status(now)) {
+        for subagent in std::mem::take(&mut self.subagents).into_iter().filter_map(|s| s.status(now)) {
             if !subagents.iter().any(|s| s.id == subagent.id) {
                 subagents.push(subagent);
                 if subagents.len() == MAX_SUBAGENTS {

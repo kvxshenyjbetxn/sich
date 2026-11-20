@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt as _, StreamExt as _};
 use sich_proto::{
-    AgentKind, AgentState, AgentStatus, ClientMsg, PROTO_VERSION, ServerMsg, TermId, decode,
-    encode, frame_codec,
+    AgentKind, AgentState, AgentStatus, ClientMsg, PROTO_VERSION, ServerMsg, SubagentActivity,
+    SubagentActivityKey, SubagentActivityKind as ActivityKind, TermId, decode, encode, frame_codec,
 };
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -484,5 +484,84 @@ async fn omp_roster_updates_do_not_reopen_a_read_parent_turn() {
     // A whole new turn can settle before its intermediate snapshot gets through the bridge.
     send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"done","message":"Parent done","finished_unix_ms":21}"#)).await;
     assert!(next_status(&mut viewer, id).await.unwrap().unread);
+    stop(viewer, daemon).await;
+}
+
+async fn activity(
+    conn: &mut Conn, id: TermId, created_unix_ms: u64, key: &SubagentActivityKey, after_seq: u64,
+) -> Option<SubagentActivity> {
+    send(conn, ClientMsg::GetSubagentActivity { id, created_unix_ms, key: key.clone(), after_seq }).await;
+    match recv(conn).await {
+        ServerMsg::SubagentActivity { activity } => activity,
+        other => panic!("unexpected activity reply: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_activity_is_private_resumable_and_keeps_the_final_result() {
+    let daemon = start_daemon("activity");
+    let mut viewer = named_client(&daemon.name, &format!("viewer{}", sich_proto::OMP_CLIENT_SUFFIX)).await;
+    let (shell, args) = idle_shell();
+    let id = create(&mut viewer, shell, &args).await;
+    send(&mut viewer, ClientMsg::ListTerminals).await;
+    let ServerMsg::Terminals(terms) = recv(&mut viewer).await else { panic!("missing terminal inventory") };
+    let created = terms[0].created_unix_ms;
+    let mut stream = named_client(&daemon.name, sich_proto::SUBAGENT_ACTIVITY_CLIENT).await;
+
+    for kind in [AgentKind::Claude, AgentKind::Codex] {
+        let call = |payload: String| ClientMsg::AgentHook { term_id: id, agent: kind, payload };
+        let child = r#","agent_id":"child","agent_type":"reviewer""#;
+        send(&mut viewer, call(event("SessionStart", ""))).await;
+        next_status(&mut viewer, id).await;
+        send(&mut viewer, call(event("SubagentStart", child))).await;
+        let started = next_status(&mut viewer, id).await.unwrap();
+        let key = SubagentActivityKey {
+            agent: kind, session_id: started.session_id, id: "child".into(), since_unix_ms: started.subagents[0].since_unix_ms,
+        };
+        send(&mut viewer, call(event("PreToolUse", &format!(r#"{child},"tool_name":"Bash","tool_input":{{"command":"private argument"}}"#)))).await;
+        next_status(&mut viewer, id).await;
+        let initial = activity(&mut stream, id, created, &key, 0).await.unwrap();
+        assert!(initial.running);
+        assert_eq!(initial.entries.iter().map(|e| e.kind).collect::<Vec<_>>(), [ActivityKind::Started, ActivityKind::ToolStarted]);
+        assert_eq!(initial.entries[1].title.as_deref(), Some("Bash"));
+        assert_eq!(initial.entries[1].text, None);
+        assert!(activity(&mut stream, id, created + 1, &key, 0).await.is_none());
+
+        send(&mut viewer, call(event("PostToolUse", &format!(r#"{child},"tool_name":"Bash","tool_response":{{"stdout":"line 1\nline 2","private":"do not copy"}}"#)))).await;
+        send(&mut viewer, ClientMsg::GetDaemonInfo).await;
+        while !matches!(recv(&mut viewer).await, ServerMsg::DaemonInfo { .. }) {}
+        let output = activity(&mut stream, id, created, &key, initial.entries[1].seq).await.unwrap();
+        assert_eq!(output.entries.len(), 1);
+        assert_eq!(output.entries[0].kind, ActivityKind::ToolFinished);
+        assert_eq!(output.entries[0].text.as_deref(), Some("line 1\nline 2"));
+
+        send(&mut viewer, call(event("SubagentStop", &format!(r#"{child},"last_assistant_message":"Reviewed.""#)))).await;
+        assert!(next_status(&mut viewer, id).await.unwrap().subagents.is_empty());
+        let finished = activity(&mut stream, id, created, &key, output.entries[0].seq).await.unwrap();
+        assert!(!finished.running);
+        assert_eq!(finished.entries.len(), 1);
+        assert_eq!(finished.entries[0].kind, ActivityKind::Completed);
+        assert_eq!(finished.entries[0].text.as_deref(), Some("Reviewed."));
+    }
+
+    let omp = |payload: &str| ClientMsg::AgentHook { term_id: id, agent: AgentKind::Omp, payload: payload.into() };
+    send(&mut viewer, omp(r#"{"session_id":"omp-01","state":"working","activity":[
+        {"id":"Scout.Deep","since_unix_ms":10,"kind":"started"},
+        {"id":"Scout.Deep","since_unix_ms":10,"kind":"tool_failed","title":"read","text":"Not found"},
+        {"id":"Scout.Deep","since_unix_ms":10,"kind":"message","text":"Only visible text"},
+        {"id":"Scout.Deep","since_unix_ms":10,"kind":"aborted"}]}"#)).await;
+    let status = next_status(&mut viewer, id).await.unwrap();
+    assert!(status.subagents.is_empty(), "coalesced short run need not reach the sidebar");
+    let key = SubagentActivityKey { agent: AgentKind::Omp, session_id: status.session_id, id: "Scout.Deep".into(), since_unix_ms: 10 };
+    drop(stream);
+    let mut stream = named_client(&daemon.name, sich_proto::SUBAGENT_ACTIVITY_CLIENT).await;
+    let finished = activity(&mut stream, id, created, &key, 0).await.unwrap();
+    assert!(!finished.running);
+    assert_eq!(finished.entries.iter().map(|e| e.kind).collect::<Vec<_>>(), [
+        ActivityKind::Started, ActivityKind::ToolFailed, ActivityKind::Message, ActivityKind::Aborted,
+    ]);
+    assert_eq!(finished.entries[1].text.as_deref(), Some("Not found"));
+    send(&mut stream, ClientMsg::ListTerminals).await;
+    assert!(matches!(recv(&mut stream).await, ServerMsg::Error { .. }), "viewer cannot act on the daemon");
     stop(viewer, daemon).await;
 }
