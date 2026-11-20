@@ -497,7 +497,9 @@ impl AppView {
         }
         if self.update_flow.is_some() {
             window.close_dialog(cx);
-            update_dialog::open(cx.entity(), window, cx);
+            // Deferred: `open` updates AppView, which is already leased here (re-entrancy panic).
+            let app = cx.entity();
+            window.defer(cx, move |window, cx| update_dialog::open(app, window, cx));
             return;
         }
         if update_status::get(cx) == CheckStatus::Checking {
@@ -511,7 +513,8 @@ impl AppView {
                     // Dialogs can't coexist: close settings, then show the update dialog.
                     window.close_dialog(cx);
                     this.update_available = Some(release);
-                    update_dialog::open(cx.entity(), window, cx);
+                    let app = cx.entity();
+                    window.defer(cx, move |window, cx| update_dialog::open(app, window, cx));
                 }
             });
         })
