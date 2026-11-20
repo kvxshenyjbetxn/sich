@@ -10,7 +10,7 @@ use anyhow::{Context as _, ensure};
 use tokio::process::Command;
 
 const NAME: &str = "sich-omp-status.js";
-const MARKER: &[u8] = b"// @sich-managed-omp-hook\n";
+const MARKER: &[u8] = b"// @sich-managed-omp-hook";
 const SOURCE: &[u8] = include_bytes!("omp_status.js");
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -78,7 +78,9 @@ fn read_owned(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {
     }
     let mut bytes = Vec::new();
     File::open(path)?.take(SOURCE.len() as u64 + 1).read_to_end(&mut bytes)?;
-    ensure!(bytes.starts_with(MARKER), "not a Sich extension file: {}", path.display());
+    let owned = bytes.strip_prefix(MARKER)
+        .is_some_and(|rest| rest.starts_with(b"\n") || rest.starts_with(b"\r\n"));
+    ensure!(owned, "not a Sich extension file: {}", path.display());
     Ok(Some(bytes))
 }
 
@@ -193,6 +195,22 @@ mod tests {
         assert_eq!(configure(false, &receipt).unwrap(), Status::NotInstalled);
         assert!(!installed.exists());
         assert_eq!(fs::read_to_string(other).unwrap(), "user extension");
+    }
+
+    #[test]
+    fn upgrades_and_removes_managed_extensions_with_windows_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = dir.path().join("receipt.json");
+        let path = dir.path().join("extensions").join(NAME);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = b"// @sich-managed-omp-hook\r\n// previous version\r\n";
+        fs::write(&path, old).unwrap();
+        install(dir.path(), &receipt).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), SOURCE);
+        fs::write(&path, old).unwrap();
+        assert_eq!(current(&receipt).unwrap(), Status::Installed);
+        uninstall(&receipt).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]
