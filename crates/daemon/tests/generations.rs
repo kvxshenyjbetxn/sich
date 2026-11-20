@@ -118,7 +118,8 @@ fn generations_coexist_and_the_old_one_retires_after_its_last_terminal() {
         assert_eq!(terminal_count(&mut new_conn).await, 1);
 
         // A retiring client never stops a daemon that still has terminals.
-        let mut retire = client(&old_socket, generation::RETIRE_CLIENT).await;
+        let omp_retire = format!("{}{}", generation::RETIRE_CLIENT, sich_proto::OMP_CLIENT_SUFFIX);
+        let mut retire = client(&old_socket, &omp_retire).await;
         send(&mut retire, ClientMsg::Shutdown).await;
         sleep(Duration::from_millis(300)).await;
         assert_eq!(terminal_count(&mut old_conn).await, 1);

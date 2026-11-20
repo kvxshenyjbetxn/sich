@@ -16,6 +16,7 @@ use crate::update_status::{self, CheckStatus};
 use crate::updater;
 use crate::codex_hooks;
 use crate::i18n::{Language, Tr, tr};
+use crate::omp_hooks;
 use crate::orch_skill;
 use crate::settings;
 use crate::theme::{self, ThemeKind};
@@ -155,6 +156,8 @@ fn agents_section(lang: Language, cx: &App) -> impl IntoElement {
     } else {
         codex_hooks::status_text(lang, &codex.status)
     };
+    let omp_enabled = settings::get(cx).omp_hooks;
+    let (omp_status, omp_error, omp_busy) = omp_hooks::status(lang, cx);
     v_flex()
         .gap_1p5()
         .child(
@@ -188,6 +191,22 @@ fn agents_section(lang: Language, cx: &App) -> impl IntoElement {
                 .text_xs()
                 .text_color(if codex_error { theme.danger } else { theme.muted_foreground })
                 .child(codex_status),
+        )
+        .child(
+            Switch::new("omp-hooks")
+                .checked(omp_enabled)
+                .disabled(omp_busy)
+                .label(tr(lang, Tr::TrackOmpHooks))
+                .on_click(|checked, window, cx| {
+                    settings::set_omp_hooks(*checked, cx);
+                    omp_hooks::apply(Some(*checked), Some(window), cx);
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(if omp_error { theme.danger } else { theme.muted_foreground })
+                .child(omp_status),
         )
 }
 

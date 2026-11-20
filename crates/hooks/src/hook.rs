@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
-use sich_proto::{AgentKind, ClientMsg, PROTO_VERSION, encode, frame_codec};
+use sich_proto::{AgentKind, ClientMsg, PROTO_VERSION, ServerMsg, decode, encode, frame_codec};
 use tokio_util::codec::Framed;
 
 /// The hook's stdin is read up to this many bytes.
@@ -89,8 +89,26 @@ pub fn send_to_daemon(socket: &str, msgs: Vec<ClientMsg>) -> anyhow::Result<()> 
             .context("connect timed out")?
             .context("connect")?;
         let mut framed = Framed::new(stream, frame_codec());
+        let omp = matches!(msgs.last(), Some(ClientMsg::AgentHook { agent: AgentKind::Omp, .. }));
         for m in &msgs {
             framed.send(encode(m)?).await.context("send")?;
+        }
+        if omp {
+            // The extension sends snapshots serially. Wait for a reply to a following
+            // request so the next process cannot overtake this hook on a new connection.
+            framed.send(encode(&ClientMsg::GetDaemonInfo)?).await.context("send hook barrier")?;
+            return tokio::time::timeout(WELCOME_WAIT, async {
+                while let Some(frame) = framed.next().await {
+                    match decode::<ServerMsg>(&frame.context("read hook reply")?)? {
+                        ServerMsg::DaemonInfo { .. } => return Ok(()),
+                        ServerMsg::Error { message } => anyhow::bail!("{message}"),
+                        _ => {}
+                    }
+                }
+                anyhow::bail!("daemon closed before processing the hook");
+            })
+            .await
+            .context("hook reply timed out")?;
         }
         // Give the daemon a moment to take the frames before the pipe closes.
         let _ = tokio::time::timeout(WELCOME_WAIT, framed.next()).await;
@@ -139,6 +157,7 @@ pub fn hook_main(agent_name: &str) -> ! {
         "claude" => AgentKind::Claude,
         "gemini" => AgentKind::Gemini,
         "codex" => AgentKind::Codex,
+        "omp" => AgentKind::Omp,
         _ => AgentKind::Other,
     };
     let env = HookEnv::from_process();

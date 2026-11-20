@@ -89,6 +89,8 @@ pub enum AgentKind {
     Gemini,
     Codex,
     Other,
+    /// Sent only to clients that advertise support in their Hello name.
+    Omp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

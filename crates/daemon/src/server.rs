@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
-use sich_proto::{ClientMsg, PROTO_VERSION, ServerMsg, decode, encode, frame_codec};
+use sich_proto::{AgentKind, AgentStatus, ClientMsg, OMP_CLIENT_SUFFIX, PROTO_VERSION, ServerMsg, decode, encode, frame_codec};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
@@ -76,13 +76,20 @@ where
     conn.send(ServerMsg::Welcome { proto_version: PROTO_VERSION, daemon_pid: std::process::id() });
     mgr.hub.register(conn.clone());
 
+    let (client_name, omp_status) = match client_name.strip_suffix(OMP_CLIENT_SUFFIX) {
+        Some(name) => (name, true),
+        None => (client_name.as_str(), false),
+    };
     let writer_cancel = cancel.clone();
     let writer = tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = writer_cancel.cancelled() => break,
                 msg = rx.recv() => {
-                    let Some(msg) = msg else { break };
+                    let Some(mut msg) = msg else { break };
+                    if !omp_status {
+                        downgrade_omp(&mut msg);
+                    }
                     let Ok(frame) = encode(&msg) else { continue };
                     if sink.send(frame).await.is_err() {
                         break;
@@ -98,6 +105,26 @@ where
     cancel.cancel();
     let _ = writer.await;
     result
+}
+
+/// Keep protocol v7 readable for clients compiled before the new enum variant.
+fn downgrade_omp(msg: &mut ServerMsg) {
+    fn downgrade(status: Option<&mut AgentStatus>) {
+        if let Some(status) = status.filter(|s| s.kind == AgentKind::Omp) {
+            status.kind = AgentKind::Other;
+        }
+    }
+    match msg {
+        ServerMsg::AgentStatusChanged { status, .. } => downgrade(status.as_mut()),
+        ServerMsg::TerminalCreated(info) => downgrade(info.agent.as_mut()),
+        ServerMsg::TerminalRestored { terminal: Some(info), .. } => downgrade(info.agent.as_mut()),
+        ServerMsg::Terminals(list) => {
+            for info in list {
+                downgrade(info.agent.as_mut());
+            }
+        }
+        _ => {}
+    }
 }
 
 async fn read_loop<R>(

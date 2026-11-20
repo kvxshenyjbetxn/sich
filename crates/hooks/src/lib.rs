@@ -6,6 +6,7 @@ mod codex_app_server;
 pub mod codex_install;
 pub mod codex_trust;
 mod hook;
+pub mod omp_install;
 pub mod statusline;
 pub mod usage;
 

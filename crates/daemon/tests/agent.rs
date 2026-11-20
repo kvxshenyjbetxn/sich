@@ -66,11 +66,15 @@ async fn recv(c: &mut Conn) -> ServerMsg {
     decode(&frame).unwrap()
 }
 
-async fn client(name: &str) -> Conn {
+async fn named_client(name: &str, client_name: &str) -> Conn {
     let mut c = connect(name).await;
-    send(&mut c, ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: "test".into() }).await;
+    send(&mut c, ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: client_name.into() }).await;
     assert!(matches!(recv(&mut c).await, ServerMsg::Welcome { .. }));
     c
+}
+
+async fn client(name: &str) -> Conn {
+    named_client(name, "test").await
 }
 
 async fn stop(mut c: Conn, d: Daemon) {
@@ -387,4 +391,57 @@ async fn codex_subagent_label_comes_from_rollout_first_line() {
 
     let _ = std::fs::remove_dir_all(&dir);
     stop(a, d).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn omp_snapshots_follow_turns_and_old_clients_keep_decoding() {
+    let daemon = start_daemon("omp");
+    let mut viewer = named_client(&daemon.name, &format!("test{}", sich_proto::OMP_CLIENT_SUFFIX)).await;
+    let mut old = client(&daemon.name).await;
+    let (shell, args) = idle_shell();
+    let id = create(&mut viewer, shell, &args).await;
+    let hook = |payload: &str| ClientMsg::AgentHook { term_id: id, agent: AgentKind::Omp, payload: payload.into() };
+
+    send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"idle","model":"model-a","title":"Session A"}"#)).await;
+    let idle = next_status(&mut viewer, id).await.unwrap();
+    assert_eq!((idle.kind, idle.state, idle.unread), (AgentKind::Omp, AgentState::Idle, false));
+    assert_eq!(idle.model.as_deref(), Some("model-a"));
+    assert_eq!(idle.title.as_deref(), Some("Session A"));
+    assert_eq!(next_status(&mut old, id).await.unwrap().kind, AgentKind::Other);
+    send(&mut old, ClientMsg::ListTerminals).await;
+    loop {
+        if let ServerMsg::Terminals(list) = recv(&mut old).await {
+            let status = list.iter().find(|t| t.id == id).unwrap().agent.as_ref().unwrap();
+            assert_eq!(status.kind, AgentKind::Other);
+            break;
+        }
+    }
+
+    send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"working","prompt":"build\n this"}"#)).await;
+    let work = next_status(&mut viewer, id).await.unwrap();
+    assert_eq!(work.state, AgentState::Working);
+    assert_eq!(work.prompt.as_deref(), Some("build this"));
+    send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"waiting","detail":"bash"}"#)).await;
+    let wait = next_status(&mut viewer, id).await.unwrap();
+    assert_eq!(wait.state, AgentState::Waiting);
+    assert_eq!(wait.detail.as_deref(), Some("bash"));
+    send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"done","message":"Done."}"#)).await;
+    let done = next_status(&mut viewer, id).await.unwrap();
+    assert_eq!((done.state, done.unread), (AgentState::Done, true));
+    assert_eq!(done.message.as_deref(), Some("Done."));
+    send(&mut viewer, ClientMsg::MarkSeen { id }).await;
+    assert!(!next_status(&mut viewer, id).await.unwrap().unread);
+
+    send(&mut viewer, hook(r#"{"session_id":"omp-02","state":"idle"}"#)).await;
+    let switched = next_status(&mut viewer, id).await.unwrap();
+    assert_eq!(switched.session_id.as_deref(), Some("omp-02"));
+    assert!(switched.title.is_none() && switched.message.is_none());
+    send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"exited"}"#)).await;
+    send(&mut viewer, hook(r#"{"session_id":"omp-02","state":"unknown"}"#)).await;
+    send(&mut viewer, hook(r#"{"session_id":"omp-02","state":"failed","message":"Unavailable"}"#)).await;
+    let failed = next_status(&mut viewer, id).await.unwrap();
+    assert_eq!((failed.state, failed.unread), (AgentState::Failed, true));
+    send(&mut viewer, hook(r#"{"session_id":"omp-02","state":"exited"}"#)).await;
+    assert!(next_status(&mut viewer, id).await.is_none());
+    stop(viewer, daemon).await;
 }

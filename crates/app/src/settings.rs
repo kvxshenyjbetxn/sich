@@ -28,6 +28,8 @@ pub struct AppSettings {
     pub agent_hooks: bool,
     /// Track Codex status through hooks in `~/.codex/hooks.json`.
     pub codex_hooks: bool,
+    /// Track omp status through its user extension directory.
+    pub omp_hooks: bool,
     pub usage_limits: bool,
     pub claude_statusline_wrap: bool,
     /// Install the Claude Code skill that teaches a coordinator agent `sich orch`.
@@ -55,6 +57,7 @@ impl Default for AppSettings {
             show_external_worktrees: false,
             agent_hooks: true,
             codex_hooks: true,
+            omp_hooks: true,
             usage_limits: true,
             claude_statusline_wrap: false,
             orchestration_skill: true,
@@ -171,6 +174,14 @@ pub fn set_codex_hooks(enabled: bool, cx: &mut App) {
     }
     s.codex_hooks = enabled;
     store(s, cx);
+}
+
+pub fn set_omp_hooks(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.omp_hooks != enabled {
+        s.omp_hooks = enabled;
+        store(s, cx);
+    }
 }
 
 pub fn set_usage_limits(enabled: bool, cx: &mut App) {
@@ -347,6 +358,15 @@ mod tests {
         let s = AppSettings { codex_hooks: false, ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(!back.codex_hooks);
+    }
+
+    #[test]
+    fn omp_hooks_defaults_to_true_and_round_trips() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(old.omp_hooks);
+        let disabled = AppSettings { omp_hooks: false, ..old };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!back.omp_hooks);
     }
 
     #[test]

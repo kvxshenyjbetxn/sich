@@ -1,7 +1,7 @@
 //! AI agent status state machine. Pure logic: no IPC, no clocks (the caller passes `now`).
 //!
 //! Two sources feed it:
-//! - Claude Code and Codex hook events, which are authoritative;
+//! - Claude Code, Codex and omp hook events, which are authoritative;
 //! - terminal title glyphs, used only while the terminal has not received any hook event
 //!   during the current agent session.
 
@@ -10,6 +10,8 @@ use std::collections::{HashMap, VecDeque};
 use sich_proto::{AgentKind, AgentState, AgentStatus, SubagentStatus};
 
 use crate::codex_rollout::{IdentityPlan, IdentityRead, IdentityResult};
+
+mod omp;
 
 /// `AgentStatus::detail` is cut to this many characters.
 pub const MAX_DETAIL_CHARS: usize = 120;
@@ -876,6 +878,23 @@ impl AgentTracker {
     #[cfg(test)]
     pub fn on_codex_hook(&mut self, h: &CodexHook, now: u64) -> bool {
         self.on_codex_hook_with(h, now, None)
+    }
+
+    pub(crate) fn on_omp_hook(&mut self, payload: &str, now: u64) -> bool {
+        let Some(snapshot) = omp::Snapshot::parse(payload) else {
+            return false;
+        };
+        let owns_current = self.status.as_ref().is_some_and(|status| snapshot.owns(status));
+        let status = snapshot.status(self.status.as_ref(), now);
+        if status.is_none() && !owns_current {
+            return false;
+        }
+        self.hooks_seen = status.is_some();
+        let changed = self.status != status;
+        self.status = status;
+        self.pending_spawns.clear();
+        self.identities.clear();
+        changed
     }
 
     /// The rollout read (if any) a Codex child hook needs before it is applied. Cheap and pure:

@@ -147,12 +147,17 @@ impl TerminalKeys {
 struct Endpoint {
     socket: String,
     incompatible: bool,
+    omp_status: bool,
 }
 
 fn legacy_endpoints(base: &str, primary: &str, entries: &[generation::Entry]) -> Vec<Endpoint> {
     entries.iter()
         .filter(|entry| entry.base() == Some(base) && entry.socket != primary)
-        .map(|entry| Endpoint { socket: entry.socket.clone(), incompatible: entry.proto_version != PROTO_VERSION })
+        .map(|entry| Endpoint {
+            socket: entry.socket.clone(),
+            incompatible: entry.proto_version != PROTO_VERSION,
+            omp_status: entry.omp_status,
+        })
         .collect()
 }
 
@@ -163,7 +168,11 @@ async fn probe_legacy(base: &str) -> Option<Endpoint> {
         stream.send(encode(&ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: "sich-app-discover".into() }).ok()?).await.ok()?;
         let msg: ServerMsg = decode(&stream.next().await?.ok()?).ok()?;
         if matches!(msg, ServerMsg::Welcome { .. }) || daemon_conn::classify_incompatible(&msg, false).is_some() {
-            Some(Endpoint { socket: base.into(), incompatible: daemon_conn::classify_incompatible(&msg, false).is_some() })
+            Some(Endpoint {
+                socket: base.into(),
+                incompatible: daemon_conn::classify_incompatible(&msg, false).is_some(),
+                omp_status: false,
+            })
         } else {
             None
         }
@@ -196,8 +205,11 @@ impl Peer {
             created_worktrees: Vec::new(),
             last_error: None,
         }));
+        let name = if legacy { generation::RETIRE_CLIENT } else { "sich-app" };
+        let suffix = if endpoint.omp_status { sich_proto::OMP_CLIENT_SUFFIX } else { "" };
         let conn = daemon_conn::Conn {
             socket: endpoint.socket.clone(),
+            client_name: format!("{name}{suffix}"),
             rt: rt.clone(),
             state: state.clone(),
             cmd_tx: cmd_tx.clone(),
@@ -250,7 +262,7 @@ impl DaemonPool {
 
     fn start_on(rt: &Handle, base: String, build: &str, wake: Wake, spawn_primary: bool) -> Self {
         let socket = generation::socket(&base, build);
-        let primary = Peer::start(rt, Endpoint { socket, incompatible: false }, wake.clone(), false);
+        let primary = Peer::start(rt, Endpoint { socket, incompatible: false, omp_status: true }, wake.clone(), false);
         let pool = Arc::new(Pool {
             base, primary, legacy: Mutex::new(Vec::new()), keys: Mutex::default(),
             discovered: false.into(), exiting: false.into(),
@@ -507,6 +519,7 @@ mod tests {
             daemon_build_id: build.into(),
             proto_version,
             started_ms: 0,
+            omp_status: false,
         }
     }
 
@@ -542,8 +555,8 @@ mod tests {
         assert_eq!(
             legacy_endpoints("base", "base-new", &entries),
             vec![
-                Endpoint { socket: "base-old".into(), incompatible: false },
-                Endpoint { socket: "base-future".into(), incompatible: true },
+                Endpoint { socket: "base-old".into(), incompatible: false, omp_status: false },
+                Endpoint { socket: "base-future".into(), incompatible: true, omp_status: false },
             ],
         );
         assert!(legacy_endpoints("base", "base-new", &[]).is_empty());

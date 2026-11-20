@@ -137,6 +137,7 @@ pub fn agent_icon(kind: AgentKind) -> (&'static str, Option<u32>) {
         AgentKind::Claude => ("agents/claude.svg", Some(0xD97757)),
         AgentKind::Gemini => ("agents/gemini.svg", Some(0x4796E3)),
         AgentKind::Codex => ("agents/codex.svg", None),
+        AgentKind::Omp => ("agents/omp.svg", Some(0xAA73F5)),
         AgentKind::Other => ("agents/generic.svg", None),
     }
 }
@@ -451,13 +452,14 @@ mod tests {
         assert_eq!(agent_icon(AgentKind::Claude), ("agents/claude.svg", Some(0xD97757)));
         assert_eq!(agent_icon(AgentKind::Gemini), ("agents/gemini.svg", Some(0x4796E3)));
         assert_eq!(agent_icon(AgentKind::Codex), ("agents/codex.svg", None));
+        assert_eq!(agent_icon(AgentKind::Omp), ("agents/omp.svg", Some(0xAA73F5)));
         assert_eq!(agent_icon(AgentKind::Other), ("agents/generic.svg", None));
     }
 
     #[test]
     fn every_agent_kind_maps_to_an_embedded_svg() {
         use crate::assets::AGENT_SVGS;
-        for kind in [AgentKind::Claude, AgentKind::Gemini, AgentKind::Codex, AgentKind::Other] {
+        for kind in [AgentKind::Claude, AgentKind::Gemini, AgentKind::Codex, AgentKind::Omp, AgentKind::Other] {
             let (path, _) = agent_icon(kind);
             let (_, bytes) = AGENT_SVGS.iter().find(|(p, _)| *p == path).expect("asset embedded");
             assert!(!bytes.is_empty());

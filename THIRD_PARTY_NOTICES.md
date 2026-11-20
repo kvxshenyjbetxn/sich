@@ -2,10 +2,12 @@
 
 ## Orca agent icons
 
-The agent icons in `crates/app/assets/agents/` (`claude.svg`, `codex.svg`, `gemini.svg`) are taken from
+The agent icons in `crates/app/assets/agents/` (`claude.svg`, `codex.svg`, `gemini.svg`, `omp.svg`) are taken from
 Orca (https://github.com/stablyai/orca), files
 `src/renderer/src/components/status-bar/accounts/provider-icons.tsx`
-(`ClaudeIcon`, `OpenAIIcon`, `GeminiIcon` silhouette). They are recolored to a single tint at render time.
+(`ClaudeIcon`, `OpenAIIcon`, `GeminiIcon` silhouette) and
+`src/renderer/src/components/agent/icons/agent-icon-glyphs.tsx` (`OmpIcon` → `omp.svg`).
+They are recolored to a single tint at render time.
 `generic.svg` is our own.
 
 Orca is licensed under the MIT License:

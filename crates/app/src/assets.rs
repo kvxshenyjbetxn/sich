@@ -36,6 +36,7 @@ pub const AGENT_SVGS: &[(&str, &[u8])] = &[
     ("agents/codex.svg", include_bytes!("../assets/agents/codex.svg")),
     ("agents/gemini.svg", include_bytes!("../assets/agents/gemini.svg")),
     ("agents/generic.svg", include_bytes!("../assets/agents/generic.svg")),
+    ("agents/omp.svg", include_bytes!("../assets/agents/omp.svg")),
 ];
 
 pub struct AppAssets;

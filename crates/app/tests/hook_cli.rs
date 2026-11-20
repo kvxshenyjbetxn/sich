@@ -1,4 +1,4 @@
-//! Runs the real `sich hook claude` binary with piped stdin against an in-process daemon.
+//! Runs the real `sich hook` binary with piped stdin against an in-process daemon.
 //! (The release build uses the `windows` subsystem; std treats a missing console handle as empty
 //! input and inherited pipes work, so the debug binary exercises the same read path.)
 
@@ -17,9 +17,14 @@ type Conn = Framed<sich_daemon::ClientStream, LengthDelimitedCodec>;
 
 const BIN: &str = env!("CARGO_BIN_EXE_sich");
 
-fn run_hook_bin(env: &[(&str, String)], stdin: &str) -> (Option<i32>, Vec<u8>, Duration) {
+fn run_hook_bin(agent: &str, env: &[(&str, String)], stdin: &str) -> (Option<i32>, Vec<u8>, Duration) {
     let mut cmd = Command::new(BIN);
-    cmd.args(["hook", "claude"])
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    cmd.args(["hook", agent])
         .env_remove("SICH_TERM_ID")
         .env_remove("SICH_SOCKET")
         // Keep the hook log out of the user's real data dir.
@@ -47,7 +52,7 @@ async fn recv(c: &mut Conn) -> ServerMsg {
 
 #[test]
 fn without_term_id_exits_zero_silently() {
-    let (code, stdout, _) = run_hook_bin(&[], r#"{"hook_event_name":"Stop"}"#);
+    let (code, stdout, _) = run_hook_bin("claude", &[], r#"{"hook_event_name":"Stop"}"#);
     assert_eq!(code, Some(0));
     assert!(stdout.is_empty());
 }
@@ -56,6 +61,7 @@ fn without_term_id_exits_zero_silently() {
 fn unreachable_daemon_exits_zero_silently_and_fast() {
     let name = format!("sich-hook-cli-none-{}", std::process::id());
     let (code, stdout, took) = run_hook_bin(
+        "claude",
         &[("SICH_TERM_ID", "1".into()), ("SICH_SOCKET", name)],
         r#"{"hook_event_name":"Stop"}"#,
     );
@@ -66,7 +72,7 @@ fn unreachable_daemon_exits_zero_silently_and_fast() {
 
 #[test]
 fn garbage_term_id_and_stdin_still_exit_zero() {
-    let (code, stdout, _) = run_hook_bin(&[("SICH_TERM_ID", "nope".into())], "\u{0}\u{1}garbage");
+    let (code, stdout, _) = run_hook_bin("claude", &[("SICH_TERM_ID", "nope".into())], "\u{0}\u{1}garbage");
     assert_eq!(code, Some(0));
     assert!(stdout.is_empty());
 }
@@ -96,7 +102,10 @@ async fn piped_stdin_reaches_the_daemon() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let mut c = c.expect("connect");
-    c.send(encode(&ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: "t".into() }).unwrap())
+    c.send(encode(&ClientMsg::Hello {
+        proto_version: PROTO_VERSION,
+        client_name: format!("t{}", sich_proto::OMP_CLIENT_SUFFIX),
+    }).unwrap())
         .await
         .unwrap();
     assert!(matches!(recv(&mut c).await, ServerMsg::Welcome { .. }));
@@ -124,6 +133,7 @@ async fn piped_stdin_reaches_the_daemon() {
     let sock = name.clone();
     let (code, stdout, _) = tokio::task::spawn_blocking(move || {
         run_hook_bin(
+            "claude",
             &[("SICH_TERM_ID", id.to_string()), ("SICH_SOCKET", sock)],
             r#"{"session_id":"s","hook_event_name":"PermissionRequest","tool_name":"Bash"}"#,
         )
@@ -142,6 +152,27 @@ async fn piped_stdin_reaches_the_daemon() {
     };
     assert_eq!((status.kind, status.state), (AgentKind::Claude, AgentState::Waiting));
     assert_eq!(status.detail.as_deref(), Some("Bash"));
+
+    let (code, stdout, _) = tokio::task::spawn_blocking(move || {
+        run_hook_bin(
+            "omp",
+            &[("SICH_TERM_ID", id.to_string()), ("SICH_SOCKET", name)],
+            r#"{"session_id":"omp-1","state":"working","prompt":"hello"}"#,
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(code, Some(0));
+    assert!(stdout.is_empty());
+    loop {
+        if let ServerMsg::AgentStatusChanged { id: sid, status: Some(status) } = recv(&mut c).await {
+            if sid == id {
+                assert_eq!((status.kind, status.state), (AgentKind::Omp, AgentState::Working));
+                assert_eq!(status.prompt.as_deref(), Some("hello"));
+                break;
+            }
+        }
+    }
 
     c.send(encode(&ClientMsg::Shutdown).unwrap()).await.unwrap();
     timeout(Duration::from_secs(10), daemon).await.expect("daemon did not stop").unwrap().unwrap();

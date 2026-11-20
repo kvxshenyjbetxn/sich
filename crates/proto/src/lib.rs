@@ -9,5 +9,8 @@ pub use msg::{
     TerminalInfo, WorktreeInfo,
 };
 
+/// Suffix in `Hello.client_name` for clients that can decode `AgentKind::Omp`.
+pub const OMP_CLIENT_SUFFIX: &str = "+omp";
+
 #[cfg(test)]
 mod tests;

@@ -83,6 +83,9 @@ impl Terminal {
         for (k, v) in crate::env::terminal_env(id, socket_name) {
             cmd.env(k, v);
         }
+        if let Ok(exe) = std::env::current_exe() {
+            cmd.env("SICH_OMP_HOOK", exe);
+        }
         let mut child =
             pair.slave.spawn_command(cmd).with_context(|| format!("spawn `{shell}`"))?;
         drop(pair.slave);
@@ -219,6 +222,7 @@ impl Terminal {
                 let ident = plan.as_ref().and_then(codex_rollout::execute);
                 self.shared.update_agent(|a| a.on_codex_hook_with(&hook, now, ident));
             }
+            AgentKind::Omp => self.shared.update_agent(|a| a.on_omp_hook(payload, now)),
             // Other agents have no hook integration yet.
             _ => {}
         }

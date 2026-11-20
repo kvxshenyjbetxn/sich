@@ -17,6 +17,8 @@ pub struct Entry {
     pub daemon_build_id: String,
     pub proto_version: u32,
     pub started_ms: u64,
+    #[serde(default)]
+    pub omp_status: bool,
 }
 
 pub fn socket(base: &str, build_id: &str) -> String {
@@ -167,7 +169,7 @@ mod tests {
     use super::*;
 
     fn generation(base: &str, build: &str, pid: u32, started_ms: u64) -> Entry {
-        Entry { pid, socket: socket(base, build), daemon_build_id: build.into(), proto_version: 7, started_ms }
+        Entry { pid, socket: socket(base, build), daemon_build_id: build.into(), proto_version: 7, started_ms, omp_status: true }
     }
 
     #[test]
@@ -212,7 +214,7 @@ mod selection_tests {
     use super::*;
 
     fn generation(base: &str, build: &str, started_ms: u64, proto_version: u32) -> Entry {
-        Entry { pid: 1, socket: socket(base, build), daemon_build_id: build.into(), proto_version, started_ms }
+        Entry { pid: 1, socket: socket(base, build), daemon_build_id: build.into(), proto_version, started_ms, omp_status: true }
     }
 
     #[test]

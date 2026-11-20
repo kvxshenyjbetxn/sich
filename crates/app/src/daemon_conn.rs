@@ -28,6 +28,7 @@ const RESUME_DELAY: Duration = Duration::from_millis(1500);
 
 pub(crate) struct Conn {
     pub socket: String,
+    pub client_name: String,
     pub rt: Handle,
     pub state: Arc<Mutex<ClientState>>,
     pub cmd_tx: mpsc::UnboundedSender<Cmd>,
@@ -172,7 +173,7 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
         &mut stream,
         &ClientMsg::Hello {
             proto_version: PROTO_VERSION,
-            client_name: if legacy { sich_daemon::generation::RETIRE_CLIENT } else { "sich-app" }.into(),
+            client_name: conn.client_name.clone(),
         },
     )
     .await?;
@@ -651,6 +652,7 @@ mod tests {
         let (cmd_tx, rx) = mpsc::unbounded_channel();
         (Conn {
             socket: "unused".into(),
+            client_name: "test".into(),
             rt: handle.clone(),
             state: Arc::new(Mutex::new(ClientState {
                 status: ConnStatus::Reconnecting,

@@ -93,6 +93,7 @@ async fn serve(socket_name: &str, build_id: &str, registered: bool) -> anyhow::R
         daemon_build_id: build_id.into(),
         proto_version: sich_proto::PROTO_VERSION,
         started_ms: mgr.started_unix_ms,
+        omp_status: true,
     };
     let _registration = if registered {
         let dir = generation::directory().context("no local data dir for daemon registry")?;

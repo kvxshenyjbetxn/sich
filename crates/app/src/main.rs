@@ -22,6 +22,7 @@ mod i18n;
 mod input;
 mod links;
 mod notifications;
+mod omp_hooks;
 mod orch_banner;
 mod orch_cli;
 mod orch_skill;
@@ -135,6 +136,7 @@ fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
         theme::apply(cx);
         agent_hooks::startup(cx);
         codex_hooks::startup(cx);
+        omp_hooks::startup(cx);
         orch_skill::startup(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {

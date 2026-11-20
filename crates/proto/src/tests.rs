@@ -115,6 +115,7 @@ fn client_msgs_round_trip() {
             payload: r#"{"hook_event_name":"Stop"}"#.into(),
         },
         ClientMsg::AgentHook { term_id: 1, agent: AgentKind::Gemini, payload: String::new() },
+        ClientMsg::AgentHook { term_id: 1, agent: AgentKind::Omp, payload: r#"{"state":"idle"}"#.into() },
         ClientMsg::MarkSeen { id: 8 },
         ClientMsg::Shutdown,
         ClientMsg::CreateGroup { name: "game".into() },
@@ -169,7 +170,10 @@ fn server_msgs_round_trip() {
 
 #[test]
 fn agent_enums_round_trip() {
-    for kind in [AgentKind::Claude, AgentKind::Gemini, AgentKind::Codex, AgentKind::Other] {
+    for (tag, kind) in [AgentKind::Claude, AgentKind::Gemini, AgentKind::Codex, AgentKind::Other, AgentKind::Omp]
+        .into_iter().enumerate()
+    {
+        assert_eq!(encode(&kind).unwrap().as_ref(), &[tag as u8]);
         let st = AgentStatus { kind, ..status() };
         assert_eq!(decode::<AgentStatus>(&encode(&st).unwrap()).unwrap(), st);
     }
