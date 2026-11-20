@@ -3,6 +3,7 @@
 mod agent;
 mod codex_rollout;
 mod env;
+pub mod generation;
 mod git;
 mod hub;
 mod ipc;
@@ -66,6 +67,15 @@ pub async fn run(socket_name: &str) -> anyhow::Result<()> {
 
 /// Runs the daemon with the identifier supplied by its executable.
 pub async fn run_with_build(socket_name: &str, build_id: &str) -> anyhow::Result<()> {
+    serve(socket_name, build_id, false).await
+}
+
+/// Runs and advertises the generation bound to this base.
+pub async fn run_generation(base: &str, build_id: &str) -> anyhow::Result<()> {
+    serve(&generation::socket(base, build_id), build_id, true).await
+}
+
+async fn serve(socket_name: &str, build_id: &str, registered: bool) -> anyhow::Result<()> {
     let name = ipc::to_name(socket_name).context("invalid socket name")?;
     let listener = match ListenerOptions::new().name(name).create_tokio() {
         Ok(l) => l,
@@ -77,12 +87,33 @@ pub async fn run_with_build(socket_name: &str, build_id: &str) -> anyhow::Result
     tracing::info!(pid = std::process::id(), socket = socket_name, "daemon started");
 
     let mgr = manager::Manager::new(socket_name, build_id);
+    let entry = generation::Entry {
+        pid: std::process::id(),
+        socket: socket_name.into(),
+        daemon_build_id: build_id.into(),
+        proto_version: sich_proto::PROTO_VERSION,
+        started_ms: mgr.started_unix_ms,
+    };
+    let _registration = if registered {
+        let dir = generation::directory().context("no local data dir for daemon registry")?;
+        Some(generation::Registration::write(&dir, entry.clone()).context("register daemon generation")?)
+    } else {
+        None
+    };
     if let Some(dir) = scrollback::directory() {
         scrollback::prune(&dir, std::time::SystemTime::now());
     }
+    let mut retirement_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             _ = mgr.shutdown.cancelled() => break,
+            _ = retirement_tick.tick(), if registered => {
+                if mgr.empty_for().is_some_and(|idle| idle >= generation::IDLE_LIMIT)
+                    && generation::should_exit_idle(&entry, &generation::entries(), mgr.empty_for())
+                {
+                    mgr.retire_if_empty(generation::IDLE_LIMIT).await;
+                }
+            }
             accepted = listener.accept() => match accepted {
                 Ok(stream) => {
                     tokio::spawn(server::handle_connection(stream, mgr.clone()));
