@@ -68,6 +68,9 @@ struct Shared {
     seen_end: Mutex<u64>,
     dirty: AtomicBool,
     replaying: AtomicBool,
+    /// While set, terminal replies (DA, DSR, ...) are dropped: the daemon is replaying old
+    /// output whose asker is long gone, so a reply would be typed into the shell.
+    quiet: AtomicBool,
     /// Text a program asked to put into the system clipboard (OSC 52); last write wins.
     clipboard: Mutex<Option<String>>,
     wake: Box<dyn Fn() + Send + Sync>,
@@ -76,6 +79,13 @@ struct Shared {
 impl Shared {
     fn write(&self, bytes: Vec<u8>) {
         (self.sender)(bytes);
+    }
+
+    /// Sends a reply to a terminal query unless replayed output is being fed.
+    fn reply(&self, bytes: Vec<u8>) {
+        if !self.quiet.load(Ordering::Relaxed) {
+            self.write(bytes);
+        }
     }
 
     fn mark(&self) {
@@ -94,7 +104,7 @@ impl EventListener for Listener {
             return;
         }
         match event {
-            Event::PtyWrite(s) => self.0.write(s.into_bytes()),
+            Event::PtyWrite(s) => self.0.reply(s.into_bytes()),
             Event::Title(t) => {
                 *self.0.title.lock() = t;
                 self.0.mark();
@@ -111,7 +121,7 @@ impl EventListener for Listener {
                     cell_width: s.cell_w,
                     cell_height: s.cell_h,
                 });
-                self.0.write(reply.into_bytes());
+                self.0.reply(reply.into_bytes());
             }
             Event::ClipboardStore(_, text) => {
                 if osc52_write() {
@@ -158,6 +168,7 @@ impl TermSession {
             seen_end: Mutex::new(0),
             dirty: AtomicBool::new(true),
             replaying: AtomicBool::new(false),
+            quiet: AtomicBool::new(false),
             clipboard: Mutex::new(None),
             wake: Box::new(wake),
         });
@@ -206,7 +217,7 @@ impl TermSession {
                 inline.feed(&mut t, &mut proc, data, cell)
             };
             if !replies.is_empty() {
-                self.shared.write(replies);
+                self.shared.reply(replies);
             }
             // A DEC 2026 block may be pending: make sure it is flushed after the timeout.
             if proc.sync_timeout().sync_timeout().is_some()
@@ -241,6 +252,16 @@ impl TermSession {
         self.shared.replaying.store(false, Ordering::Relaxed);
         drop(term);
         self.shared.mark();
+    }
+
+    /// Starts (`true`) or ends (`false`) a daemon replay of old output: while quiet, the bytes
+    /// are still rendered but replies to terminal queries inside them are dropped.
+    pub fn set_quiet(&self, quiet: bool) {
+        self.shared.quiet.store(quiet, Ordering::Relaxed);
+    }
+
+    pub fn is_quiet(&self) -> bool {
+        self.shared.quiet.load(Ordering::Relaxed)
     }
 
     /// End offset of the stream fed so far; use as `resume_from_seq` after a reconnect.
@@ -443,6 +464,20 @@ mod tests {
         s.feed(0, b"live\x1b[6n");
         assert_eq!(s.last_seq(), 8);
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn quiet_replay_drops_replies_but_live_output_replies() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (s, rx) = capture_session(&rt);
+        s.set_quiet(true);
+        s.feed(0, b"PS> \x1b[c\x1b[6n\x1b[>q\x1b[14t");
+        assert!(rx.try_recv().is_err(), "replayed queries must not be answered");
+        assert_eq!(s.last_seq(), 20);
+        s.set_quiet(false);
+        s.feed(20, b"\x1b[c\x1b[6n");
+        assert!(rx.try_recv().unwrap().starts_with(b"\x1b[?"));
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[1;5R");
     }
 
     fn capture_session(rt: &tokio::runtime::Runtime) -> (TermSession, std::sync::mpsc::Receiver<Vec<u8>>) {

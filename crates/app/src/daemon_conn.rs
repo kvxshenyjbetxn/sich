@@ -44,6 +44,35 @@ enum End {
     Restart(crate::daemon_restart::Request),
 }
 
+/// Finds the end of a daemon history replay without a protocol change. The daemon answers a
+/// connection's messages in order and replays history synchronously while handling
+/// `Subscribe`, so the reply to a `GetDaemonInfo` sent right after a `Subscribe` arrives after
+/// the last replayed byte. Every `GetDaemonInfo` gets exactly one `DaemonInfo` reply.
+#[derive(Default)]
+pub(crate) struct ReplayMarkers {
+    /// The terminal of the latest `Subscribe` from the start, not yet followed by a marker.
+    pending: Option<TermId>,
+    /// One entry per outstanding `GetDaemonInfo`: the terminal whose replay it ends, if any.
+    queue: std::collections::VecDeque<Option<TermId>>,
+}
+
+impl ReplayMarkers {
+    pub(crate) fn on_sent(&mut self, msg: &ClientMsg) {
+        match msg {
+            ClientMsg::Subscribe { id, resume_from_seq } => {
+                self.pending = resume_from_seq.is_none().then_some(*id);
+            }
+            ClientMsg::GetDaemonInfo => self.queue.push_back(self.pending.take()),
+            _ => {}
+        }
+    }
+
+    /// A `DaemonInfo` arrived: the terminal whose replay just ended, if any.
+    pub(crate) fn on_daemon_info(&mut self) -> Option<TermId> {
+        self.queue.pop_front().flatten()
+    }
+}
+
 /// Detects a daemon we cannot talk to: a `Welcome` with another version, or an `Error` before
 /// any `Welcome` (an old v1 daemon only answers a version mismatch with `Error`).
 pub(crate) fn classify_incompatible(msg: &ServerMsg, welcomed: bool) -> Option<ConnStatus> {
@@ -134,6 +163,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     let mut restores = HashMap::new();
     let mut resumes = HashMap::new();
     let mut next_restore = 0_u64;
+    let mut markers = ReplayMarkers::default();
     loop {
         let resume_at = resumes.values().map(|(when, _)| *when).min();
         tokio::select! {
@@ -157,7 +187,9 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                                 if let Some(command) = conn.restore_terminal(info, data).filter(|_| !exited) {
                                     resumes.insert(id, (tokio::time::Instant::now() + RESUME_DELAY, command));
                                 }
-                                send(&mut stream, &ClientMsg::Subscribe { id, resume_from_seq: None }).await?;
+                                let sub = ClientMsg::Subscribe { id, resume_from_seq: None };
+                                markers.on_sent(&sub);
+                                send(&mut stream, &sub).await?;
                             }
                         }
                     }
@@ -170,7 +202,13 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                             }
                             _ => None,
                         };
+                        if matches!(msg, ServerMsg::DaemonInfo { .. }) {
+                            if let Some(session) = markers.on_daemon_info().and_then(|id| conn.session_of(id)) {
+                                session.set_quiet(false);
+                            }
+                        }
                         for out in conn.on_server(msg)? {
+                            markers.on_sent(&out);
                             send(&mut stream, &out).await?;
                         }
                         if let Some(id) = resume_id {
@@ -237,6 +275,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     Cmd::Resume(..) => continue,
                     Cmd::Resize(id, cols, rows) => ClientMsg::Resize { id, cols, rows },
                 };
+                markers.on_sent(&msg);
                 send(&mut stream, &msg).await?;
             }
         }
@@ -443,6 +482,8 @@ impl Conn {
                         out.push(ClientMsg::Resize { id: info.id, cols, rows });
                     }
                     entry.session.set_exited(info.exited);
+                    // A marker lost with the old connection must not leave it quiet.
+                    entry.session.set_quiet(false);
                     entry.info = info;
                     out.push(ClientMsg::Subscribe {
                         id: entry.info.id,
@@ -451,8 +492,12 @@ impl Conn {
                     terminals.push(entry);
                 }
                 None => {
-                    out.push(ClientMsg::Subscribe { id: info.id, resume_from_seq: None });
+                    // An existing terminal: the daemon replays its buffered history, which
+                    // may hold old queries nobody is waiting for. Quiet until the marker.
                     let session = self.new_session(&info);
+                    session.set_quiet(true);
+                    out.push(ClientMsg::Subscribe { id: info.id, resume_from_seq: None });
+                    out.push(ClientMsg::GetDaemonInfo);
                     terminals.push(TermEntry { info, session });
                 }
             }
@@ -482,6 +527,51 @@ mod tests {
 
     fn welcome(v: u32) -> ServerMsg {
         ServerMsg::Welcome { proto_version: v, daemon_pid: 42 }
+    }
+
+    #[test]
+    fn replay_marker_ends_the_replay_of_the_latest_fresh_subscribe() {
+        let mut m = ReplayMarkers::default();
+        m.on_sent(&ClientMsg::GetDaemonInfo); // from Welcome
+        m.on_sent(&ClientMsg::Subscribe { id: 3, resume_from_seq: None });
+        m.on_sent(&ClientMsg::GetDaemonInfo);
+        m.on_sent(&ClientMsg::Subscribe { id: 4, resume_from_seq: Some(10) });
+        m.on_sent(&ClientMsg::GetDaemonInfo); // unpaired: a resume is live output
+        assert_eq!(m.on_daemon_info(), None);
+        assert_eq!(m.on_daemon_info(), Some(3));
+        assert_eq!(m.on_daemon_info(), None);
+        assert_eq!(m.on_daemon_info(), None, "extra replies are harmless");
+    }
+
+    #[test]
+    fn reconcile_keeps_known_terminals_live_and_quiets_new_ones_until_the_marker() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let conn = test_conn(&rt, false);
+        let info = |id| TerminalInfo {
+            id,
+            title: String::new(),
+            cwd: Default::default(),
+            cols: 80,
+            rows: 24,
+            exited: None,
+            created_unix_ms: 0,
+            worktree: None,
+            agent: None,
+        };
+        let mut out = Vec::new();
+        conn.reconcile(vec![info(1)], &mut out);
+        assert_eq!(
+            out,
+            vec![
+                ClientMsg::Subscribe { id: 1, resume_from_seq: None },
+                ClientMsg::GetDaemonInfo
+            ]
+        );
+        let session = conn.session_of(1).unwrap();
+        assert!(session.is_quiet());
+        // Reconnect before the marker arrived: the resume must not stay quiet.
+        conn.reconcile(vec![info(1)], &mut Vec::new());
+        assert!(!session.is_quiet());
     }
 
     #[test]
