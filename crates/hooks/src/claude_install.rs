@@ -1,4 +1,4 @@
-//! Registers `sich hook claude` in Claude Code's `settings.json` (documented hooks mechanism).
+//! Manages Sich hooks and orchestration permissions in Claude Code settings.
 //!
 //! Safety rules: only our own entries are ever added, changed or removed; everything else
 //! (user hooks, other tools' hooks, key order) is kept; a hook event key is written only if the
@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
@@ -17,6 +18,9 @@ const BACKUP_FILE: &str = "settings.json.sich-backup";
 const TMP_FILE: &str = "settings.json.sich-tmp";
 const HOOK_TIMEOUT_SECS: u64 = 5;
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+// Hook installation can run in the background while the app applies the skill setting.
+static SETTINGS_EDIT: Mutex<()> = Mutex::new(());
 
 type Version = (u32, u32, u32);
 
@@ -222,6 +226,42 @@ fn is_our_hook(h: &Value) -> bool {
     h.get("command").and_then(Value::as_str).is_some_and(is_our_command)
 }
 
+// The same command rules go in the skill's frontmatter and in permissions.allow.
+const ORCH_RULE_PATTERNS: [(&str, &str); 2] = [
+    ("Bash(\"", "\" orch:*)"),
+    ("PowerShell(& \"", "\" orch *)"),
+];
+
+fn is_literal_sich_cli(path: &str) -> bool {
+    !path.contains(['*', '"', '$', '`', '\r', '\n'])
+        && matches!(path.rsplit(['/', '\\']).next(), Some("sich-cli" | "sich-cli.exe"))
+}
+
+/// Renders the quoted Bash and PowerShell allow rules for Sich's orchestration CLI.
+/// Rules target the console relay so they can be recognized and removed after it moves.
+pub fn orch_allow_rules(exe: &Path) -> Vec<String> {
+    let Some(path) = exe.to_str() else { return Vec::new() };
+    if !exe.is_absolute() || !is_literal_sich_cli(path) || (!cfg!(windows) && path.contains('\\')) {
+        return Vec::new();
+    }
+
+    let path = path.replace('\\', "/");
+    ORCH_RULE_PATTERNS.iter().map(|(prefix, suffix)| format!("{prefix}{path}{suffix}")).collect()
+}
+
+fn is_our_orch_rule(rule: &str) -> bool {
+    ORCH_RULE_PATTERNS.iter().any(|&(prefix, suffix)| {
+        let Some(path) = rule.strip_prefix(prefix).and_then(|rule| rule.strip_suffix(suffix)) else {
+            return false;
+        };
+        // Also recognize rules in settings that moved between Windows and Unix.
+        let absolute = path.starts_with('/')
+            || path.starts_with("\\\\")
+            || matches!(path.as_bytes(), [drive, b':', b'/' | b'\\', ..] if drive.is_ascii_alphabetic());
+        absolute && is_literal_sich_cli(path)
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // settings.json merging
 
@@ -390,6 +430,65 @@ fn write_settings(dir: &Path, root: &Value, existed: bool) -> anyhow::Result<boo
     Ok(backup_created)
 }
 
+/// Adds the current orchestration rules and removes those for previous CLI paths.
+pub fn install_orch_allow_rules(claude_config_dir: &Path, exe: &Path) -> anyhow::Result<()> {
+    update_orch_allow_rules(claude_config_dir, &orch_allow_rules(exe))
+}
+
+/// Removes the managed orchestration rules for all previous CLI paths.
+pub fn remove_orch_allow_rules(claude_config_dir: &Path) -> anyhow::Result<()> {
+    update_orch_allow_rules(claude_config_dir, &[])
+}
+
+fn update_orch_allow_rules(dir: &Path, desired: &[String]) -> anyhow::Result<()> {
+    let _edit = SETTINGS_EDIT.lock().map_err(|_| anyhow::anyhow!("Claude settings edit lock poisoned"))?;
+    let original = read_settings(&settings_path(dir))?;
+    if original.is_none() && desired.is_empty() {
+        return Ok(());
+    }
+    let mut root = original.clone().unwrap_or_else(|| Value::Object(Map::new()));
+    let Some(allow) = orch_allow_array(&mut root, !desired.is_empty())? else { return Ok(()) };
+
+    allow.retain(|entry| {
+        entry.as_str().is_none_or(|rule| !is_our_orch_rule(rule) || desired.iter().any(|item| item == rule))
+    });
+    for rule in desired {
+        if !allow.iter().any(|entry| entry.as_str() == Some(rule)) {
+            allow.push(Value::String(rule.clone()));
+        }
+    }
+
+    if original.as_ref() != Some(&root) {
+        write_settings(dir, &root, original.is_some())?;
+    }
+    Ok(())
+}
+
+fn orch_allow_array(root: &mut Value, create: bool) -> anyhow::Result<Option<&mut Vec<Value>>> {
+    let Some(root) = root.as_object_mut() else {
+        bail!("settings.json is not a JSON object");
+    };
+    let permissions = if create {
+        root.entry("permissions").or_insert_with(|| Value::Object(Map::new()))
+    } else {
+        let Some(permissions) = root.get_mut("permissions") else { return Ok(None) };
+        permissions
+    };
+    let Some(permissions) = permissions.as_object_mut() else {
+        bail!("`permissions` in settings.json is not an object");
+    };
+    let allow = if create {
+        permissions.entry("allow").or_insert_with(|| Value::Array(Vec::new()))
+    } else {
+        let Some(allow) = permissions.get_mut("allow") else { return Ok(None) };
+        allow
+    };
+    match allow.as_array_mut() {
+        Some(allow) => Ok(Some(allow)),
+        None => bail!("`permissions.allow` in settings.json is not an array"),
+    }
+}
+
 /// Installs for the detected Claude version (`claude --version`).
 pub fn install(claude_config_dir: &Path, exe: &Path) -> anyhow::Result<InstallReport> {
     install_with_version(claude_config_dir, exe, probe_claude_version().as_deref())
@@ -401,6 +500,7 @@ pub fn install_with_version(
     exe: &Path,
     version: Option<&str>,
 ) -> anyhow::Result<InstallReport> {
+    let _edit = SETTINGS_EDIT.lock().map_err(|_| anyhow::anyhow!("Claude settings edit lock poisoned"))?;
     let path = settings_path(claude_config_dir);
     let original = read_settings(&path)?;
     let existed = original.is_some();
@@ -432,6 +532,7 @@ pub fn install_with_version(
 /// Removes our entries only. `exe` is accepted for symmetry: entries are recognised by shape,
 /// so stale paths are removed as well.
 pub fn uninstall(claude_config_dir: &Path, _exe: &Path) -> anyhow::Result<InstallReport> {
+    let _edit = SETTINGS_EDIT.lock().map_err(|_| anyhow::anyhow!("Claude settings edit lock poisoned"))?;
     let path = settings_path(claude_config_dir);
     let mut report = InstallReport { settings_path: path.clone(), ..Default::default() };
     let Some(original) = read_settings(&path)? else { return Ok(report) };
@@ -484,6 +585,153 @@ mod tests {
 
     fn write(dir: &Path, text: &str) {
         fs::write(dir.join(SETTINGS_FILE), text).unwrap();
+    }
+
+    fn cli() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Program Files\Sich\sich-cli.exe")
+        } else {
+            PathBuf::from("/opt/Sich Tools/sich-cli")
+        }
+    }
+
+    #[test]
+    fn orch_allow_rules_create_settings_from_missing_and_empty_files() {
+        let path = if cfg!(windows) { "C:/Program Files/Sich/sich-cli.exe" } else { "/opt/Sich Tools/sich-cli" };
+        for initial in [None, Some(""), Some("{}")] {
+            let dir = tempfile::tempdir().unwrap();
+            if let Some(initial) = initial {
+                write(dir.path(), initial);
+            }
+            install_orch_allow_rules(dir.path(), &cli()).unwrap();
+            assert_eq!(
+                read(dir.path()),
+                json!({"permissions": {"allow": [
+                    format!("Bash(\"{path}\" orch:*)"),
+                    format!("PowerShell(& \"{path}\" orch *)"),
+                ]}})
+            );
+        }
+    }
+
+    #[test]
+    fn orch_allow_rules_append_missing_rules_and_preserve_keys_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let [bash, powershell]: [String; 2] = orch_allow_rules(&cli()).try_into().unwrap();
+        let initial = json!({
+            "theme": "dark",
+            "permissions": {
+                "deny": ["Read(.env)"],
+                "allow": ["Read", bash, "Bash(git status)"],
+                "ask": ["Bash"]
+            },
+            "hooks": {"Stop": []},
+        });
+        write(dir.path(), &initial.to_string());
+        install_orch_allow_rules(dir.path(), &cli()).unwrap();
+
+        let mut expected = initial;
+        expected["permissions"]["allow"].as_array_mut().unwrap().push(json!(powershell));
+        let actual = read(dir.path());
+        assert_eq!(actual.to_string(), expected.to_string());
+
+        // A no-op must preserve even the formatting of an existing file.
+        write(dir.path(), &expected.to_string());
+        install_orch_allow_rules(dir.path(), &cli()).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap(), expected.to_string());
+    }
+
+    #[test]
+    fn orch_allow_rules_create_missing_allow_in_existing_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), r#"{"permissions":{"deny":["Bash"]}}"#);
+        install_orch_allow_rules(dir.path(), &cli()).unwrap();
+        assert_eq!(
+            read(dir.path()).to_string(),
+            json!({"permissions":{"deny":["Bash"],"allow":orch_allow_rules(&cli())}}).to_string()
+        );
+    }
+
+    #[test]
+    fn orch_allow_rules_replace_stale_paths_and_remove_only_managed_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = [
+            "Bash(git status)",
+            r#"Bash("/old/sich-cli" orch check)"#,
+            r#"Bash("/old/other-sich-cli" orch:*)"#,
+            r#"Bash("/old/sich-cli" daemon:*)"#,
+            r#"PowerShell(& "C:/old/sich-cli.exe" orch check)"#,
+            r#"PowerShell(& "C:/old/sich-cli.exe" *)"#,
+            r#"PowerShell(& "C:/old/sich.exe" orch *)"#,
+            r#"Bash("sich-cli" orch:*)"#,
+            r#"Bash("/*/sich-cli" orch:*)"#,
+        ];
+        let old_bash = r#"Bash("/old/sich-cli" orch:*)"#;
+        let old_powershell = r#"PowerShell(& "C:/Old Apps/sich-cli.exe" orch *)"#;
+        let mut allow = user.to_vec();
+        allow.insert(1, old_bash);
+        allow.insert(3, old_powershell);
+        write(dir.path(), &json!({"permissions": {"allow": allow, "deny": ["Write"]}}).to_string());
+
+        install_orch_allow_rules(dir.path(), &cli()).unwrap();
+        let expected: Vec<_> = user.into_iter().map(str::to_owned).chain(orch_allow_rules(&cli())).collect();
+        let mut settings = read(dir.path());
+        assert_eq!(settings["permissions"]["allow"], json!(expected));
+
+        let allow = settings["permissions"]["allow"].as_array_mut().unwrap();
+        allow.extend([json!(old_bash), json!(old_powershell)]);
+        write(dir.path(), &settings.to_string());
+        remove_orch_allow_rules(dir.path()).unwrap();
+        assert_eq!(read(dir.path()), json!({"permissions": {"allow": user, "deny": ["Write"]}}));
+    }
+
+    #[test]
+    fn orch_allow_rules_reject_invalid_settings_without_writing() {
+        for (initial, reason) in [
+            (r#"{"permissions":null}"#, "permissions"),
+            (r#"{"permissions":{"allow":{}}}"#, "permissions.allow"),
+            (r#"{"permissions":{"allow":null}}"#, "permissions.allow"),
+            ("[]", "not a JSON object"),
+            ("{invalid JSON", "not valid JSON"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), initial);
+            let install_err = install_orch_allow_rules(dir.path(), &cli()).unwrap_err();
+            let remove_err = remove_orch_allow_rules(dir.path()).unwrap_err();
+            assert!(format!("{install_err:#}").contains(reason), "{install_err:#}");
+            assert!(format!("{remove_err:#}").contains(reason), "{remove_err:#}");
+            assert_eq!(fs::read_to_string(dir.path().join(SETTINGS_FILE)).unwrap(), initial);
+            assert!(!dir.path().join(BACKUP_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn orch_allow_rules_removal_without_managed_rules_does_not_write() {
+        let dir = tempfile::tempdir().unwrap();
+        remove_orch_allow_rules(dir.path()).unwrap();
+        assert!(!settings_path(dir.path()).exists());
+
+        for initial in [r#"{"theme": "dark"}"#, r#"{"permissions": {}}"#, r#"{"permissions": {"allow": ["Read"]}}"#] {
+            write(dir.path(), initial);
+            remove_orch_allow_rules(dir.path()).unwrap();
+            assert_eq!(fs::read_to_string(settings_path(dir.path())).unwrap(), initial);
+            assert!(!dir.path().join(BACKUP_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn orch_allow_rules_share_the_one_time_settings_backup_with_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial = r#"{"theme":"dark"}"#;
+        write(dir.path(), initial);
+        install_orch_allow_rules(dir.path(), &cli()).unwrap();
+        let backup = dir.path().join(BACKUP_FILE);
+        assert_eq!(fs::read_to_string(&backup).unwrap(), initial);
+
+        install_with_version(dir.path(), &exe(), Some(NEW_VERSION)).unwrap();
+        remove_orch_allow_rules(dir.path()).unwrap();
+        assert_eq!(fs::read_to_string(backup).unwrap(), initial);
+        assert!(is_installed(dir.path(), &exe()));
     }
 
     fn all_commands(v: &Value) -> Vec<String> {

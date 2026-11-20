@@ -1,10 +1,10 @@
 //! The Claude Code skill that teaches a coordinator agent to use `sich orch`.
 //!
-//! Only `<claude config>/skills/sich-orchestration/` is ours: the file is overwritten only when
-//! it carries our marker, and removed (with its directory) when the setting is switched off.
+//! The installer manages the marked skill file and its matching Claude Code allow rules.
 
 use std::path::{Path, PathBuf};
 
+use anyhow::Context as _;
 use gpui_kit::App;
 use sich_hooks::claude_install;
 
@@ -46,18 +46,8 @@ fn quoted_exe(exe: &Path) -> String {
 
 pub fn render(exe: &Path) -> String {
     let x = quoted_exe(exe);
-    // Grant permissions only when the quoted command identifies a literal executable.
-    let rules = if exe.is_absolute()
-        && exe.to_str().is_some_and(|path| {
-            !path.contains(['*', '"', '$', '`', '\r', '\n']) && (cfg!(windows) || !path.contains('\\'))
-        })
-    {
-        vec![format!("Bash({x} orch:*)"), format!("PowerShell(& {x} orch *)")]
-    } else {
-        Vec::new()
-    };
     // JSON string quoting keeps the executable's shell quotes intact in this YAML list.
-    let allowed_tools = serde_json::json!(rules);
+    let allowed_tools = serde_json::json!(claude_install::orch_allow_rules(exe));
     format!(
         "---
 name: sich-orchestration
@@ -107,8 +97,17 @@ Workers use `ask`, `send --to coordinator`, `done` and `check` themselves; their
     )
 }
 
-/// Writes the skill unless a foreign file is in the way.
-pub fn install(claude_dir: &Path, exe: &Path) -> std::io::Result<InstallOutcome> {
+/// Installs the managed skill and persists its allow rules for later turns.
+pub fn install(claude_dir: &Path, exe: &Path) -> anyhow::Result<InstallOutcome> {
+    let outcome = write_skill(claude_dir, exe)?;
+    if outcome != InstallOutcome::ForeignFile {
+        claude_install::install_orch_allow_rules(claude_dir, exe)
+            .context("install orchestration allow rules")?;
+    }
+    Ok(outcome)
+}
+
+fn write_skill(claude_dir: &Path, exe: &Path) -> std::io::Result<InstallOutcome> {
     let file = skill_file(claude_dir);
     let content = render(exe);
     match std::fs::read_to_string(&file) {
@@ -122,8 +121,16 @@ pub fn install(claude_dir: &Path, exe: &Path) -> std::io::Result<InstallOutcome>
     Ok(InstallOutcome::Written)
 }
 
-/// Removes our skill directory (only if the file carries our marker).
-pub fn remove(claude_dir: &Path) -> std::io::Result<RemoveOutcome> {
+/// Removes the managed skill and its persistent allow rules.
+pub fn remove(claude_dir: &Path) -> anyhow::Result<RemoveOutcome> {
+    let skill = remove_skill(claude_dir).context("remove skill file");
+    let rules = claude_install::remove_orch_allow_rules(claude_dir).context("remove orchestration allow rules");
+    let outcome = skill?;
+    rules?;
+    Ok(outcome)
+}
+
+fn remove_skill(claude_dir: &Path) -> std::io::Result<RemoveOutcome> {
     let file = skill_file(claude_dir);
     match std::fs::read_to_string(&file) {
         Ok(existing) if is_managed(&existing) => {
@@ -152,7 +159,7 @@ pub fn apply(enabled: bool) {
         remove(&dir).map(|_| ())
     };
     if let Err(e) = result {
-        tracing::warn!("orchestration skill: {e}");
+        tracing::warn!("orchestration skill: {e:#}");
     }
 }
 
@@ -239,6 +246,61 @@ mod tests {
     }
 
     #[test]
+    fn installed_skill_and_settings_use_the_same_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        install(dir.path(), &exe()).unwrap();
+        let skill = std::fs::read_to_string(skill_file(dir.path())).unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(settings["permissions"]["allow"], serde_json::json!(parse_skill(&skill).0.allowed_tools));
+
+        // Reinstall the permissions even when the existing skill needs no changes.
+        std::fs::write(&settings_path, "{}").unwrap();
+        assert_eq!(install(dir.path(), &exe()).unwrap(), InstallOutcome::Unchanged);
+        let restored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(restored, settings);
+
+        // Remove the permissions even if the skill file has already been removed.
+        std::fs::remove_file(skill_file(dir.path())).unwrap();
+        assert_eq!(remove(dir.path()).unwrap(), RemoveOutcome::NotInstalled);
+        let removed: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(settings_path).unwrap()).unwrap();
+        assert_eq!(removed["permissions"]["allow"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn fallback_launcher_keeps_skill_commands_without_granting_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = exe();
+        install(dir.path(), &cli).unwrap();
+
+        let fallback = cli.with_file_name("sich.exe");
+        install(dir.path(), &fallback).unwrap();
+        let skill = std::fs::read_to_string(skill_file(dir.path())).unwrap();
+        let (front, body) = parse_skill(&skill);
+        assert!(front.allowed_tools.is_empty());
+        assert!(body.contains("sich.exe"));
+        let settings: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["permissions"]["allow"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn removing_skill_leaves_malformed_settings_untouched_and_reports_the_error() {
+        let dir = tempfile::tempdir().unwrap();
+        install(dir.path(), &exe()).unwrap();
+        let settings_path = dir.path().join("settings.json");
+        std::fs::write(&settings_path, r#"{"permissions":{"allow":false}}"#).unwrap();
+
+        let err = remove(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("permissions.allow"));
+        assert!(!skill_file(dir.path()).exists());
+        assert_eq!(std::fs::read_to_string(settings_path).unwrap(), r#"{"permissions":{"allow":false}}"#);
+    }
+
+    #[test]
     fn install_upgrades_the_previous_managed_skill() {
         let dir = tempfile::tempdir().unwrap();
         let file = skill_file(dir.path());
@@ -275,6 +337,7 @@ mod tests {
         assert_eq!(install(dir.path(), &exe()).unwrap(), InstallOutcome::ForeignFile);
         assert_eq!(remove(dir.path()).unwrap(), RemoveOutcome::ForeignFile);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "my own skill");
+        assert!(!dir.path().join("settings.json").exists());
     }
 
     #[test]
