@@ -24,7 +24,7 @@ use sich_orch::auto_close::{AutoClose, countdown_seconds};
 use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
-use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonClient, RestartResult, RestoreData, Snapshot};
+use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonPool, RestartResult, RestoreData, Snapshot};
 use crate::diff_tabs::{DiffTab, DiffTabs};
 use crate::diff_view::DiffView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
@@ -62,12 +62,13 @@ const RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Terminals of one workspace being recreated from the saved session.
 struct RestoreTarget {
     key: WorkspaceKey,
+    existing: Vec<TermId>,
     expected: usize,
-    active: Option<usize>,
+    active: usize,
 }
 
 pub struct AppView {
-    pub(crate) client: DaemonClient,
+    pub(crate) client: DaemonPool,
     views: HashMap<TermId, Entity<TerminalView>>,
     diff_tabs: HashMap<WorkspaceKey, DiffTabs<Entity<DiffView>>>,
     next_diff_id: u64,
@@ -98,8 +99,6 @@ pub struct AppView {
     attention: HashMap<TermId, Option<BadgeKind>>,
     /// `since_unix_ms` of the status for which `mark_seen` was already sent, per terminal.
     seen_sent: HashMap<TermId, u64>,
-    /// Daemon socket name (for the final `Shutdown`).
-    socket: String,
     events_tx: UnboundedSender<UiEvent>,
     events_rx: Option<UnboundedReceiver<UiEvent>>,
     tray: Option<Tray>,
@@ -108,8 +107,6 @@ pub struct AppView {
     saved: Option<Session>,
     /// Whether the terminal restore decision was made (once per run).
     restored: bool,
-    /// The client does not auto-create a first terminal because the restore will fill the daemon.
-    suppress_auto_create: bool,
     restore_targets: Vec<RestoreTarget>,
     restore_started: Option<Instant>,
     window_state: Option<SavedWindow>,
@@ -149,16 +146,14 @@ impl AppView {
         let mut right_panel = saved.as_ref().map_or_else(RightPanelState::default, |s| s.right_panel);
         right_panel.width = right_panel.width.map(|width| clamp_right_w(width, f32::INFINITY, 0.));
         let git_panel = cx.new(|_| GitPanel::new(right_panel.history_collapsed));
-        let suppress_auto_create = saved.as_ref().is_some_and(Session::has_terminals);
         // Coalescing wake path: bounded(1), try_send never blocks.
         let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
-        let client = DaemonClient::start(
+        let client = DaemonPool::start(
             &rt,
             socket.clone(),
             Arc::new(move || {
                 let _ = wake_tx.try_send(());
             }),
-            !suppress_auto_create,
         );
         cx.spawn(async move |this, cx| {
             while wake_rx.recv().await.is_ok() {
@@ -188,7 +183,8 @@ impl AppView {
         .detach();
 
         // The watcher delivers mail, raises escalations, closes workers and cleans up merged worktrees.
-        let orch_socket = socket.clone();
+        let orch_socket = socket;
+        let worktree_socket = client.primary_socket().to_owned();
         cx.spawn(async move |this, cx| {
             let mut watcher = Some(sich_orch::watch::Watcher::new(sich_orch::paths::db_path()));
             let mut closing: Option<gpui_kit::Task<()>> = None;
@@ -200,6 +196,7 @@ impl AppView {
                     (this.orch_tick_data(), settings::get(cx).orch_auto_close_workers)
                 }) else { break };
                 let Some(mut w) = watcher.take() else { break };
+                let legacy_socket = orch_socket.clone();
                 let (w, mut out) = cx
                     .background_executor()
                     .spawn(async move {
@@ -210,17 +207,21 @@ impl AppView {
                             now_ms: data.now_ms,
                             exe: &data.exe,
                         };
-                        let out = w.tick(&input);
+                        let routes = sich_orch::watch::TerminalRoutes { terminals: &data.routes, legacy_socket: &legacy_socket };
+                        let out = w.tick_routed(&input, Some(&routes));
                         (w, out)
                     })
                     .await;
                 watcher = Some(w);
                 let due = std::mem::take(&mut out.due);
-                let Ok((should_close, should_clean)) = this.update(cx, |this, cx| {
+                let Ok((should_close, cleanup_terminals)) = this.update(cx, |this, cx| {
                     this.apply_orch(out, cx);
                     let synced = this.client.terminals_synced();
                     let settings = settings::get(cx);
-                    (synced && settings.orch_auto_close_workers, synced && settings.orch_cleanup_worktrees)
+                    let cleanup = (synced && settings.orch_cleanup_worktrees && cleanup.is_none()
+                        && last_cleanup.is_none_or(|t| t.elapsed() >= orch_watch::WORKTREE_CLEANUP_INTERVAL))
+                        .then(|| this.client.snapshot().terminals.into_iter().map(|t| t.info).collect::<Vec<_>>());
+                    (synced && settings.orch_auto_close_workers, cleanup)
                 }) else { break };
                 if closing.as_mut().is_some_and(|close| close.now_or_never().is_some()) {
                     closing = None;
@@ -235,14 +236,12 @@ impl AppView {
                 if cleanup.as_mut().is_some_and(|task| task.now_or_never().is_some()) {
                     cleanup = None;
                 }
-                if should_clean && cleanup.is_none()
-                    && last_cleanup.is_none_or(|t| t.elapsed() >= orch_watch::WORKTREE_CLEANUP_INTERVAL)
-                {
+                if let Some(terminals) = cleanup_terminals {
                     last_cleanup = Some(Instant::now());
-                    let socket = orch_socket.clone();
+                    let socket = worktree_socket.clone();
                     let rt = rt.clone();
                     cleanup = Some(cx.background_executor().spawn(async move {
-                        orch_watch::cleanup_worktrees(&socket, &rt);
+                        orch_watch::cleanup_worktrees(&socket, &terminals, &rt);
                     }));
                 }
             }
@@ -277,14 +276,12 @@ impl AppView {
             hwnd: None,
             attention: HashMap::new(),
             seen_sent: HashMap::new(),
-            socket,
             events_tx: events.0,
             events_rx: Some(events.1),
             tray: None,
             tray_lang: settings::language(cx),
             saved,
             restored: false,
-            suppress_auto_create,
             restore_targets: Vec::new(),
             restore_started: None,
             window_state: None,
@@ -310,7 +307,13 @@ impl AppView {
         let snap = self.client.snapshot();
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
         let exe = crate::daemon_host::cli_exe().map_or_else(|| "sich-cli".to_string(), |p| p.to_string_lossy().into_owned());
-        orch_watch::tick_data(&infos, self.client.terminals_synced(), sich_orch::paths::now_ms(), exe, Instant::now())
+        let mut data = orch_watch::tick_data(&infos, self.client.terminals_synced(), sich_orch::paths::now_ms(), exe, Instant::now());
+        for info in &infos {
+            if let Some(owner) = self.client.owner(info.id) {
+                data.routes.entry(owner.socket).or_default().insert(owner.id, info.id);
+            }
+        }
+        data
     }
 
     /// Applies one watcher result: sidebar data, and wake-up pointers typed like a user would
@@ -665,9 +668,7 @@ impl AppView {
         if let Err(err) = self.save_current_session() {
             tracing::error!("failed to save session: {err:#}");
         }
-        if let Err(e) = crate::cli::stop_daemon(&self.socket) {
-            tracing::warn!("could not stop the daemon: {e:#}");
-        }
+        self.client.shutdown_all();
         self.quit_ui_only(cx);
     }
 
@@ -681,17 +682,12 @@ impl AppView {
             return;
         }
         let snap = self.client.snapshot();
-        let session = match snap.status {
-            ConnStatus::Connected { .. } if self.session_ready() => {
-                let infos: Vec<_> = snap.terminals.into_iter().map(|t| t.info).collect();
-                Some(self.build_session(&infos))
-            }
-            ConnStatus::Incompatible { .. } => None,
-            _ => return,
-        };
+        if !matches!(snap.status, ConnStatus::Incompatible { .. }) {
+            return;
+        }
         self.restarting_daemon = true;
         self.pending_save = None;
-        self.client.restart_daemon(crate::daemon_restart::Request { expected: snap.status, session });
+        self.client.restart_daemon(crate::daemon_restart::Request { expected: snap.status, session: None });
         cx.notify();
     }
 
@@ -701,7 +697,6 @@ impl AppView {
         self.restart_dialog_shown = false;
         self.last_session = None;
         if let RestartResult::Stopped(session) = result {
-            self.suppress_auto_create = session.has_terminals();
             self.restore = Some(session.selected.clone());
             self.saved = Some(session);
             self.restored = false;
@@ -737,6 +732,7 @@ impl AppView {
             right_panel: self.right_panel,
         });
         session.daemon_pid = self.client.daemon_pid();
+        session.record_owners(|key| self.client.owner(key));
         session
     }
 
@@ -778,35 +774,27 @@ impl AppView {
         }
         let Some(count) = self.client.first_list_count() else { return };
         self.restored = true;
-        let plan = match self.saved.take() {
-            Some(saved) if count > 0 => {
-                for workspace in saved.workspaces {
-                    let key = WorkspaceKey::of(workspace.worktree.as_deref());
-                    let saved_id = workspace.active.and_then(|index| workspace.terminals.get(index)).and_then(|term| term.id);
-                    let ids = terminals_in(&key, infos);
-                    if saved.daemon_pid == self.client.daemon_pid() {
-                        if let Some(id) = saved_id.filter(|id| ids.contains(id)) {
-                            self.ws.set_active(&key, id);
-                        }
-                    }
-                }
-                Vec::new()
+        let attached: Vec<_> = infos.iter().filter_map(|info| Some((info.id, self.client.owner(info.id)?))).collect();
+        let peers = self.client.connected_peers();
+        let mut plan = Vec::new();
+        if let Some(saved) = self.saved.take() {
+            let (missing, active) = session::reattach(saved, &attached, &peers, count);
+            for (key, id) in active {
+                self.ws.set_active(&key, id);
             }
-            Some(saved) => session::restore_plan(&saved, count, &self.projects),
-            None => Vec::new(),
-        };
-        if plan.is_empty() {
-            if self.suppress_auto_create && count == 0 {
-                // Nothing restorable: behave like a fresh start.
-                self.client.create_terminal_in(DEFAULT_COLS, DEFAULT_ROWS, None);
-            }
-            return;
+            plan = session::restore_plan(&missing, 0, &self.projects);
+        }
+        if plan.is_empty() && count == 0 {
+            self.client.create_terminal_in(DEFAULT_COLS, DEFAULT_ROWS, None);
         }
         let lang = settings::language(cx);
         let resume_agents = settings::get(cx).resume_agents_on_restore;
         for (key, terminals, active) in plan {
             let worktree = key.path().map(PathBuf::from);
-            self.restore_targets.push(RestoreTarget { key, expected: terminals.len(), active });
+            if let Some(active) = active {
+                let existing = terminals_in(&key, infos);
+                self.restore_targets.push(RestoreTarget { key, existing, expected: terminals.len(), active });
+            }
             for term in terminals {
                 let resume = term.agent.filter(|_| resume_agents)
                     .and_then(|a| session::resume_command(a.kind, &a.session_id));
@@ -831,11 +819,11 @@ impl AppView {
         let timed_out = self.restore_started.is_some_and(|t| t.elapsed() > RESTORE_TIMEOUT);
         let ws = &mut self.ws;
         self.restore_targets.retain(|t| {
-            let ids = terminals_in(&t.key, infos);
+            let ids: Vec<_> = terminals_in(&t.key, infos).into_iter().filter(|id| !t.existing.contains(id)).collect();
             if ids.len() < t.expected && !timed_out {
                 return true;
             }
-            if let Some(id) = t.active.and_then(|a| ids.get(a)) {
+            if let Some(id) = ids.get(t.active) {
                 ws.set_active(&t.key, *id);
             }
             false
@@ -1091,7 +1079,9 @@ impl AppView {
             self.views.insert(id, view);
             // A terminal this window asked for: show its workspace and activate it.
             let key = WorkspaceKey::of(entry.info.worktree.as_deref());
-            if let Some(pos) = self.pending_creates.iter().position(|k| *k == key) {
+            if self.client.owner(id).is_some_and(|owner| owner.socket == self.client.primary_socket())
+                && let Some(pos) = self.pending_creates.iter().position(|k| *k == key)
+            {
                 self.pending_creates.remove(pos);
                 self.ws.set_active(&key, id);
                 self.set_selected(key.clone(), cx);
@@ -1253,10 +1243,9 @@ impl AppView {
             lang,
             &snap.status,
             self.restarting_daemon,
-            snap.daemon_build.as_deref(),
-            sich_app::daemon_build_id(),
+            snap.legacy_terminals.then_some("legacy"),
+            "primary",
         );
-        let old_build = matches!(&status, StatusLine::Text { old_build: true, .. });
         let indicator = match status {
             StatusLine::Dot { tooltip } => {
                 div()
@@ -1272,7 +1261,6 @@ impl AppView {
             }
             StatusLine::Text { text, .. } => text.into_any_element(),
         };
-        let restart = old_build && self.session_ready();
         let app = cx.entity();
         h_flex()
             .h(px(24.))
@@ -1285,7 +1273,7 @@ impl AppView {
             .border_t_1()
             .border_color(theme.status_bar_border)
             .text_size(px(12.))
-            .text_color(if old_build { theme.warning } else { theme.muted_foreground })
+            .text_color(theme.muted_foreground)
             .child(div().flex_1().child(indicator))
             .children(self.usage_bar.render(lang, window_width, cx))
             .children(self.update_available.as_ref().map(|release| {
@@ -1301,13 +1289,6 @@ impl AppView {
                     .child(Button::new("update-available").xsmall().label(tr(lang, Tr::Update)).on_click(
                         move |_, window, cx| update_dialog::open(app.clone(), window, cx),
                     ))
-            }))
-            .children(restart.then(|| {
-                Button::new("restart-daemon").xsmall().label(tr(lang, Tr::RestartDaemon)).on_click(
-                    move |_, window, cx| {
-                        worktree_dialogs::open_restart_daemon(app.clone(), window, cx)
-                    },
-                )
             }))
             .child(
                 Button::new("open-settings")

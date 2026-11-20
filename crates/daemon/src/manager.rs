@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use parking_lot::Mutex;
@@ -23,9 +24,14 @@ pub struct Manager {
     /// Serializes worktree removal with terminal creation in a project.
     pub(crate) worktree_operations: tokio::sync::Mutex<()>,
     scrollback_lock: Mutex<()>,
-    terminals: Mutex<BTreeMap<TermId, Arc<Terminal>>>,
+    terminals: Mutex<Terminals>,
     next_term: AtomicU64,
     next_conn: AtomicU64,
+}
+
+struct Terminals {
+    entries: BTreeMap<TermId, Arc<Terminal>>,
+    empty_since: Instant,
 }
 
 impl Manager {
@@ -39,7 +45,7 @@ impl Manager {
             worktree_operations: tokio::sync::Mutex::new(()),
             scrollback_lock: Mutex::new(()),
             shutdown: CancellationToken::new(),
-            terminals: Mutex::new(BTreeMap::new()),
+            terminals: Mutex::new(Terminals { entries: BTreeMap::new(), empty_since: Instant::now() }),
             next_term: AtomicU64::new(1),
             next_conn: AtomicU64::new(1),
         })
@@ -50,11 +56,24 @@ impl Manager {
     }
 
     pub fn list(&self) -> Vec<TerminalInfo> {
-        self.terminals.lock().values().map(|t| t.info()).collect()
+        self.terminals.lock().entries.values().map(|t| t.info()).collect()
     }
 
     pub fn get(&self, id: TermId) -> Option<Arc<Terminal>> {
-        self.terminals.lock().get(&id).cloned()
+        self.terminals.lock().entries.get(&id).cloned()
+    }
+
+    pub fn empty_for(&self) -> Option<Duration> {
+        let terms = self.terminals.lock();
+        terms.entries.is_empty().then(|| terms.empty_since.elapsed())
+    }
+
+    /// Serializes the final emptiness check and shutdown with terminal creation.
+    pub async fn retire_if_empty(&self, minimum_idle: Duration) {
+        let _operation = self.worktree_operations.lock().await;
+        if self.empty_for().is_some_and(|elapsed| elapsed >= minimum_idle) {
+            self.shutdown.cancel();
+        }
     }
 
     /// Spawns a terminal (blocking work is moved off the async runtime) and broadcasts it.
@@ -64,6 +83,7 @@ impl Manager {
         before_broadcast: impl FnOnce(&TerminalInfo),
     ) -> anyhow::Result<()> {
         let _operation = self.worktree_operations.lock().await;
+        anyhow::ensure!(!self.shutdown.is_cancelled(), "daemon is shutting down");
         let me = self.clone();
         let term = tokio::task::spawn_blocking(move || {
             let id = me.next_term.fetch_add(1, Ordering::Relaxed);
@@ -72,7 +92,7 @@ impl Manager {
         .await
         .context("spawn task")??;
         let info = term.info();
-        self.terminals.lock().insert(term.id(), term);
+        self.terminals.lock().entries.insert(term.id(), term);
         before_broadcast(&info);
         self.hub.broadcast(ServerMsg::TerminalCreated(info));
         Ok(())
@@ -80,7 +100,14 @@ impl Manager {
 
     /// Kills (if alive) and removes a terminal. Returns false if it does not exist.
     pub fn kill(&self, id: TermId) -> bool {
-        let Some(term) = self.terminals.lock().remove(&id) else { return false };
+        let term = {
+            let mut terms = self.terminals.lock();
+            let Some(term) = terms.entries.remove(&id) else { return false };
+            if terms.entries.is_empty() {
+                terms.empty_since = Instant::now();
+            }
+            term
+        };
         term.kill();
         term.clear_agent();
         self.hub.broadcast(ServerMsg::TerminalRemoved { id });
@@ -105,6 +132,7 @@ impl Manager {
         let ids: Vec<TermId> = self
             .terminals
             .lock()
+            .entries
             .values()
             .filter(|t| t.info().worktree.is_some_and(|w| crate::git::same_path(&w, worktree)))
             .map(|t| t.id())
@@ -117,7 +145,7 @@ impl Manager {
     /// Drops all subscriptions of a closed connection.
     pub fn drop_connection(&self, conn: ConnId) {
         self.hub.unregister(conn);
-        for t in self.terminals.lock().values() {
+        for t in self.terminals.lock().entries.values() {
             t.unsubscribe(conn);
         }
     }
@@ -127,7 +155,7 @@ impl Manager {
         let mgr = self.clone();
         match tokio::task::spawn_blocking(move || {
             let _save = mgr.scrollback_lock.lock();
-            let terminals: Vec<_> = mgr.terminals.lock().values().rev().cloned().collect();
+            let terminals: Vec<_> = mgr.terminals.lock().entries.values().rev().cloned().collect();
             let mut files = Vec::new();
             for term in terminals {
                 if files.len() == crate::scrollback::MAX_FILES {
@@ -152,7 +180,7 @@ impl Manager {
     }
 
     pub fn kill_all(&self) {
-        let all = std::mem::take(&mut *self.terminals.lock());
+        let all = std::mem::take(&mut self.terminals.lock().entries);
         for t in all.values() {
             t.kill();
         }

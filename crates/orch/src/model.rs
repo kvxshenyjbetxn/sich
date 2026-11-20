@@ -151,6 +151,7 @@ pub enum Role {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Recipient {
     pub term: u64,
+    pub socket: Option<String>,
     pub role: Role,
     pub unread: u32,
     pub max_unread_id: i64,

@@ -82,7 +82,9 @@ fn main() -> anyhow::Result<()> {
     if daemon_host::relocate_gui(&args) {
         return Ok(());
     }
+    // Inside a Sich terminal `SICH_SOCKET` names that terminal's own generation: use its base.
     let socket = sich_daemon::socket_name_from_env();
+    let socket = sich_daemon::generation::base_for(&socket, &sich_daemon::generation::entries()).to_owned();
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
         [] => run_ui(socket, false),
         ["--takeover"] => run_ui(socket, true),
@@ -125,11 +127,6 @@ fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
         Acquire::Unavailable => {}
     }
     let session = Session::load();
-
-    // Start the daemon if it is not running; the client keeps retrying if this fails.
-    if let Err(e) = rt.block_on(cli::ensure_daemon(&socket)) {
-        tracing::error!("could not start daemon: {e:#}");
-    }
 
     gpui_kit::application().with_assets(crate::assets::AppAssets).run(move |cx| {
         gpui_kit::init(cx);

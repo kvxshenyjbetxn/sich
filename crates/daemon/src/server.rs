@@ -93,7 +93,8 @@ where
         writer_cancel.cancel();
     });
 
-    let result = read_loop(&mut source, mgr, &conn, &cancel).await;
+    let retire = client_name == crate::generation::RETIRE_CLIENT;
+    let result = read_loop(&mut source, mgr, &conn, &cancel, retire).await;
     cancel.cancel();
     let _ = writer.await;
     result
@@ -104,6 +105,7 @@ async fn read_loop<R>(
     mgr: &Arc<Manager>,
     conn: &ConnHandle,
     cancel: &CancellationToken,
+    retire: bool,
 ) -> anyhow::Result<()>
 where
     R: futures::Stream<Item = std::io::Result<bytes::BytesMut>> + Unpin,
@@ -115,6 +117,10 @@ where
         };
         let Some(frame) = frame else { return Ok(()) };
         let msg: ClientMsg = decode(&frame.context("read frame")?).context("decode message")?;
+        if retire && msg == ClientMsg::Shutdown {
+            mgr.retire_if_empty(std::time::Duration::ZERO).await;
+            return Ok(());
+        }
         handle_msg(msg, mgr, conn).await;
     }
 }

@@ -36,6 +36,19 @@ pub struct TickInput<'a> {
     pub exe: &'a str,
 }
 
+/// Links persisted wire IDs to the GUI keys used in a watcher tick.
+pub struct TerminalRoutes<'a> {
+    pub terminals: &'a HashMap<String, HashMap<u64, u64>>,
+    pub legacy_socket: &'a str,
+}
+
+fn terminal_key(routes: Option<&TerminalRoutes<'_>>, socket: Option<&str>, id: u64) -> Option<u64> {
+    match routes {
+        Some(routes) => routes.terminals.get(socket.unwrap_or(routes.legacy_socket))?.get(&id).copied(),
+        None => Some(id),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pointer {
     pub term: u64,
@@ -80,7 +93,11 @@ impl Watcher {
     }
 
     pub fn tick(&mut self, input: &TickInput<'_>) -> TickOutput {
-        match self.tick_inner(input) {
+        self.tick_routed(input, None)
+    }
+
+    pub fn tick_routed(&mut self, input: &TickInput<'_>, routes: Option<&TerminalRoutes<'_>>) -> TickOutput {
+        match self.tick_inner(input, routes) {
             Ok(out) => out,
             Err(_) => {
                 // Drop the connection; the next tick reopens it.
@@ -90,7 +107,7 @@ impl Watcher {
         }
     }
 
-    fn tick_inner(&mut self, input: &TickInput<'_>) -> Result<TickOutput> {
+    fn tick_inner(&mut self, input: &TickInput<'_>, routes: Option<&TerminalRoutes<'_>>) -> Result<TickOutput> {
         let mut out = TickOutput::default();
         if !self.connect() {
             if self.last_snapshot != OrchSnapshot::default() {
@@ -101,9 +118,9 @@ impl Watcher {
         }
         let db = self.db.as_mut().expect("connected");
         if input.synced {
-            raise_escalations(db, input)?;
+            raise_escalations(db, input, routes)?;
         }
-        out.pointers = plan_pointers(db, input)?;
+        out.pointers = plan_pointers(db, input, routes)?;
 
         let version = db.data_version()?;
         let signature = term_signature(input.terms);
@@ -111,7 +128,7 @@ impl Watcher {
         self.last_version = Some(version);
         self.last_signature = signature;
         if changed || self.last_snapshot == OrchSnapshot::default() {
-            let snap = visible_snapshot(db.snapshot()?, input.terms);
+            let snap = visible_snapshot(db.snapshot_with(|socket, id| terminal_key(routes, socket, id))?, input.terms);
             if snap != self.last_snapshot {
                 self.last_snapshot = snap.clone();
                 out.snapshot = Some(snap);
@@ -145,10 +162,12 @@ fn visible_snapshot(mut snap: OrchSnapshot, terms: &HashMap<u64, TermObs>) -> Or
     snap
 }
 
-fn raise_escalations(db: &mut Db, input: &TickInput<'_>) -> Result<()> {
+fn raise_escalations(db: &mut Db, input: &TickInput<'_>, routes: Option<&TerminalRoutes<'_>>) -> Result<()> {
     let active = db.dispatches_in_states(&[DispatchState::Starting, DispatchState::Working])?;
     for d in active {
-        let obs = input.terms.get(&d.worker_term).filter(|t| t.created_ms <= d.started_ms);
+        let socket = db.dispatch_socket(&d.id)?;
+        let obs = terminal_key(routes, socket.as_deref(), d.worker_term)
+            .and_then(|key| input.terms.get(&key)).filter(|t| t.created_ms <= d.started_ms);
         let last_activity = db.last_activity_ms(&d)?;
         let ei = EscalationInput {
             state: d.state,
@@ -172,23 +191,24 @@ fn raise_escalations(db: &mut Db, input: &TickInput<'_>) -> Result<()> {
     Ok(())
 }
 
-fn plan_pointers(db: &mut Db, input: &TickInput<'_>) -> Result<Vec<Pointer>> {
+fn plan_pointers(db: &mut Db, input: &TickInput<'_>, routes: Option<&TerminalRoutes<'_>>) -> Result<Vec<Pointer>> {
     // A terminal can be coordinator and worker at once: merge its mail into one pointer.
-    let mut by_term: HashMap<u64, (u32, i64)> = HashMap::new();
+    let mut by_term = HashMap::new();
     for r in db.pending_recipients()? {
-        if !terminal_alive(input.terms, r.term, r.bound_ms) {
-            continue;
-        }
-        let e = by_term.entry(r.term).or_insert((0, 0));
+        let socket = r.socket.or_else(|| routes.map(|routes| routes.legacy_socket.to_owned()));
+        let Some(key) = terminal_key(routes, socket.as_deref(), r.term)
+            .filter(|key| terminal_alive(input.terms, *key, r.bound_ms))
+        else { continue };
+        let e = by_term.entry(key).or_insert((0, 0, socket, r.term));
         e.0 += r.unread;
         e.1 = e.1.max(r.max_unread_id);
     }
     let mut pointers = Vec::new();
     let mut terms: Vec<_> = by_term.into_iter().collect();
     terms.sort_unstable_by_key(|(t, _)| *t);
-    for (term, (unread, max_id)) in terms {
+    for (term, (unread, max_id, socket, raw_id)) in terms {
         let obs = input.terms[&term];
-        let last = db.last_pointed(term)?;
+        let last = db.last_pointed_at(socket.as_deref(), raw_id)?;
         let di = DeliveryInput {
             unread,
             max_unread_id: max_id,
@@ -200,7 +220,7 @@ fn plan_pointers(db: &mut Db, input: &TickInput<'_>) -> Result<Vec<Pointer>> {
             now_ms: input.now_ms,
         };
         if delivery::should_point(&di) {
-            db.record_pointed(term, max_id, input.now_ms)?;
+            db.record_pointed_at(socket.as_deref(), raw_id, max_id, input.now_ms)?;
             pointers.push(Pointer {
                 term,
                 text: delivery::pointer_text(&crate::preamble::exe_command(input.exe), unread),
@@ -436,5 +456,64 @@ mod tests {
         assert_eq!(tick(&mut w, &terms, deadline + AUTO_CLOSE_DELAY_MS).due, [id]);
         terms.get_mut(&2).unwrap().created_ms = NOW;
         assert!(tick(&mut w, &terms, deadline + AUTO_CLOSE_DELAY_MS).due.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn terminal_key_uses_the_socket_or_the_legacy_default() {
+        let terminals = HashMap::from([
+            ("base".to_string(), HashMap::from([(1u64, 11u64)])),
+            ("base-new".to_string(), HashMap::from([(1u64, 21u64)])),
+        ]);
+        let routes = TerminalRoutes { terminals: &terminals, legacy_socket: "base" };
+        assert_eq!(terminal_key(Some(&routes), Some("base-new"), 1), Some(21));
+        assert_eq!(terminal_key(Some(&routes), None, 1), Some(11), "rows without a socket are legacy");
+        assert_eq!(terminal_key(Some(&routes), Some("base-gone"), 1), None);
+        assert_eq!(terminal_key(Some(&routes), Some("base-new"), 2), None);
+        assert_eq!(terminal_key(None, Some("anything"), 7), Some(7), "unrouted ticks keep wire ids");
+    }
+
+    #[test]
+    fn mail_is_pointed_at_the_gui_key_of_the_owning_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orchestration.db");
+        let mut db = Db::open(&path).unwrap();
+        let scope = Some(crate::db::TerminalScope { socket: "base-new", legacy: false });
+        let run = db.ensure_run_at(1, 500, 600, scope).unwrap();
+        let (_, d) = db
+            .create_task_with_dispatch_at(&run.id, "t_00000001", "d_00000001", "T", "spec", 2, Agent::Claude, None, None, None, 700, Some("base-new"))
+            .unwrap();
+        db.mark_working(&d.id).unwrap();
+        let m = NewMessage {
+            run_id: &run.id,
+            from: Endpoint::Worker(d.id.clone()),
+            to: Endpoint::Coordinator,
+            kind: MsgType::Message,
+            subject: "s",
+            body: "hello",
+            reply_to: None,
+            payload: None,
+        };
+        db.send_message(&m, 1000).unwrap();
+
+        let obs = TermObs { created_ms: 500, exited: false, agent: AgentObs::Idle, agent_since_ms: 900_000, user_idle_ms: None };
+        let terms = HashMap::from([(101, obs.clone()), (102, obs)]);
+        let routed = HashMap::from([("base-new".to_string(), HashMap::from([(1u64, 101u64), (2, 102)]))]);
+        let routes = TerminalRoutes { terminals: &routed, legacy_socket: "base" };
+        let input = TickInput { terms: &terms, synced: true, auto_close_workers: false, now_ms: 1_000_000, exe: "sich" };
+        let mut watcher = Watcher::new(Some(path.clone()));
+        let out = watcher.tick_routed(&input, Some(&routes));
+        assert_eq!(out.pointers.iter().map(|p| p.term).collect::<Vec<_>>(), [101]);
+        assert_eq!(out.snapshot.as_ref().map(|s| s.coordinators.keys().copied().collect::<Vec<_>>()), Some(vec![101]));
+
+        // Without a route for this daemon (it is gone) nothing is typed anywhere.
+        let none = HashMap::new();
+        let routes = TerminalRoutes { terminals: &none, legacy_socket: "base" };
+        let mut watcher = Watcher::new(Some(path));
+        assert!(watcher.tick_routed(&input, Some(&routes)).pointers.is_empty());
     }
 }

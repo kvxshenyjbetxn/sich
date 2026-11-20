@@ -21,7 +21,7 @@ pub fn run_daemon(socket: &str) -> anyhow::Result<()> {
     };
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     crate::daemon_host::prune_old_hosts();
-    let res = rt.block_on(sich_daemon::run_with_build(socket, sich_app::daemon_build_id()));
+    let res = rt.block_on(sich_daemon::run_generation(socket, sich_app::daemon_build_id()));
     if let Err(e) = &res {
         tracing::error!("daemon failed: {e:#}");
     }
@@ -29,15 +29,25 @@ pub fn run_daemon(socket: &str) -> anyhow::Result<()> {
 }
 
 /// `sich daemon stop`: asks a running daemon to shut down.
-pub fn stop_daemon(socket: &str) -> anyhow::Result<()> {
+pub fn stop_daemon(base: &str) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
-        let stream = sich_daemon::connect(socket).await.context("daemon is not running")?;
-        let mut framed = Framed::new(stream, frame_codec());
-        // `Shutdown` is accepted before `Hello` by every daemon version.
-        framed.send(encode(&ClientMsg::Shutdown)?).await?;
-        Ok(())
+        if std::env::var_os("SICH_TERM_ID").is_none() {
+            let socket = sich_daemon::generation::socket(base, sich_app::daemon_build_id());
+            if sich_daemon::connect(&socket).await.is_ok() {
+                return shutdown(&socket).await;
+            }
+        }
+        shutdown(base).await
     })
+}
+
+pub async fn shutdown(socket: &str) -> anyhow::Result<()> {
+    let stream = sich_daemon::connect(socket).await.context("daemon is not running")?;
+    let mut framed = Framed::new(stream, frame_codec());
+    // `Shutdown` is accepted before `Hello` by every daemon version.
+    framed.send(encode(&ClientMsg::Shutdown)?).await?;
+    Ok(())
 }
 
 /// Starts or adopts the daemon for the CLI's daemon start command.
@@ -48,14 +58,15 @@ pub fn start_daemon(socket: &str) -> anyhow::Result<()> {
 }
 
 /// Makes sure a daemon is reachable, starting a detached one if needed (waits up to ~5 s).
-pub async fn ensure_daemon(socket: &str) -> anyhow::Result<()> {
-    if sich_daemon::connect(socket).await.is_ok() {
+pub async fn ensure_daemon(base: &str) -> anyhow::Result<()> {
+    let socket = sich_daemon::generation::socket(base, sich_app::daemon_build_id());
+    if sich_daemon::connect(&socket).await.is_ok() {
         return Ok(());
     }
-    spawn_detached_daemon()?;
+    spawn_detached_daemon(base)?;
     let deadline = Instant::now() + START_TIMEOUT;
     loop {
-        if sich_daemon::connect(socket).await.is_ok() {
+        if sich_daemon::connect(&socket).await.is_ok() {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -68,26 +79,29 @@ pub async fn ensure_daemon(socket: &str) -> anyhow::Result<()> {
 pub fn spawn_replacement_ui() -> anyhow::Result<()> {
     // The user-facing exe, so a freshly built one is picked up (it relocates itself).
     let exe = crate::daemon_host::launcher_exe().context("locate sich executable")?;
-    spawn_detached(&exe, "--takeover")
+    spawn_detached(&exe, "--takeover", None)
 }
 
-fn spawn_detached_daemon() -> anyhow::Result<()> {
+fn spawn_detached_daemon(base: &str) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("locate current executable")?;
     let host = crate::daemon_host::spawn_path(&exe);
-    match spawn_detached(&host, "daemon") {
+    match spawn_detached(&host, "daemon", Some(base)) {
         Err(err) if host != exe => {
             tracing::warn!("could not launch relocated daemon: {err:#}");
-            spawn_detached(&exe, "daemon")
+            spawn_detached(&exe, "daemon", Some(base))
         }
         result => result,
     }
 }
 
-fn spawn_detached(exe: &std::path::Path, arg: &str) -> anyhow::Result<()> {
+fn spawn_detached(exe: &std::path::Path, arg: &str, base: Option<&str>) -> anyhow::Result<()> {
     let mut cmd = Command::new(exe);
     // Never leak the launcher marker: a replacement UI must relocate itself, and terminals
     // spawned by the daemon must not inherit a stale value.
     cmd.arg(arg).env_remove(crate::daemon_host::LAUNCHER_ENV).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    if let Some(base) = base {
+        cmd.env("SICH_SOCKET", base);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;

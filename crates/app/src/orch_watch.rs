@@ -46,6 +46,7 @@ pub fn agent_obs(status: Option<&AgentStatus>) -> AgentObs {
 /// Everything one watcher tick needs, owned so it can move to a background thread.
 pub struct TickData {
     pub terms: HashMap<u64, TermObs>,
+    pub routes: HashMap<String, HashMap<u64, u64>>,
     pub synced: bool,
     pub now_ms: i64,
     pub exe: String,
@@ -68,7 +69,7 @@ pub fn tick_data(terminals: &[TerminalInfo], synced: bool, now_ms: i64, exe: Str
             )
         })
         .collect();
-    TickData { terms, synced, now_ms, exe }
+    TickData { terms, routes: HashMap::new(), synced, now_ms, exe }
 }
 
 pub fn release_due(dispatches: &[String], socket: &str, rt: &tokio::runtime::Handle) {
@@ -87,9 +88,9 @@ pub fn release_due(dispatches: &[String], socket: &str, rt: &tokio::runtime::Han
     }
 }
 
-pub fn cleanup_worktrees(socket: &str, rt: &tokio::runtime::Handle) {
+pub fn cleanup_worktrees(socket: &str, terminals: &[TerminalInfo], rt: &tokio::runtime::Handle) {
     let Some(path) = sich_orch::paths::db_path().filter(|p| p.is_file()) else { return };
-    let result = Db::open(&path).and_then(|db| rt.block_on(sich_app::orch_worktree::cleanup_worktrees(&db, socket, true)));
+    let result = Db::open(&path).and_then(|db| rt.block_on(sich_app::orch_worktree::cleanup_worktrees_with_terminals(&db, socket, terminals, true)));
     if let Err(e) = result {
         tracing::warn!("could not clean up orchestration worktrees: {e:#}");
     }

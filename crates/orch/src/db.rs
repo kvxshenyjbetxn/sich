@@ -89,6 +89,33 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
+/// Optional endpoint data for new records. Keep it additive so an executable still in
+/// use by a legacy terminal can open the database during a GUI takeover.
+const ENDPOINT_TABLES: &str = "
+    CREATE TABLE IF NOT EXISTS run_sockets (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+        socket TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS dispatch_sockets (
+        dispatch_id TEXT PRIMARY KEY REFERENCES dispatches(id) ON DELETE CASCADE,
+        socket TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS socket_deliveries (
+        socket TEXT NOT NULL,
+        term_id INTEGER NOT NULL,
+        last_pointed_msg_id INTEGER NOT NULL,
+        last_pointed_ms INTEGER NOT NULL,
+        PRIMARY KEY (socket, term_id)
+    );
+";
+
+#[derive(Clone, Copy)]
+pub struct TerminalScope<'a> {
+    pub socket: &'a str,
+    /// Only the unversioned endpoint can own rows written before sockets were persisted.
+    pub legacy: bool,
+}
+
 pub struct Db {
     conn: Connection,
 }
@@ -211,6 +238,23 @@ fn message_of(r: &Row<'_>) -> rusqlite::Result<Message> {
     })
 }
 
+fn find_run(
+    conn: &Connection,
+    term: u64,
+    created_ms: i64,
+    scope: Option<TerminalScope<'_>>,
+) -> Result<Option<Run>> {
+    Ok(conn.query_row(
+        "SELECT r.id, r.coordinator_term, r.created_ms FROM runs r
+         LEFT JOIN run_sockets s ON s.run_id = r.id
+         WHERE coordinator_term = ?1 AND created_ms >= ?2
+             AND (?3 IS NULL OR s.socket = ?3 OR (?4 AND s.socket IS NULL))
+         ORDER BY created_ms DESC, r.rowid DESC LIMIT 1",
+        params![term as i64, created_ms, scope.map(|s| s.socket), scope.is_some_and(|s| s.legacy)],
+        |r| Ok(Run { id: r.get(0)?, coordinator_term: r.get::<_, i64>(1)? as u64, created_ms: r.get(2)? }),
+    ).optional()?)
+}
+
 impl Db {
     /// Opens (creating and migrating if needed) the database at `path`.
     pub fn open(path: &Path) -> Result<Db> {
@@ -254,6 +298,7 @@ impl Db {
             tx.execute_batch(sql).with_context(|| format!("migration {}", i + 1))?;
             tx.execute("INSERT INTO schema_version (version) VALUES (?1)", [i as i64 + 1])?;
         }
+        tx.execute_batch(ENDPOINT_TABLES)?;
         tx.commit()?;
         Ok(())
     }
@@ -273,28 +318,20 @@ impl Db {
     /// (terminal ids restart with the daemon; `term_created_ms` rejects runs of a previous
     /// incarnation). `None` = no run yet.
     pub fn run_for_coordinator(&self, term: u64, term_created_ms: i64) -> Result<Option<Run>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT id, coordinator_term, created_ms FROM runs
-                 WHERE coordinator_term = ?1 AND created_ms >= ?2 ORDER BY created_ms DESC, rowid DESC LIMIT 1",
-                params![term as i64, term_created_ms],
-                |r| Ok(Run { id: r.get(0)?, coordinator_term: r.get::<_, i64>(1)? as u64, created_ms: r.get(2)? }),
-            )
-            .optional()?)
+        self.run_for_coordinator_at(term, term_created_ms, None)
+    }
+
+    pub fn run_for_coordinator_at(&self, term: u64, term_created_ms: i64, scope: Option<TerminalScope<'_>>) -> Result<Option<Run>> {
+        find_run(&self.conn, term, term_created_ms, scope)
     }
 
     pub fn ensure_run(&mut self, term: u64, term_created_ms: i64, now: i64) -> Result<Run> {
+        self.ensure_run_at(term, term_created_ms, now, None)
+    }
+
+    pub fn ensure_run_at(&mut self, term: u64, term_created_ms: i64, now: i64, scope: Option<TerminalScope<'_>>) -> Result<Run> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = tx
-            .query_row(
-                "SELECT id, coordinator_term, created_ms FROM runs
-                 WHERE coordinator_term = ?1 AND created_ms >= ?2 ORDER BY created_ms DESC, rowid DESC LIMIT 1",
-                params![term as i64, term_created_ms],
-                |r| Ok(Run { id: r.get(0)?, coordinator_term: r.get::<_, i64>(1)? as u64, created_ms: r.get(2)? }),
-            )
-            .optional()?;
-        let run = match existing {
+        let run = match find_run(&tx, term, term_created_ms, scope)? {
             Some(run) => run,
             None => {
                 let run = Run { id: crate::paths::new_run_id(), coordinator_term: term, created_ms: now };
@@ -305,6 +342,12 @@ impl Db {
                 run
             }
         };
+        if let Some(scope) = scope {
+            tx.execute(
+                "INSERT OR IGNORE INTO run_sockets (run_id, socket) VALUES (?1, ?2)",
+                params![run.id, scope.socket],
+            )?;
+        }
         tx.commit()?;
         Ok(run)
     }
@@ -336,6 +379,27 @@ impl Db {
         owned_worktree: Option<&OwnedWorktree>,
         now: i64,
     ) -> Result<(Task, Dispatch)> {
+        self.create_task_with_dispatch_at(
+            run_id, task_id, dispatch_id, title, spec, worker_term, agent, model, effort, owned_worktree, now, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_task_with_dispatch_at(
+        &mut self,
+        run_id: &str,
+        task_id: &str,
+        dispatch_id: &str,
+        title: &str,
+        spec: &str,
+        worker_term: u64,
+        agent: Agent,
+        model: Option<&str>,
+        effort: Option<&str>,
+        owned_worktree: Option<&OwnedWorktree>,
+        now: i64,
+        socket: Option<&str>,
+    ) -> Result<(Task, Dispatch)> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO tasks (id, run_id, title, spec, status, created_ms, updated_ms)
@@ -354,6 +418,12 @@ impl Db {
                 owned_worktree.map(|w| &w.identity),
             ],
         )?;
+        if let Some(socket) = socket {
+            tx.execute(
+                "INSERT INTO dispatch_sockets (dispatch_id, socket) VALUES (?1, ?2)",
+                params![dispatch_id, socket],
+            )?;
+        }
         tx.commit()?;
         Ok((
             self.get_task(task_id)?.context("task vanished")?,
@@ -409,18 +479,30 @@ impl Db {
     /// The newest live (not lost/released) dispatch whose worker terminal is `term` and that was
     /// started no earlier than the terminal was created.
     pub fn dispatch_for_worker(&self, term: u64, term_created_ms: i64) -> Result<Option<Dispatch>> {
-        Ok(self
-            .conn
-            .query_row(
-                &format!(
-                    "SELECT {DISPATCH_COLS} FROM dispatches
-                     WHERE worker_term = ?1 AND started_ms >= ?2 AND state NOT IN ('lost','released')
-                     ORDER BY started_ms DESC, rowid DESC LIMIT 1"
-                ),
-                params![term as i64, term_created_ms],
-                dispatch_of,
-            )
-            .optional()?)
+        self.dispatch_for_worker_at(term, term_created_ms, None)
+    }
+
+    pub fn dispatch_for_worker_at(&self, term: u64, term_created_ms: i64, scope: Option<TerminalScope<'_>>) -> Result<Option<Dispatch>> {
+        Ok(self.conn.query_row(
+            &format!(
+                "SELECT {DISPATCH_COLS} FROM dispatches
+                 WHERE worker_term = ?1 AND started_ms >= ?2 AND state NOT IN ('lost','released')
+                   AND (?3 IS NULL
+                     OR id IN (SELECT dispatch_id FROM dispatch_sockets WHERE socket = ?3)
+                     OR (?4 AND id NOT IN (SELECT dispatch_id FROM dispatch_sockets)))
+                 ORDER BY started_ms DESC, rowid DESC LIMIT 1"
+            ),
+            params![term as i64, term_created_ms, scope.map(|s| s.socket), scope.is_some_and(|s| s.legacy)],
+            dispatch_of,
+        ).optional()?)
+    }
+
+    pub fn dispatch_socket(&self, id: &str) -> Result<Option<String>> {
+        Ok(self.conn.query_row(
+            "SELECT socket FROM dispatch_sockets WHERE dispatch_id = ?1",
+            [id],
+            |r| r.get(0),
+        ).optional()?)
     }
 
     pub fn set_dispatch_state(&mut self, id: &str, state: DispatchState, now: i64) -> Result<()> {
@@ -703,8 +785,9 @@ impl Db {
     pub fn pending_recipients(&self) -> Result<Vec<Recipient>> {
         let mut out = Vec::new();
         let mut st = self.conn.prepare(
-            "SELECT r.coordinator_term, r.created_ms, COUNT(m.id), MAX(m.id)
+            "SELECT r.coordinator_term, r.created_ms, COUNT(m.id), MAX(m.id), s.socket
              FROM messages m JOIN runs r ON r.id = m.run_id
+             LEFT JOIN run_sockets s ON s.run_id = r.id
              WHERE m.to_kind = 'coordinator' AND m.read_ms IS NULL GROUP BY r.id",
         )?;
         for row in st.query_map([], |r| {
@@ -714,13 +797,15 @@ impl Db {
                 bound_ms: r.get(1)?,
                 unread: r.get::<_, i64>(2)? as u32,
                 max_unread_id: r.get(3)?,
+                socket: r.get(4)?,
             })
         })? {
             out.push(row?);
         }
         let mut st = self.conn.prepare(
-            "SELECT d.worker_term, d.started_ms, COUNT(m.id), MAX(m.id)
+            "SELECT d.worker_term, d.started_ms, COUNT(m.id), MAX(m.id), s.socket
              FROM messages m JOIN dispatches d ON d.id = m.to_dispatch
+             LEFT JOIN dispatch_sockets s ON s.dispatch_id = d.id
              WHERE m.to_kind = 'worker' AND m.read_ms IS NULL AND d.state NOT IN ('lost','released') GROUP BY d.id",
         )?;
         for row in st.query_map([], |r| {
@@ -730,6 +815,7 @@ impl Db {
                 bound_ms: r.get(1)?,
                 unread: r.get::<_, i64>(2)? as u32,
                 max_unread_id: r.get(3)?,
+                socket: r.get(4)?,
             })
         })? {
             out.push(row?);
@@ -757,13 +843,38 @@ impl Db {
         Ok(())
     }
 
+    pub(crate) fn last_pointed_at(&self, socket: Option<&str>, term: u64) -> Result<Option<(i64, i64)>> {
+        let Some(socket) = socket else { return self.last_pointed(term) };
+        Ok(self.conn.query_row(
+            "SELECT last_pointed_msg_id, last_pointed_ms FROM socket_deliveries WHERE socket = ?1 AND term_id = ?2",
+            params![socket, term as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?)
+    }
+
+    pub(crate) fn record_pointed_at(&mut self, socket: Option<&str>, term: u64, msg_id: i64, now: i64) -> Result<()> {
+        let Some(socket) = socket else { return self.record_pointed(term, msg_id, now) };
+        self.conn.execute(
+            "INSERT INTO socket_deliveries (socket, term_id, last_pointed_msg_id, last_pointed_ms)
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT(socket, term_id)
+             DO UPDATE SET last_pointed_msg_id = ?3, last_pointed_ms = ?4",
+            params![socket, term as i64, msg_id, now],
+        )?;
+        Ok(())
+    }
+
     /// Everything the sidebar needs (live workers by terminal, coordinators by terminal).
     pub fn snapshot(&self) -> Result<OrchSnapshot> {
+        self.snapshot_with(|_, term| Some(term))
+    }
+
+    pub(crate) fn snapshot_with(&self, key_for: impl Fn(Option<&str>, u64) -> Option<u64>) -> Result<OrchSnapshot> {
         let mut snap = OrchSnapshot::default();
         let mut st = self.conn.prepare(
             "SELECT d.worker_term, t.title, d.id, d.state, d.started_ms,
-                    d.ended_ms, d.keep_open, d.auto_close_allowed_ms
+                    d.ended_ms, d.keep_open, d.auto_close_allowed_ms, s.socket
              FROM dispatches d JOIN tasks t ON t.id = d.task_id
+             LEFT JOIN dispatch_sockets s ON s.dispatch_id = d.id
              WHERE d.state NOT IN ('lost','released') ORDER BY d.started_ms, d.rowid",
         )?;
         for row in st.query_map([], |r| {
@@ -778,18 +889,25 @@ impl Db {
                     keep_open: r.get(6)?,
                     auto_close_allowed_ms: r.get(7)?,
                 },
+                r.get::<_, Option<String>>(8)?,
             ))
         })? {
-            let (term, info) = row?;
-            snap.workers.insert(term, info); // newest dispatch of a terminal wins
+            let (term, info, socket) = row?;
+            if let Some(key) = key_for(socket.as_deref(), term) {
+                snap.workers.insert(key, info); // newest dispatch of a terminal wins
+            }
         }
         let mut st = self.conn.prepare(
-            "SELECT r.coordinator_term, MAX(r.created_ms) FROM runs r
-             WHERE EXISTS (SELECT 1 FROM dispatches d WHERE d.run_id = r.id) GROUP BY r.coordinator_term",
+            "SELECT r.coordinator_term, r.created_ms, s.socket FROM runs r
+             LEFT JOIN run_sockets s ON s.run_id = r.id
+             WHERE EXISTS (SELECT 1 FROM dispatches d WHERE d.run_id = r.id)
+             ORDER BY r.created_ms, r.rowid",
         )?;
-        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)?)))? {
-            let (term, created) = row?;
-            snap.coordinators.insert(term, created);
+        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?)))? {
+            let (term, created, socket) = row?;
+            if let Some(key) = key_for(socket.as_deref(), term) {
+                snap.coordinators.insert(key, created);
+            }
         }
         Ok(snap)
     }
@@ -1298,5 +1416,92 @@ mod tests {
         all.dedup();
         assert_eq!(all.len(), unique, "a message was delivered twice");
         assert_eq!(all.len(), 30);
+    }
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    fn open() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("orchestration.db")).unwrap();
+        (dir, db)
+    }
+
+    fn scope<'a>(socket: &'a str, legacy: bool) -> Option<TerminalScope<'a>> {
+        Some(TerminalScope { socket, legacy })
+    }
+
+    #[test]
+    fn same_terminal_id_on_two_daemons_has_separate_runs() {
+        let (_dir, mut db) = open();
+        let a = db.ensure_run_at(1, 0, 100, scope("base-a", false)).unwrap();
+        let b = db.ensure_run_at(1, 0, 200, scope("base-b", false)).unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(db.ensure_run_at(1, 0, 300, scope("base-a", false)).unwrap().id, a.id, "idempotent per socket");
+        assert_eq!(db.run_for_coordinator_at(1, 0, scope("base-b", false)).unwrap().unwrap().id, b.id);
+        assert!(db.run_for_coordinator_at(1, 0, scope("base-c", false)).unwrap().is_none());
+    }
+
+    #[test]
+    fn rows_without_a_socket_belong_to_the_legacy_endpoint_only() {
+        let (_dir, mut db) = open();
+        let old = db.ensure_run(1, 0, 100).unwrap();
+        assert_eq!(db.run_for_coordinator_at(1, 0, scope("base", true)).unwrap().unwrap().id, old.id);
+        assert!(db.run_for_coordinator_at(1, 0, scope("base-new", false)).unwrap().is_none());
+        let (_task, d) = db
+            .create_task_with_dispatch(&old.id, "t_1", "d_1", "t", "s", 2, Agent::Codex, None, None, None, 150)
+            .unwrap();
+        assert_eq!(db.dispatch_for_worker_at(2, 0, scope("base", true)).unwrap().unwrap().id, d.id);
+        assert!(db.dispatch_for_worker_at(2, 0, scope("base-new", false)).unwrap().is_none());
+        assert_eq!(db.dispatch_socket(&d.id).unwrap(), None);
+    }
+
+    #[test]
+    fn dispatches_remember_the_daemon_that_owns_the_worker() {
+        let (_dir, mut db) = open();
+        let run = db.ensure_run_at(1, 0, 100, scope("base-new", false)).unwrap();
+        let (_task, d) = db
+            .create_task_with_dispatch_at(&run.id, "t_1", "d_1", "t", "s", 2, Agent::Codex, None, None, None, 150, Some("base-new"))
+            .unwrap();
+        assert_eq!(db.dispatch_socket(&d.id).unwrap().as_deref(), Some("base-new"));
+        assert!(db.dispatch_for_worker_at(2, 0, scope("base-new", false)).unwrap().is_some());
+        assert!(db.dispatch_for_worker_at(2, 0, scope("base", true)).unwrap().is_none());
+    }
+
+    #[test]
+    fn delivery_bookkeeping_is_per_socket() {
+        let (_dir, mut db) = open();
+        db.record_pointed_at(Some("base-a"), 1, 5, 1000).unwrap();
+        assert_eq!(db.last_pointed_at(Some("base-a"), 1).unwrap(), Some((5, 1000)));
+        assert_eq!(db.last_pointed_at(Some("base-b"), 1).unwrap(), None);
+        db.record_pointed_at(None, 1, 9, 2000).unwrap();
+        assert_eq!(db.last_pointed_at(None, 1).unwrap(), Some((9, 2000)));
+        assert_eq!(db.last_pointed_at(Some("base-a"), 1).unwrap(), Some((5, 1000)));
+    }
+
+    #[test]
+    fn snapshot_maps_terminals_through_their_socket_and_drops_unknown_ones() {
+        let (_dir, mut db) = open();
+        let a = db.ensure_run_at(1, 0, 100, scope("base-a", false)).unwrap();
+        db.create_task_with_dispatch_at(&a.id, "t_1", "d_1", "t", "s", 2, Agent::Codex, None, None, None, 150, Some("base-a")).unwrap();
+        let b = db.ensure_run_at(1, 0, 200, scope("base-b", false)).unwrap();
+        db.create_task_with_dispatch_at(&b.id, "t_2", "d_2", "t", "s", 2, Agent::Codex, None, None, None, 250, Some("base-b")).unwrap();
+        let snap = db
+            .snapshot_with(|socket, term| match socket {
+                Some("base-a") => Some(100 + term),
+                Some("base-b") => Some(200 + term),
+                _ => None,
+            })
+            .unwrap();
+        let mut workers: Vec<_> = snap.workers.keys().copied().collect();
+        workers.sort_unstable();
+        assert_eq!(workers, [102, 202]);
+        let mut coordinators: Vec<_> = snap.coordinators.keys().copied().collect();
+        coordinators.sort_unstable();
+        assert_eq!(coordinators, [101, 201]);
+        let none = db.snapshot_with(|_, _| None).unwrap();
+        assert!(none.workers.is_empty() && none.coordinators.is_empty());
     }
 }

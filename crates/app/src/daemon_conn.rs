@@ -45,6 +45,10 @@ enum End {
     Restart(crate::daemon_restart::Request),
 }
 
+pub(crate) fn should_retire(legacy: bool, listed: bool, terminal_count: usize) -> bool {
+    legacy && listed && terminal_count == 0
+}
+
 /// Finds the end of a daemon history replay without a protocol change. The daemon answers a
 /// connection's messages in order and replays history synchronously while handling
 /// `Subscribe`, so the reply to a `GetDaemonInfo` sent right after a `Subscribe` arrives after
@@ -88,20 +92,23 @@ pub(crate) fn classify_incompatible(msg: &ServerMsg, welcomed: bool) -> Option<C
     }
 }
 
-pub(crate) async fn run(conn: Conn, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
+pub(crate) async fn run(conn: Conn, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>, legacy: bool) {
     let mut backoff = BACKOFF_MIN;
     'connect: loop {
         match sich_daemon::connect(&conn.socket).await {
             Ok(stream) => {
                 let mut welcomed = false;
                 let framed = Framed::new(stream, frame_codec());
-                match session(&conn, framed, &mut cmd_rx, &mut welcomed).await {
+                match session_on(&conn, framed, &mut cmd_rx, &mut welcomed, legacy).await {
                     Ok(End::Closed) => return,
                     Ok(End::Incompatible) => {
                         // Stay put until the user confirms a restart.
                         while let Some(cmd) = cmd_rx.recv().await {
                             if let Cmd::Restart(request) = cmd {
                                 if conn.restart(request).await {
+                                    if legacy {
+                                        return;
+                                    }
                                     backoff = BACKOFF_MIN;
                                     while cmd_rx.try_recv().is_ok() {}
                                     continue 'connect;
@@ -121,6 +128,11 @@ pub(crate) async fn run(conn: Conn, mut cmd_rx: mpsc::UnboundedReceiver<Cmd>) {
                 if welcomed {
                     backoff = BACKOFF_MIN;
                 }
+            }
+            Err(e) if legacy && matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+                conn.state.lock().terminals.clear();
+                (conn.wake)();
+                return;
             }
             Err(e) => tracing::debug!("daemon connect failed: {e}"),
         }
@@ -148,16 +160,20 @@ async fn send<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut Stream<S>, msg: &C
     stream.send(encode(msg)?).await.context("send to daemon")
 }
 
-async fn session<S: AsyncRead + AsyncWrite + Unpin>(
+async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
     conn: &Conn,
     mut stream: Stream<S>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
     welcomed: &mut bool,
+    legacy: bool,
 ) -> anyhow::Result<End> {
     conn.state.lock().pending_worktrees.clear();
     send(
         &mut stream,
-        &ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: "sich-app".into() },
+        &ClientMsg::Hello {
+            proto_version: PROTO_VERSION,
+            client_name: if legacy { sich_daemon::generation::RETIRE_CLIENT } else { "sich-app" }.into(),
+        },
     )
     .await?;
 
@@ -196,6 +212,8 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                     msg => {
+                        let listed = matches!(msg, ServerMsg::Terminals(_));
+                        let removed = matches!(msg, ServerMsg::TerminalRemoved { .. });
                         let resume_id = match &msg {
                             ServerMsg::Output { id, bytes, .. } if !bytes.is_empty() => Some(*id),
                             ServerMsg::TerminalExited { id, .. } | ServerMsg::TerminalRemoved { id } => {
@@ -212,6 +230,12 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                         for out in conn.on_server(msg)? {
                             markers.on_sent(&out);
                             send(&mut stream, &out).await?;
+                        }
+                        let terminal_count = conn.state.lock().terminals.len();
+                        if should_retire(legacy, listed, terminal_count) {
+                            send(&mut stream, &ClientMsg::Shutdown).await?;
+                        } else if legacy && removed && terminal_count == 0 {
+                            send(&mut stream, &ClientMsg::ListTerminals).await?;
                         }
                         if let Some(id) = resume_id {
                             if let Some((_, bytes)) = resumes.remove(&id) {
@@ -322,14 +346,9 @@ impl Conn {
             st.daemon_build = None;
             st.synced = false;
             st.first_list_count = None;
-            st.auto_create = !session.has_terminals();
             st.restart_result = Some(RestartResult::Stopped(session));
         }
         (self.wake)();
-        if let Err(err) = crate::cli::ensure_daemon(&self.socket).await {
-            self.state.lock().last_error = Some(("restart daemon".into(), format!("{err:#}"), Instant::now()));
-            (self.wake)();
-        }
         true
     }
 
@@ -733,7 +752,7 @@ mod tests {
         let (local, peer) = tokio::io::duplex(8192);
         let mut peer = Framed::new(peer, frame_codec());
         let task = tokio::spawn(async move {
-            session(&conn, Framed::new(local, frame_codec()), &mut commands, &mut false).await
+            session_on(&conn, Framed::new(local, frame_codec()), &mut commands, &mut false, false).await
         });
 
         assert!(matches!(recv_client(&mut peer).await, ClientMsg::Hello { .. }));
@@ -792,5 +811,18 @@ mod tests {
         conn.reconcile(vec![info], &mut out);
         assert_eq!(conn.state.lock().first_list_count, Some(1));
         assert!(!out.iter().any(|m| matches!(m, ClientMsg::CreateTerminal { .. })));
+    }
+}
+
+#[cfg(test)]
+mod retire_tests {
+    use super::should_retire;
+
+    #[test]
+    fn only_a_listed_empty_legacy_daemon_is_retired() {
+        assert!(should_retire(true, true, 0));
+        assert!(!should_retire(true, true, 1), "never stop a daemon that still has terminals");
+        assert!(!should_retire(true, false, 0), "wait for the first terminal list");
+        assert!(!should_retire(false, true, 0), "the primary daemon stays up");
     }
 }

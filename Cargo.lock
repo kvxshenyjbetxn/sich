@@ -6210,6 +6210,7 @@ dependencies = [
  "dunce",
  "futures",
  "interprocess",
+ "libc",
  "parking_lot",
  "portable-pty",
  "serde",
