@@ -27,7 +27,7 @@ impl Request {
     pub async fn save_and_shutdown(self, socket: &str) -> anyhow::Result<Session> {
         timeout(IPC_TIMEOUT, async {
             let framed = Framed::new(sich_daemon::connect(socket).await?, frame_codec());
-            self.shutdown_peer(framed, crate::session::file_path().as_deref())
+            self.shutdown_peer(framed, crate::session::file_path().as_deref(), Some(socket))
                 .await
         })
         .await
@@ -38,6 +38,7 @@ impl Request {
         self,
         mut framed: Framed<S, LengthDelimitedCodec>,
         session_path: Option<&Path>,
+        socket: Option<&str>,
     ) -> anyhow::Result<Session> {
         let (version, pid) = match self.expected {
             ConnStatus::Connected { pid } => (Some(PROTO_VERSION), Some(pid)),
@@ -81,7 +82,7 @@ impl Request {
                 .session
                 .or_else(|| session_path.and_then(Session::load_from))
                 .unwrap_or_default();
-            if session.attach_scrollback(pid, &files) {
+            if session.attach_owner_scrollback(socket, pid, &files) {
                 session
                     .save_to(session_path.context("no config directory")?)
                     .context("save session before shutdown")?;
@@ -189,7 +190,7 @@ mod tests {
                 session: Some(session()),
             };
             request
-                .shutdown_peer(Framed::new(client, frame_codec()), Some(&client_path))
+                .shutdown_peer(Framed::new(client, frame_codec()), Some(&client_path), None)
                 .await
         });
         let mut peer = Framed::new(peer, frame_codec());
@@ -215,7 +216,7 @@ mod tests {
                 session: Some(session()),
             };
             request
-                .shutdown_peer(Framed::new(client, frame_codec()), Some(&path))
+                .shutdown_peer(Framed::new(client, frame_codec()), Some(&path), None)
                 .await
         });
         let mut peer = Framed::new(peer, frame_codec());
@@ -242,7 +243,7 @@ mod tests {
                 session: None,
             };
             request
-                .shutdown_peer(Framed::new(client, frame_codec()), Some(&path))
+                .shutdown_peer(Framed::new(client, frame_codec()), Some(&path), None)
                 .await
         });
         assert_eq!(

@@ -112,20 +112,6 @@ pub fn open_remove_project(
     );
 }
 
-pub fn open_restart_daemon(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
-    let lang = settings::language(cx);
-    open_confirm(
-        window,
-        cx,
-        tr(lang, Tr::RestartDaemon).to_string(),
-        tr(lang, Tr::RestartDaemonWarning).to_string(),
-        None,
-        tr(lang, Tr::RestartDaemon),
-        true,
-        Rc::new(move |_, cx| app.update(cx, |this, cx| this.request_daemon_restart(cx))),
-    );
-}
-
 pub fn open_incompatible_daemon(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         window.close_dialog(cx);

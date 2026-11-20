@@ -10,7 +10,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use sich_app::orch_ipc::Link;
 use sich_app::orch_worktree::WorktreeClient;
 use sich_orch::cli_parse::{self, Command, SpecSource, Target};
-use sich_orch::db::ReleaseMode;
+use sich_orch::db::{ReleaseMode, TerminalScope};
 use sich_orch::launch::{self, LaunchSpec};
 use sich_orch::model::*;
 use sich_orch::paths;
@@ -68,14 +68,37 @@ pub fn run(args: &[String]) -> i32 {
 struct Caller {
     term: TermId,
     socket: String,
+    base: String,
+    created_ms: i64,
 }
 
-fn caller() -> Result<Caller> {
+fn caller(rt: &tokio::runtime::Runtime) -> Result<Caller> {
     let term = std::env::var("SICH_TERM_ID")
         .ok()
         .and_then(|v| v.trim().parse::<TermId>().ok())
         .ok_or_else(|| anyhow!("this command only works inside a Sich terminal (SICH_TERM_ID is not set)"))?;
-    Ok(Caller { term, socket: sich_daemon::socket_name_from_env() })
+    let socket = sich_daemon::socket_name_from_env();
+    let entries = sich_daemon::generation::entries();
+    let base = sich_daemon::generation::base_for(&socket, &entries).to_owned();
+    let created_ms = rt.block_on(async {
+        let mut link = Link::connect(&socket, "sich-orch").await?;
+        link.list_terminals().await?.into_iter().find(|t| t.id == term && t.exited.is_none())
+            .map(|t| t.created_unix_ms as i64)
+            .with_context(|| format!("terminal {term} is not running on {socket}"))
+    })?;
+    Ok(Caller { term, socket, base, created_ms })
+}
+
+impl Caller {
+    fn scope(&self) -> Option<TerminalScope<'_>> {
+        Some(TerminalScope { socket: &self.socket, legacy: self.socket == self.base })
+    }
+
+    fn worker_socket(&self) -> String {
+        let entries = sich_daemon::generation::entries();
+        sich_daemon::generation::newest_compatible(&self.base, &entries)
+            .map_or_else(|| self.socket.clone(), |entry| entry.socket.clone())
+    }
 }
 
 fn open_db() -> Result<Db> {
@@ -84,15 +107,15 @@ fn open_db() -> Result<Db> {
 }
 
 fn execute(command: Command) -> Result<i32> {
-    let caller = caller()?;
+    // Multi-threaded: `release` drives I/O through `Handle::block_on`, which needs worker threads.
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
+    let caller = caller(&rt)?;
     match command {
         Command::Help => unreachable!("handled by run"),
         Command::Start { agent, model, effort, title, spec, worktree } => {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
             rt.block_on(start(&caller, StartArgs { agent, model, effort, title, spec, worktree }))
         }
         Command::Release { dispatch, remove_worktree } => {
-            let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
             release(&caller, &dispatch, remove_worktree, rt.handle())
         }
         Command::Check => check(&caller),
@@ -112,8 +135,11 @@ pub struct Identity {
     pub run: Option<Run>,
 }
 
-pub fn identify(db: &Db, term: TermId) -> Result<Identity> {
-    Ok(Identity { worker: db.dispatch_for_worker(term, 0)?, run: db.run_for_coordinator(term, 0)? })
+fn identify(db: &Db, caller: &Caller) -> Result<Identity> {
+    Ok(Identity {
+        worker: db.dispatch_for_worker_at(caller.term, caller.created_ms, caller.scope())?,
+        run: db.run_for_coordinator_at(caller.term, caller.created_ms, caller.scope())?,
+    })
 }
 
 fn require_worker(id: &Identity) -> Result<&Dispatch> {
@@ -134,7 +160,7 @@ fn exe_text() -> String {
 
 fn check(caller: &Caller) -> Result<i32> {
     let mut db = open_db()?;
-    let id = identify(&db, caller.term)?;
+    let id = identify(&db, caller)?;
     if id.worker.is_none() && id.run.is_none() {
         say("no new messages");
         return Ok(0);
@@ -154,7 +180,7 @@ fn check(caller: &Caller) -> Result<i32> {
 
 fn send(caller: &Caller, to: Target, body: String, subject: Option<String>) -> Result<i32> {
     let mut db = open_db()?;
-    let id = identify(&db, caller.term)?;
+    let id = identify(&db, caller)?;
     let now = paths::now_ms();
     match to {
         Target::Coordinator => {
@@ -205,7 +231,7 @@ fn send(caller: &Caller, to: Target, body: String, subject: Option<String>) -> R
 
 fn ask(caller: &Caller, question: String) -> Result<i32> {
     let mut db = open_db()?;
-    let id = identify(&db, caller.term)?;
+    let id = identify(&db, caller)?;
     let d = require_worker(&id)?;
     let sent = db.send_message(
         &NewMessage {
@@ -226,7 +252,7 @@ fn ask(caller: &Caller, question: String) -> Result<i32> {
 
 fn reply(caller: &Caller, message_id: i64, body: String) -> Result<i32> {
     let mut db = open_db()?;
-    let id = identify(&db, caller.term)?;
+    let id = identify(&db, caller)?;
     let run = require_run(&id)?;
     let question = db.get_message(message_id)?.ok_or_else(|| anyhow!("unknown message #{message_id}"))?;
     if question.run_id != run.id || question.to != Endpoint::Coordinator {
@@ -254,7 +280,7 @@ fn reply(caller: &Caller, message_id: i64, body: String) -> Result<i32> {
 
 fn done(caller: &Caller, outcome: Outcome, summary: String, report: Option<String>, files: Vec<String>) -> Result<i32> {
     let mut db = open_db()?;
-    let id = identify(&db, caller.term)?;
+    let id = identify(&db, caller)?;
     let d = require_worker(&id)?;
     let report = report.map(|r| std::path::absolute(&r).map_or(r, |p| p.to_string_lossy().into_owned()));
     match db.complete_dispatch(&d.id, outcome, &summary, report.as_deref(), &files, paths::now_ms())? {
@@ -270,7 +296,7 @@ fn done(caller: &Caller, outcome: Outcome, summary: String, report: Option<Strin
 
 fn list(caller: &Caller) -> Result<i32> {
     let db = open_db()?;
-    let id = identify(&db, caller.term)?;
+    let id = identify(&db, caller)?;
     let run = require_run(&id)?;
     let tasks = db.list_tasks(&run.id)?;
     let dispatches = db.list_dispatches(&run.id)?;
@@ -613,8 +639,12 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
         .find(|t| t.id == caller.term)
         .ok_or_else(|| anyhow!("terminal {} is not known to the daemon", caller.term))?;
 
+    let worker_socket = caller.worker_socket();
+    if worker_socket != caller.socket {
+        link = Link::connect(&worker_socket, "sich-orch").await?;
+    }
     let worker_worktree = if let Some(branch) = &args.worktree {
-        let mut client = WorktreeClient::connect(&caller.socket, Some(&dispatch_id)).await?;
+        let mut client = WorktreeClient::connect(&worker_socket, Some(&dispatch_id)).await?;
         let (project_id, project_root, worktree) = client.create(me, branch).await?;
         // Sich created it, so the sidebar shows it (external worktrees are hidden by default).
         if let Err(e) = crate::worktree_visibility::record_created(&project_root, &worktree.path) {
@@ -641,8 +671,8 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
         let worker_term = created.id;
         let now = paths::now_ms();
         let recorded = open_db().and_then(|mut db| {
-            let run = db.ensure_run(caller.term, me.created_unix_ms as i64, now)?;
-            db.create_task_with_dispatch(
+            let run = db.ensure_run_at(caller.term, me.created_unix_ms as i64, now, caller.scope())?;
+            db.create_task_with_dispatch_at(
                 &run.id,
                 &task_id,
                 &dispatch_id,
@@ -654,6 +684,7 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
                 args.effort.as_deref(),
                 owned,
                 now.max(created.created_unix_ms as i64),
+                Some(&worker_socket),
             )
         });
         if let Err(e) = recorded {
@@ -714,7 +745,7 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
 
 fn release(caller: &Caller, dispatch_id: &str, remove_worktree: bool, rt: &tokio::runtime::Handle) -> Result<i32> {
     let mut db = open_db()?;
-    let id = identify(&db, caller.term)?;
+    let id = identify(&db, caller)?;
     let run = require_run(&id)?;
     let d = db.get_dispatch(dispatch_id)?.ok_or_else(|| anyhow!("unknown dispatch {dispatch_id}"))?;
     if d.run_id != run.id {
@@ -725,10 +756,10 @@ fn release(caller: &Caller, dispatch_id: &str, remove_worktree: bool, rt: &tokio
     } else {
         None
     };
-    release_worker(&mut db, dispatch_id, ReleaseMode::Manual, &caller.socket, rt)?;
+    release_worker(&mut db, dispatch_id, ReleaseMode::Manual, &caller.base, rt)?;
     if let Some(wt) = worktree.filter(|wt| !wt.cleaned) {
         rt.block_on(async {
-            WorktreeClient::connect(&caller.socket, Some(&wt.identity)).await?.discard(wt).await
+            WorktreeClient::connect(&caller.worker_socket(), Some(&wt.identity)).await?.discard(wt).await
         }).context("worker terminal closed, but worktree removal failed")?;
         db.mark_worktree_cleaned(dispatch_id)?;
     }
@@ -745,6 +776,8 @@ pub(crate) fn release_worker(
     socket: &str,
     rt: &tokio::runtime::Handle,
 ) -> Result<()> {
+    let owner = db.dispatch_socket(dispatch_id)?;
+    let socket = owner.as_deref().unwrap_or(socket);
     db.release_dispatch(dispatch_id, paths::now_ms(), mode, |d| {
         rt.block_on(async {
             tokio::time::timeout(Duration::from_secs(4), close_worker_terminal(socket, d))
@@ -756,7 +789,13 @@ pub(crate) fn release_worker(
 }
 
 async fn close_worker_terminal(socket: &str, dispatch: &Dispatch) -> Result<()> {
-    let mut link = Link::connect(socket, "sich-orch").await?;
+    let mut link = match Link::connect(socket, "sich-orch").await {
+        Ok(link) => link,
+        Err(err) if err.downcast_ref::<std::io::Error>().is_some_and(|err| {
+            matches!(err.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused)
+        }) => return Ok(()),
+        Err(err) => return Err(err),
+    };
     let id = dispatch.worker_term;
     // The daemon can reuse terminal ids after a restart. Check on the connection that will send
     // KillTerminal so a stale dispatch cannot close an unrelated terminal in the new daemon.

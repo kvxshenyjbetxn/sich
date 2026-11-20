@@ -25,8 +25,11 @@ impl WorktreeClient {
         let deadline = Instant::now() + Duration::from_secs(10);
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             if let Some(ServerMsg::DaemonInfo { build_id, .. }) = link.recv(left).await? {
-                if build_id != crate::daemon_build_id() {
-                    bail!("restart the Sich daemon to use orchestration worktrees");
+                let registered = sich_daemon::generation::entries().iter().any(|entry| {
+                    entry.socket == socket && entry.daemon_build_id == build_id
+                });
+                if build_id != crate::daemon_build_id() && !registered {
+                    bail!("start the current Sich daemon to use orchestration worktrees");
                 }
                 return Ok(Self {
                     link,
@@ -177,6 +180,15 @@ fn still_owned(worktree: &OwnedWorktree) -> Result<bool> {
 
 /// One pass of the GUI watcher, called on its background executor.
 pub async fn cleanup_worktrees(db: &Db, socket: &str, enabled: bool) -> Result<()> {
+    cleanup_worktrees_with_terminals(db, socket, &[], enabled).await
+}
+
+pub async fn cleanup_worktrees_with_terminals(
+    db: &Db,
+    socket: &str,
+    other_terminals: &[TerminalInfo],
+    enabled: bool,
+) -> Result<()> {
     if !enabled {
         return Ok(());
     }
@@ -185,7 +197,8 @@ pub async fn cleanup_worktrees(db: &Db, socket: &str, enabled: bool) -> Result<(
         return Ok(());
     }
     let mut client = WorktreeClient::connect(socket, None).await?;
-    let terminals = client.link.list_terminals().await?;
+    let mut terminals = client.link.list_terminals().await?;
+    terminals.extend_from_slice(other_terminals);
     let projects = client.projects().await?;
     for dispatch in candidates {
         if let Err(e) =

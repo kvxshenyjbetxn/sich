@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sich_proto::{AgentKind, AgentState, GroupId, GroupInfo, ProjectId, ProjectInfo, TermId, TerminalInfo};
 
 use crate::workspace::{WorkspaceKey, Workspaces, same_path, terminals_in, workspace_exists};
+use crate::daemon_client::TerminalOwner;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -92,6 +93,9 @@ pub struct SavedWorkspace {
 #[serde(default)]
 pub struct SavedTerminal {
     pub id: Option<TermId>,
+    pub socket: Option<String>,
+    pub daemon_pid: Option<u32>,
+    pub created_ms: Option<u64>,
     pub cwd: PathBuf,
     #[serde(deserialize_with = "read_saved_agent")]
     pub agent: Option<SavedAgent>,
@@ -139,6 +143,7 @@ impl SavedTerminal {
             }),
             interrupted: agent.is_some_and(|a| a.state == AgentState::Working),
             scrollback: None,
+            ..Self::default()
         }
     }
 }
@@ -159,19 +164,48 @@ pub struct SavedWindow {
 
 impl Session {
     /// True when there is at least one terminal to bring back.
+    #[cfg(test)]
     pub fn has_terminals(&self) -> bool {
         self.workspaces.iter().any(|w| !w.terminals.is_empty())
     }
 
-    /// Associates filenames with the saved IDs only when this is their daemon.
-    pub fn attach_scrollback(&mut self, pid: Option<u32>, files: &[(TermId, String)]) -> bool {
-        if pid.is_none() || self.daemon_pid != pid {
-            return false;
-        }
+    /// Converts the in-memory terminal keys into identities that survive a GUI takeover.
+    pub(crate) fn record_owners(&mut self, owner_of: impl Fn(TermId) -> Option<TerminalOwner>) {
         for term in self.workspaces.iter_mut().flat_map(|w| &mut w.terminals) {
-            term.scrollback = files.iter().find(|(id, _)| Some(*id) == term.id).map(|(_, name)| name.clone());
+            let owner = term.id.and_then(&owner_of);
+            term.id = owner.as_ref().map(|owner| owner.id);
+            if let Some(owner) = owner {
+                term.socket = Some(owner.socket);
+                term.daemon_pid = Some(owner.pid);
+                term.created_ms = Some(owner.created_ms);
+            }
         }
-        true
+    }
+
+    /// Associates filenames with the saved IDs only when this is their daemon.
+    #[cfg(test)]
+    pub fn attach_scrollback(&mut self, pid: Option<u32>, files: &[(TermId, String)]) -> bool {
+        self.attach_owner_scrollback(None, pid, files)
+    }
+
+    pub(crate) fn attach_owner_scrollback(
+        &mut self,
+        socket: Option<&str>,
+        pid: Option<u32>,
+        files: &[(TermId, String)],
+    ) -> bool {
+        let mut matched = false;
+        for term in self.workspaces.iter_mut().flat_map(|w| &mut w.terminals) {
+            let belongs = match term.socket.as_deref() {
+                Some(owner) => Some(owner) == socket && term.daemon_pid == pid,
+                None => self.daemon_pid == pid,
+            };
+            if pid.is_some() && belongs {
+                matched = true;
+                term.scrollback = files.iter().find(|(id, _)| Some(*id) == term.id).map(|(_, name)| name.clone());
+            }
+        }
+        matched
     }
 
     /// Parses file contents; `None` for garbage.
@@ -208,6 +242,52 @@ impl Session {
         let path = file_path().ok_or_else(|| anyhow::anyhow!("no config directory"))?;
         self.save_to(&path)
     }
+}
+
+/// Resolve saved tabs to live GUI keys and leave only the terminals that need recreating.
+/// A live owner that no longer lists a terminal means it was closed since the last save.
+pub(crate) fn reattach(
+    mut session: Session,
+    attached: &[(TermId, TerminalOwner)],
+    peers: &[(String, u32)],
+    initial_count: usize,
+) -> (Session, Vec<(WorkspaceKey, TermId)>) {
+    let mut selected = Vec::new();
+    for workspace in &mut session.workspaces {
+        let mut missing = Vec::new();
+        let mut active = None;
+        for (index, term) in std::mem::take(&mut workspace.terminals).into_iter().enumerate() {
+            let (live, owner_alive) = match term.socket.as_deref() {
+                Some(socket) => {
+                    let owner_alive = peers.iter().any(|(name, pid)| name == socket && Some(*pid) == term.daemon_pid);
+                    let live = attached.iter().find(|(_, owner)| {
+                        owner.socket == socket && Some(owner.pid) == term.daemon_pid
+                            && Some(owner.id) == term.id && Some(owner.created_ms) == term.created_ms
+                    });
+                    (live, owner_alive)
+                }
+                None => {
+                    let live = attached.iter().find(|(_, owner)| {
+                        Some(owner.pid) == session.daemon_pid && Some(owner.id) == term.id
+                    });
+                    (live, initial_count > 0)
+                }
+            };
+            if let Some((key, _)) = live {
+                if workspace.active == Some(index) {
+                    selected.push((WorkspaceKey::of(workspace.worktree.as_deref()), *key));
+                }
+            } else if !owner_alive {
+                if workspace.active == Some(index) {
+                    active = Some(missing.len());
+                }
+                missing.push(term);
+            }
+        }
+        workspace.terminals = missing;
+        workspace.active = active;
+    }
+    (session, selected)
 }
 
 pub(crate) fn file_path() -> Option<PathBuf> {
@@ -869,5 +949,122 @@ mod tests {
         assert!(SavedWindow::from_bounds(-32000., -32000., 800., 600., false).is_none());
         assert!(SavedWindow::from_bounds(0., 0., 0., 0., false).is_none());
         assert!(SavedWindow::from_bounds(f32::NAN, 0., 800., 600., false).is_none());
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    fn owner(socket: &str, id: TermId, pid: u32, created_ms: u64) -> TerminalOwner {
+        TerminalOwner { socket: socket.into(), id, pid, created_ms }
+    }
+
+    fn saved(id: TermId, socket: Option<&str>, pid: Option<u32>, created: Option<u64>, cwd: &str) -> SavedTerminal {
+        SavedTerminal {
+            id: Some(id),
+            socket: socket.map(Into::into),
+            daemon_pid: pid,
+            created_ms: created,
+            cwd: PathBuf::from(cwd),
+            ..Default::default()
+        }
+    }
+
+    fn session(terminals: Vec<SavedTerminal>, active: Option<usize>) -> Session {
+        Session {
+            workspaces: vec![SavedWorkspace { worktree: None, terminals, active }],
+            ..Session::default()
+        }
+    }
+
+    #[test]
+    fn per_terminal_owner_survives_a_round_trip() {
+        let mut s = session(vec![saved(7, None, None, None, "a"), saved(8, None, None, None, "b")], Some(1));
+        s.record_owners(|key| match key {
+            7 => Some(owner("base-new", 1, 40, 1000)),
+            8 => Some(owner("base", 1, 30, 900)),
+            _ => None,
+        });
+        let back = Session::parse(&serde_json::to_string(&s).unwrap()).unwrap();
+        let terms = &back.workspaces[0].terminals;
+        assert_eq!((terms[0].id, terms[0].socket.as_deref(), terms[0].daemon_pid, terms[0].created_ms), (Some(1), Some("base-new"), Some(40), Some(1000)));
+        assert_eq!((terms[1].id, terms[1].socket.as_deref(), terms[1].daemon_pid, terms[1].created_ms), (Some(1), Some("base"), Some(30), Some(900)));
+    }
+
+    #[test]
+    fn terminals_without_a_live_owner_lose_their_wire_identity() {
+        let mut s = session(vec![saved(7, None, None, None, "a")], None);
+        s.record_owners(|_| None);
+        assert_eq!(s.workspaces[0].terminals[0].id, None);
+    }
+
+    #[test]
+    fn old_session_files_without_owners_still_parse() {
+        let s = Session::parse(r#"{"daemon_pid":5,"workspaces":[{"terminals":[{"id":3,"cwd":"x"}]}]}"#).unwrap();
+        let t = &s.workspaces[0].terminals[0];
+        assert_eq!((t.id, t.socket.as_deref(), t.daemon_pid, t.created_ms), (Some(3), None, None, None));
+    }
+
+    #[test]
+    fn scrollback_is_attached_only_by_the_owning_daemon() {
+        let mut s = session(
+            vec![saved(1, Some("base-new"), Some(40), Some(1), "a"), saved(1, Some("base"), Some(30), Some(1), "b")],
+            None,
+        );
+        let files = [(1, "1.bin".to_string())];
+        assert!(!s.attach_owner_scrollback(Some("base-new"), Some(41), &files), "same socket, other process");
+        assert!(!s.attach_owner_scrollback(None, Some(40), &files));
+        assert!(s.attach_owner_scrollback(Some("base"), Some(30), &files));
+        let terms = &s.workspaces[0].terminals;
+        assert_eq!(terms[0].scrollback, None);
+        assert_eq!(terms[1].scrollback.as_deref(), Some("1.bin"));
+    }
+
+    #[test]
+    fn reattach_matches_live_terminals_by_owner_and_recreates_the_rest() {
+        let s = session(
+            vec![
+                saved(1, Some("base-old"), Some(30), Some(100), "live-old"),
+                saved(1, Some("base-new"), Some(40), Some(200), "live-new"),
+                saved(2, Some("base-new"), Some(40), Some(300), "closed-meanwhile"),
+                saved(3, Some("base-gone"), Some(50), Some(400), "owner-died"),
+            ],
+            Some(1),
+        );
+        let attached = [(11, owner("base-old", 1, 30, 100)), (12, owner("base-new", 1, 40, 200))];
+        let peers = [("base-old".to_string(), 30), ("base-new".to_string(), 40)];
+        let (rest, selected) = reattach(s, &attached, &peers, 2);
+        let cwds: Vec<_> = rest.workspaces[0].terminals.iter().map(|t| t.cwd.to_str().unwrap()).collect();
+        assert_eq!(cwds, ["owner-died"], "a live owner without the terminal means it was closed");
+        assert_eq!(selected, vec![(WorkspaceKey::of(None), 12)]);
+        assert_eq!(rest.workspaces[0].active, None);
+    }
+
+    #[test]
+    fn reattach_ignores_a_reused_wire_id_of_another_incarnation() {
+        let s = session(vec![saved(1, Some("base"), Some(30), Some(100), "stale")], Some(0));
+        // Same socket and id, but created later: a different terminal.
+        let attached = [(11, owner("base", 1, 30, 999))];
+        let peers = [("base".to_string(), 30)];
+        let (rest, selected) = reattach(s, &attached, &peers, 1);
+        assert!(selected.is_empty());
+        assert!(rest.workspaces[0].terminals.is_empty());
+    }
+
+    #[test]
+    fn reattach_handles_sessions_saved_before_owners_were_recorded() {
+        let mut s = session(vec![saved(4, None, None, None, "a"), saved(5, None, None, None, "b")], Some(0));
+        s.daemon_pid = Some(30);
+        let attached = [(11, owner("base", 4, 30, 1))];
+        let (rest, selected) = reattach(s.clone(), &attached, &[("base".into(), 30)], 1);
+        assert_eq!(selected, vec![(WorkspaceKey::of(None), 11)]);
+        assert!(rest.workspaces[0].terminals.is_empty(), "a populated daemon is never refilled");
+
+        // The daemon had no terminals at all: everything is recreated and the active tab is kept.
+        let (rest, selected) = reattach(s, &[], &[("base-new".into(), 40)], 0);
+        assert!(selected.is_empty());
+        assert_eq!(rest.workspaces[0].terminals.len(), 2);
+        assert_eq!(rest.workspaces[0].active, Some(0));
     }
 }
