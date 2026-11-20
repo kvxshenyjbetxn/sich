@@ -3069,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "icongen"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "resvg 0.46.0",
 ]
@@ -6160,7 +6160,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "sich-app"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -6202,7 +6202,7 @@ dependencies = [
 
 [[package]]
 name = "sich-daemon"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -6226,7 +6226,7 @@ dependencies = [
 
 [[package]]
 name = "sich-git"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "dunce",
  "notify",
@@ -6236,7 +6236,7 @@ dependencies = [
 
 [[package]]
 name = "sich-hooks"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "base64",
@@ -6255,7 +6255,7 @@ dependencies = [
 
 [[package]]
 name = "sich-orch"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -6267,7 +6267,7 @@ dependencies = [
 
 [[package]]
 name = "sich-proto"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytes",
  "postcard",
@@ -6278,7 +6278,7 @@ dependencies = [
 
 [[package]]
 name = "sich-term"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "alacritty_terminal",
  "base64",
