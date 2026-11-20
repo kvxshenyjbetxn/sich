@@ -10,8 +10,9 @@ Claude Code itself runs inside a Sich terminal now: **never stop/kill the user's
 3. `cargo build --release` (works while Sich runs: GUI and daemon run from copies in
    `%LOCALAPPDATA%\sich\daemon-host\<build_id>\`, together with the bundled `conpty.dll` / `OpenConsole.exe`).
 4. `Start-Process E:\dev\program\sich\target\release\sich.exe` → the new GUI takes over the old one; the daemon stays.
-5. If daemon code changed (`crates/daemon`, `crates/proto`), the status bar shows "Перезапустити демон";
-   the user presses it when convenient (terminals restart, scrollback restored, agents `--resume`d).
+5. If daemon code changed (`crates/daemon`, `crates/proto`) without a PROTO_VERSION bump, nothing to do: the new GUI
+   starts a new daemon generation and the old daemon retires once empty. Only a PROTO_VERSION bump shows
+   "Перезапустити демон" (terminals restart, scrollback restored, agents `--resume`d).
 
 UI checks: launch an isolated instance (`SICH_SOCKET=sich-uitest`, `SICH_CONFIG_DIR`, `SICH_WORKTREE_ROOT`,
 `SICH_DATA_DIR`, `SICH_LOG_DIR` pointing into the session scratchpad, `SICH_NO_HOOK_INSTALL=1`) from
@@ -41,7 +42,7 @@ stopped freely (`sich daemon stop` with `SICH_SOCKET=sich-uitest`, then taskkill
 - Note: after a release, `target\release\sich.exe` is an official build (runs in place, locks the file). For dev
   use, run the normal `cargo build --release` again.
 
-## Task B — daemons side by side, like Orca (bigger; removes most "restart daemon" prompts)
+## Task B — DONE: daemons side by side, like Orca (see ARCHITECTURE.md, "Покоління демонів поруч")
 Orca never restarts its daemon on update: the old daemon keeps the old terminals, a new daemon generation serves
 new terminals, and an old daemon exits once it has no terminals (see the Orca research notes: versioned endpoint
 names, legacy adapters). Our version, scoped to **same PROTO_VERSION** (protocol bumps keep the current
