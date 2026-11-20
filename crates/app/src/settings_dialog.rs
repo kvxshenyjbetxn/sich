@@ -14,7 +14,7 @@ use crate::agent_hooks;
 use crate::app_view::AppView;
 use crate::update_status::{self, CheckStatus};
 use crate::updater;
-use crate::codex_hooks::{self, CodexStatus};
+use crate::codex_hooks;
 use crate::i18n::{Language, Tr, tr};
 use crate::orch_skill;
 use crate::settings;
@@ -130,7 +130,6 @@ fn agents_section(lang: Language, cx: &App) -> impl IntoElement {
     } else {
         codex_hooks::status_text(lang, &codex.status)
     };
-    let codex_installed = !codex.busy && matches!(codex.status, CodexStatus::Installed { .. });
     v_flex()
         .gap_1p5()
         .child(
@@ -165,9 +164,6 @@ fn agents_section(lang: Language, cx: &App) -> impl IntoElement {
                 .text_color(if codex_error { theme.danger } else { theme.muted_foreground })
                 .child(codex_status),
         )
-        .children(codex_installed.then(|| {
-            div().text_xs().text_color(theme.muted_foreground).child(tr(lang, Tr::CodexApproveHint))
-        }))
 }
 
 fn language_picker(current: Language, cx: &App) -> impl IntoElement {
