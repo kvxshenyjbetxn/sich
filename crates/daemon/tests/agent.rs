@@ -445,3 +445,44 @@ async fn omp_snapshots_follow_turns_and_old_clients_keep_decoding() {
     assert!(next_status(&mut viewer, id).await.is_none());
     stop(viewer, daemon).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn omp_roster_updates_do_not_reopen_a_read_parent_turn() {
+    let daemon = start_daemon("omp-roster");
+    let mut viewer = named_client(&daemon.name, &format!("test{}", sich_proto::OMP_CLIENT_SUFFIX)).await;
+    let mut old = client(&daemon.name).await;
+    let (shell, args) = idle_shell();
+    let id = create(&mut viewer, shell, &args).await;
+    let hook = |payload: &str| ClientMsg::AgentHook { term_id: id, agent: AgentKind::Omp, payload: payload.into() };
+
+    send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"done","message":"Parent done","finished_unix_ms":20,
+        "subagents":[{"id":"Scout.Check","state":"working","agent_type":"scout","description":"Check\n parser","since_unix_ms":10}]}"#)).await;
+    let done = next_status(&mut viewer, id).await.unwrap();
+    assert_eq!((done.state, done.unread), (AgentState::Done, true));
+    assert_eq!(done.subagents.len(), 1);
+    let child = &done.subagents[0];
+    assert_eq!((child.id.as_str(), child.state), ("Scout.Check", AgentState::Working));
+    assert_eq!(child.description.as_deref(), Some("Check parser"));
+    let old_done = next_status(&mut old, id).await.unwrap();
+    assert_eq!(old_done.kind, AgentKind::Other);
+    assert_eq!(old_done.subagents, done.subagents);
+    send(&mut viewer, ClientMsg::MarkSeen { id }).await;
+    assert!(!next_status(&mut viewer, id).await.unwrap().unread);
+
+    send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"done","message":"Parent done","finished_unix_ms":20,
+        "subagents":[{"id":"Scout.Check","state":"waiting","detail":"ask","since_unix_ms":10}]}"#)).await;
+    let waiting = next_status(&mut viewer, id).await.unwrap();
+    assert_eq!((waiting.state, waiting.unread, waiting.since_unix_ms), (AgentState::Done, false, done.since_unix_ms));
+    assert_eq!(waiting.message.as_deref(), Some("Parent done"));
+    let child = &waiting.subagents[0];
+    assert_eq!((child.state, child.detail.as_deref(), child.since_unix_ms), (AgentState::Waiting, Some("ask"), done.subagents[0].since_unix_ms));
+
+    send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"done","message":"Parent done","finished_unix_ms":20}"#)).await;
+    let empty = next_status(&mut viewer, id).await.unwrap();
+    assert!(empty.subagents.is_empty() && !empty.unread);
+
+    // A whole new turn can settle before its intermediate snapshot gets through the bridge.
+    send(&mut viewer, hook(r#"{"session_id":"omp-01","state":"done","message":"Parent done","finished_unix_ms":21}"#)).await;
+    assert!(next_status(&mut viewer, id).await.unwrap().unread);
+    stop(viewer, daemon).await;
+}
