@@ -366,6 +366,10 @@ async fn worker_worktree_lifecycle(h: &mut Harness, db: &mut Db, base: &Path) {
     let task = std::fs::read_to_string(task_file).unwrap();
     assert!(task.contains(&format!("{} on branch {branch} (based on base/coordinator)", wt.path.display())));
     assert!(h.orch_ok(coord, &["list"]).await.contains("branch=workers/parser"));
+    // Sich created the worktree, so the sidebar must show it (external worktrees are hidden).
+    let norm = |s: &str| s.replace("\\\\", "/").replace('\\', "/").to_lowercase();
+    let visible = std::fs::read_to_string(base.join("cfg/sich/worktrees.json")).expect("worktrees.json written");
+    assert!(norm(&visible).contains(&norm(&wt.path.to_string_lossy())), "{visible}");
     assert_eq!(wt.identity, dispatch_id);
     let other_id = if dispatch_id == "d_ffffffff" { "d_00000000" } else { "d_ffffffff" };
     let mut stranger = WorktreeClient::connect(&h.socket, Some(other_id)).await.unwrap();

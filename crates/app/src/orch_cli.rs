@@ -615,7 +615,11 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
 
     let worker_worktree = if let Some(branch) = &args.worktree {
         let mut client = WorktreeClient::connect(&caller.socket, Some(&dispatch_id)).await?;
-        let (project_id, worktree) = client.create(me, branch).await?;
+        let (project_id, project_root, worktree) = client.create(me, branch).await?;
+        // Sich created it, so the sidebar shows it (external worktrees are hidden by default).
+        if let Err(e) = crate::worktree_visibility::record_created(&project_root, &worktree.path) {
+            tracing::warn!("could not record the worker worktree as visible: {e:#}");
+        }
         Some((client, project_id, worktree))
     } else {
         None

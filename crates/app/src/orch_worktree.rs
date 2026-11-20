@@ -1,6 +1,6 @@
 //! The CLI and GUI watcher share the daemon client for orchestration-owned worktrees.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -64,7 +64,7 @@ impl WorktreeClient {
         &mut self,
         coordinator: &TerminalInfo,
         branch: &str,
-    ) -> Result<(ProjectId, OwnedWorktree)> {
+    ) -> Result<(ProjectId, PathBuf, OwnedWorktree)> {
         let path = coordinator.worktree.as_deref().unwrap_or(&coordinator.cwd);
         let root =
             worker_worktree::root(path).context("the coordinator must be in a Git worktree")?;
@@ -87,6 +87,11 @@ impl WorktreeClient {
                 "create_worktree",
             )
             .await?;
+        let project_root = projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.path.clone())
+            .context("the daemon did not list the coordinator's project")?;
         let path = projects
             .iter()
             .find(|p| p.id == project_id)
@@ -108,6 +113,7 @@ impl WorktreeClient {
         }
         Ok((
             project_id,
+            project_root,
             OwnedWorktree {
                 path,
                 branch: branch.into(),
