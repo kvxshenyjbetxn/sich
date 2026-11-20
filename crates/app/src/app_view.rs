@@ -41,8 +41,7 @@ use crate::update_status::{self, CheckStatus};
 use crate::updater;
 use crate::view::TerminalView;
 use crate::workspace::{
-    PendingWorktree, WorkspaceKey, Workspaces, cycle_id,
-    match_pending_worktree, restore_selection, terminals_in, workspace_exists,
+    WorkspaceKey, Workspaces, cycle_id, restore_selection, terminals_in, workspace_exists,
 };
 use crate::win_flash;
 use crate::win_show;
@@ -78,6 +77,7 @@ pub struct AppView {
     /// Saved workspace to restore when the first `Projects` update arrives.
     restore: Option<Option<PathBuf>>,
     pub(crate) projects: Vec<ProjectInfo>,
+    pub(crate) worktree_visibility: crate::worktree_visibility::Store,
     pub(crate) groups: Vec<GroupInfo>,
     /// Groups whose project list is collapsed (default: expanded).
     pub(crate) collapsed_groups: HashSet<GroupId>,
@@ -85,7 +85,6 @@ pub struct AppView {
     pub(crate) collapsed: HashSet<ProjectId>,
     /// Workspaces this window asked a terminal for; the matching new terminal gets activated.
     pending_creates: VecDeque<WorkspaceKey>,
-    pending_worktree: Option<PendingWorktree>,
     seen_projects_rev: u64,
     shown_error: Option<Instant>,
     /// Terminal that last received keyboard focus.
@@ -264,11 +263,11 @@ impl AppView {
                 None => settings::get(cx).last_workspace,
             }),
             projects: Vec::new(),
+            worktree_visibility: Default::default(),
             groups: Vec::new(),
             collapsed_groups: HashSet::new(),
             collapsed: HashSet::new(),
             pending_creates: VecDeque::new(),
-            pending_worktree: None,
             seen_projects_rev: 0,
             shown_error: None,
             focused: None,
@@ -706,7 +705,6 @@ impl AppView {
             self.restore_targets.clear();
             self.restore_started = None;
             self.pending_creates.clear();
-            self.pending_worktree = None;
             self.views.clear();
             self.ws.prune(&[]);
             self.attention.clear();
@@ -935,6 +933,9 @@ impl AppView {
                 }
             }
             GitPanelEvent::Refreshed(worktree) | GitPanelEvent::Mutated { worktree, .. } => {
+                if let GitPanelEvent::Mutated { branch_switched: true, .. } = event {
+                    self.client.refresh_projects();
+                }
                 if let Some(tabs) = self.diff_tabs.get(&WorkspaceKey::of(Some(worktree))) {
                     for tab in &tabs.tabs {
                         if let GitPanelEvent::Mutated { diff_tab: Some(id), error, .. } = event {
@@ -1041,7 +1042,6 @@ impl AppView {
         base: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        self.pending_worktree = Some(PendingWorktree { project_id, name: name.clone() });
         self.client.create_worktree(project_id, name, base);
         cx.notify();
     }
@@ -1101,12 +1101,11 @@ impl AppView {
         self.ws.prune(&ids);
         self.window_active = window.is_window_active();
 
-        let (rev, projects, groups) = self.client.projects_with_rev();
-        if rev != self.seen_projects_rev {
-            self.seen_projects_rev = rev;
-            self.projects = projects;
-            self.groups = groups;
-            self.on_projects_changed(cx);
+        if let Some(update) = self.client.projects_since(self.seen_projects_rev) {
+            self.seen_projects_rev = update.revision;
+            self.projects = update.projects;
+            self.groups = update.groups;
+            self.on_projects_changed(update.created_worktrees, cx);
         }
 
         self.maybe_restore_terminals(infos, cx);
@@ -1132,7 +1131,7 @@ impl AppView {
         self.touch_session(infos, cx);
     }
 
-    fn on_projects_changed(&mut self, cx: &mut Context<Self>) {
+    fn on_projects_changed(&mut self, created: Vec<(PathBuf, PathBuf)>, cx: &mut Context<Self>) {
         self.diff_tabs.retain(|key, _| workspace_exists(key, &self.projects));
         if let Some(saved) = self.restore.take() {
             if let Some(session) = &self.saved {
@@ -1145,13 +1144,19 @@ impl AppView {
         } else if !workspace_exists(&self.ws.selected, &self.projects) {
             self.set_selected(WorkspaceKey::Home, cx);
         }
-        if let Some(pending) = self.pending_worktree.clone() {
-            if let Some(path) = match_pending_worktree(&pending, &self.projects) {
-                self.pending_worktree = None;
-                let key = WorkspaceKey::Worktree(path);
+        for (root, path) in created {
+            if let Err(error) = crate::worktree_visibility::record_created(&root, &path) {
+                tracing::warn!("could not record created worktree: {error:#}");
+            }
+            let key = WorkspaceKey::Worktree(path);
+            if workspace_exists(&key, &self.projects) {
                 self.set_selected(key.clone(), cx);
                 self.new_terminal_in(key, cx);
             }
+        }
+        match crate::worktree_visibility::reconcile(&self.projects) {
+            Ok(store) => self.worktree_visibility = store,
+            Err(error) => tracing::warn!("could not load worktree preferences: {error:#}"),
         }
     }
 

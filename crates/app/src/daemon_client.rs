@@ -2,6 +2,7 @@
 //!
 //! The connection itself lives in `daemon_conn` (a tokio task with auto-reconnect).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::{daemon_conn, daemon_restart};
 use crate::session::Session;
+use crate::workspace::PendingWorktree;
 
 /// Wakes the UI thread (must be cheap and non-blocking).
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -55,6 +57,8 @@ pub(crate) struct ClientState {
     pub groups: Vec<GroupInfo>,
     /// Incremented on every `Projects` message (0 = none received yet).
     pub projects_rev: u64,
+    pub pending_worktrees: VecDeque<PendingWorktree>,
+    pub created_worktrees: Vec<(PathBuf, PathBuf)>,
     /// Last `OpFailed` from the daemon: (op, message, when).
     pub last_error: Option<(String, String, Instant)>,
 }
@@ -98,6 +102,13 @@ pub struct Snapshot {
     pub daemon_build: Option<String>,
 }
 
+pub(crate) struct ProjectsUpdate {
+    pub revision: u64,
+    pub projects: Vec<ProjectInfo>,
+    pub groups: Vec<GroupInfo>,
+    pub created_worktrees: Vec<(PathBuf, PathBuf)>,
+}
+
 #[derive(Clone)]
 pub struct DaemonClient {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
@@ -120,6 +131,8 @@ impl DaemonClient {
             projects: Vec::new(),
             groups: Vec::new(),
             projects_rev: 0,
+            pending_worktrees: VecDeque::new(),
+            created_worktrees: Vec::new(),
             last_error: None,
         }));
         let conn = daemon_conn::Conn {
@@ -156,10 +169,15 @@ impl DaemonClient {
         self.state.lock().first_list_count
     }
 
-    /// Projects plus the revision counter (changes on every `Projects` message).
-    pub fn projects_with_rev(&self) -> (u64, Vec<ProjectInfo>, Vec<GroupInfo>) {
-        let st = self.state.lock();
-        (st.projects_rev, st.projects.clone(), st.groups.clone())
+    /// Takes newly confirmed worktrees along with the latest Projects snapshot.
+    pub(crate) fn projects_since(&self, revision: u64) -> Option<ProjectsUpdate> {
+        let mut st = self.state.lock();
+        (st.projects_rev != revision).then(|| ProjectsUpdate {
+            revision: st.projects_rev,
+            projects: st.projects.clone(),
+            groups: st.groups.clone(),
+            created_worktrees: std::mem::take(&mut st.created_worktrees),
+        })
     }
 
     pub fn restart_daemon(&self, request: daemon_restart::Request) {

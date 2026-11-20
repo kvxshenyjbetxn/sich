@@ -24,6 +24,7 @@ use crate::group_dialogs;
 use crate::groups::{group_badge, group_projects};
 use crate::i18n::{Language, Tr, more_subagents, relative_time, tr};
 use crate::os;
+use crate::{notifications, settings, worktree_visibility};
 use crate::tab_bar::{entry_title, tab_label};
 use crate::workspace::{WorkspaceKey, same_path, terminals_in};
 use crate::worktree_dialogs::{self, WorktreeRef};
@@ -585,8 +586,17 @@ impl AppView {
                     .child(err.clone()),
             );
         } else if expanded {
-            for w in &project.worktrees {
+            let (shown, external) = worktree_visibility::sidebar_worktrees(
+                project,
+                &self.worktree_visibility,
+                settings::get(cx).show_external_worktrees,
+                self.ws.selected.path(),
+            );
+            for w in shown {
                 col = col.child(self.render_worktree(pid, w, base, snap, infos, lang, app, cx));
+            }
+            if !external.is_empty() {
+                col = col.child(external_worktree_row(project, external, base, lang, app, cx));
             }
         }
         col
@@ -885,6 +895,58 @@ impl AppView {
             )
             .into_any_element()
     }
+}
+
+fn external_worktree_row(
+    project: &ProjectInfo,
+    external: Vec<&WorktreeInfo>,
+    base: f32,
+    lang: Language,
+    app: &Entity<AppView>,
+    cx: &gpui_kit::App,
+) -> impl IntoElement + use<> {
+    let count = tr(lang, Tr::ExternalWorktreeCount).replace("{n}", &external.len().to_string());
+    let paths: Vec<_> = external.iter().map(|w| w.path.clone()).collect();
+    let action = |label: Tr, import: bool| {
+        let (app, root, paths) = (app.clone(), project.path.clone(), paths.clone());
+        Button::new((if import { "import-external" } else { "hide-external" }, project.id))
+            .ghost()
+            .xsmall()
+            .compact()
+            .label(tr(lang, label))
+            .on_click(move |_, window, cx| {
+                let paths: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+                match worktree_visibility::set_external(&root, &paths, import) {
+                    Ok(store) => app.update(cx, |this, cx| {
+                        this.worktree_visibility = store;
+                        cx.notify();
+                    }),
+                    Err(error) => notifications::show_error(error.to_string(), window, cx),
+                }
+            })
+    };
+    h_flex()
+        .h(px(ROW_H))
+        .min_w_0()
+        .pl(px(8. + base + INDENT))
+        .pr_2()
+        .gap_1()
+        .text_color(cx.theme().muted_foreground)
+        .child(
+            div()
+                .id(("external-worktree-count", project.id))
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .truncate()
+                .tooltip({
+                    let count = count.clone();
+                    move |window, cx| Tooltip::new(count.clone()).build(window, cx)
+                })
+                .child(count),
+        )
+        .child(action(Tr::ImportExternalWorktrees, true))
+        .child(action(Tr::HideExternalWorktrees, false))
 }
 
 #[cfg(test)]

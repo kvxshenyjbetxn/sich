@@ -20,6 +20,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use crate::daemon_client::{
     ClientState, Cmd, ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, RestartResult, RestoreData, TermEntry, Wake,
 };
+use crate::workspace::{PendingWorktree, match_pending_worktree};
 
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(2);
@@ -153,6 +154,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
     welcomed: &mut bool,
 ) -> anyhow::Result<End> {
+    conn.state.lock().pending_worktrees.clear();
     send(
         &mut stream,
         &ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: "sich-app".into() },
@@ -258,6 +260,7 @@ async fn session<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     Cmd::RemoveProject(id) => ClientMsg::RemoveProject { id },
                     Cmd::CreateWorktree { project_id, name, base } => {
+                        conn.state.lock().pending_worktrees.push_back(PendingWorktree { project_id, name: name.clone() });
                         ClientMsg::CreateWorktree { project_id, name, base }
                     }
                     Cmd::RemoveWorktree { project_id, path, force, delete_branch } => {
@@ -450,13 +453,27 @@ impl Conn {
             }
             ServerMsg::Projects { projects, groups } => {
                 let mut st = self.state.lock();
+                // CreateWorktree replies arrive in request order on this connection. Only a
+                // newly listed match can confirm success, including when other clients broadcast
+                // Projects while we are waiting for the daemon's response.
+                if let Some(request) = st.pending_worktrees.front()
+                    && match_pending_worktree(request, &st.projects).is_none()
+                    && let Some((root, path)) = match_pending_worktree(request, &projects)
+                {
+                    st.pending_worktrees.pop_front();
+                    st.created_worktrees.push((root.to_path_buf(), path.to_path_buf()));
+                }
                 st.projects = projects;
                 st.groups = groups;
                 st.projects_rev += 1;
             }
             ServerMsg::OpFailed { op, message } => {
                 tracing::warn!("daemon op `{op}` failed: {message}");
-                self.state.lock().last_error = Some((op, message, Instant::now()));
+                let mut st = self.state.lock();
+                if op == "create_worktree" {
+                    st.pending_worktrees.pop_front();
+                }
+                st.last_error = Some((op, message, Instant::now()));
             }
             ServerMsg::Error { message } => tracing::warn!("daemon error: {message}"),
         }
@@ -628,11 +645,59 @@ mod tests {
                 projects: Vec::new(),
                 groups: Vec::new(),
                 projects_rev: 0,
+                pending_worktrees: Default::default(),
+                created_worktrees: Vec::new(),
                 last_error: None,
             })),
             cmd_tx,
             wake: Arc::new(|| {}),
         }, rx)
+    }
+
+    #[test]
+    fn worktree_confirmations_survive_coalesced_projects_updates() {
+        use sich_proto::{ProjectInfo, WorktreeInfo};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let conn = test_conn(&rt, false);
+        let report = |names: &[&str]| ServerMsg::Projects {
+            projects: vec![ProjectInfo {
+                id: 7,
+                name: "repo".into(),
+                path: "/repo".into(),
+                is_git: true,
+                worktrees: names.iter().map(|name| WorktreeInfo {
+                    path: format!("/worktrees/{name}").into(),
+                    branch: Some((*name).into()),
+                    head: String::new(),
+                    is_main: false,
+                    dirty: false,
+                }).collect(),
+                error: None,
+                group: None,
+            }],
+            groups: Vec::new(),
+        };
+
+        conn.on_server(report(&["external"])).unwrap();
+        conn.state.lock().pending_worktrees.extend(
+            ["first", "external", "second"].map(|name| PendingWorktree {
+                project_id: 7, name: name.into(),
+            }),
+        );
+        conn.on_server(report(&["external", "first"])).unwrap();
+        conn.on_server(report(&["external", "first", "unrelated"])).unwrap();
+        conn.on_server(ServerMsg::OpFailed {
+            op: "create_worktree".into(), message: "already exists".into(),
+        }).unwrap();
+        conn.on_server(report(&["external", "first", "unrelated", "second"])).unwrap();
+
+        let state = conn.state.lock();
+        assert!(state.pending_worktrees.is_empty());
+        assert_eq!(state.created_worktrees, [
+            ("/repo".into(), "/worktrees/first".into()),
+            ("/repo".into(), "/worktrees/second".into()),
+        ]);
     }
 
     #[test]
