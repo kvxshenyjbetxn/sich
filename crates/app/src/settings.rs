@@ -23,6 +23,7 @@ pub struct AppSettings {
     pub theme: ThemeKind,
     /// Selected worktree path; `None` = Home.
     pub last_workspace: Option<PathBuf>,
+    pub show_external_worktrees: bool,
     /// Track Claude Code status through hooks in `~/.claude/settings.json`.
     pub agent_hooks: bool,
     /// Track Codex status through hooks in `~/.codex/hooks.json`.
@@ -48,6 +49,7 @@ impl Default for AppSettings {
             language: Language::from_locale(sys_locale::get_locale().as_deref()),
             theme: ThemeKind::Gray,
             last_workspace: None,
+            show_external_worktrees: false,
             agent_hooks: true,
             codex_hooks: true,
             orchestration_skill: true,
@@ -130,6 +132,15 @@ pub fn set_last_workspace(path: Option<PathBuf>, cx: &mut App) {
     }
     s.last_workspace = path;
     store(s, cx);
+}
+
+pub fn set_show_external_worktrees(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.show_external_worktrees != enabled {
+        s.show_external_worktrees = enabled;
+        store(s, cx);
+        cx.refresh_windows();
+    }
 }
 
 pub fn set_language(language: Language, cx: &mut App) {
@@ -382,5 +393,14 @@ mod tests {
         if let Some(p) = config_file("session.json") {
             assert!(p.ends_with(std::path::Path::new("sich").join("session.json")));
         }
+    }
+
+    #[test]
+    fn show_external_worktrees_defaults_to_false_and_round_trips() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!old.show_external_worktrees);
+        let enabled = AppSettings { show_external_worktrees: true, ..old };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&enabled).unwrap()).unwrap();
+        assert!(back.show_external_worktrees);
     }
 }

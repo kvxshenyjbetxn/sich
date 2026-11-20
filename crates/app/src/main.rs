@@ -46,6 +46,7 @@ mod win_flash;
 mod win_show;
 mod workspace;
 mod worktree_dialogs;
+pub mod worktree_visibility;
 
 use gpui_kit::{
     AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,

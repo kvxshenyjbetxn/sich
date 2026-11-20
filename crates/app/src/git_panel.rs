@@ -1,5 +1,6 @@
 //! Worktree-scoped Git state. The UI schedules work and applies generation-checked results.
 
+mod branch_picker;
 mod render;
 
 use std::collections::{HashMap, HashSet};
@@ -18,7 +19,7 @@ use gpui_kit::{
 use sich_git::compare::{CompareKey, CompareSource};
 use sich_git::scheduler::Scheduler;
 use sich_git::watch::{self, WatchSignal};
-use sich_git::{ChangeKind, Commit, FileChange, GitError, HISTORY_PAGE_SIZE, Repo, RepoStatus};
+use sich_git::{Branch, ChangeKind, Commit, FileChange, GitError, HISTORY_PAGE_SIZE, Repo, RepoStatus};
 
 use crate::i18n::{Language, Tr, tr};
 use crate::worktree_dialogs;
@@ -59,6 +60,7 @@ pub(crate) enum GitPanelEvent {
         worktree: PathBuf,
         diff_tab: Option<u64>,
         error: Option<String>,
+        branch_switched: bool,
     },
 }
 
@@ -91,6 +93,7 @@ enum Operation {
     Unstage,
     Discard,
     Commit,
+    SwitchBranch,
 }
 
 #[derive(Clone)]
@@ -105,6 +108,8 @@ enum Mutation {
     Discard(FileChange),
     DiscardAll,
     Commit { message: String, all: bool },
+    SwitchBranch(Branch),
+    CreateBranch(String),
 }
 
 impl Mutation {
@@ -117,6 +122,7 @@ impl Mutation {
             Self::Unstage(_) | Self::UnstageAll => Operation::Unstage,
             Self::Discard(_) | Self::DiscardAll => Operation::Discard,
             Self::Commit { .. } => Operation::Commit,
+            Self::SwitchBranch(_) | Self::CreateBranch(_) => Operation::SwitchBranch,
         }
     }
 
@@ -140,6 +146,8 @@ impl Mutation {
                 }
                 repo.commit(&message)
             }
+            Self::SwitchBranch(branch) => repo.switch_branch(&branch),
+            Self::CreateBranch(name) => repo.create_branch(&name),
         }
     }
 }
@@ -233,6 +241,7 @@ pub(crate) struct GitPanel {
     next_request: u64,
     drafts: HashMap<PathBuf, String>,
     input: Option<CommitInput>,
+    branch_picker: Option<Entity<branch_picker::BranchPicker>>,
     operations: HashMap<PathBuf, Operation>,
     scheduler: Scheduler,
     wake: Option<Sender<()>>,
@@ -259,6 +268,7 @@ impl GitPanel {
             next_request: 0,
             drafts: HashMap::new(),
             input: None,
+            branch_picker: None,
             operations: HashMap::new(),
             scheduler: Scheduler::default(),
             wake: None,
@@ -287,6 +297,7 @@ impl GitPanel {
         self.history = History::default();
         self.collapsed.clear();
         self.input = None;
+        self.branch_picker = None;
         self.scheduler = Scheduler::default();
 
         if let Some(path) = self.worktree.clone() {
@@ -538,6 +549,9 @@ impl GitPanel {
                     }
                 }
                 let error = result.err().map(|error| error.to_string());
+                if operation == Operation::SwitchBranch && let Some(error) = &error {
+                    crate::notifications::show_error(error.clone(), window, cx);
+                }
                 if panel.worktree.as_ref() == Some(&path) {
                     panel
                         .generation
@@ -546,12 +560,13 @@ impl GitPanel {
                 cx.emit(GitPanelEvent::Mutated {
                     worktree: path.clone(),
                     diff_tab,
+                    branch_switched: operation == Operation::SwitchBranch && error.is_none(),
                     error,
                 });
                 if panel.worktree.as_ref() == Some(&path) {
                     let history = matches!(
                         operation,
-                        Operation::Fetch | Operation::Pull | Operation::Push | Operation::Commit
+                        Operation::Fetch | Operation::Pull | Operation::Push | Operation::Commit | Operation::SwitchBranch
                     );
                     panel.request_refresh(history);
                 }

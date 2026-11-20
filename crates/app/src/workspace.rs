@@ -163,23 +163,27 @@ pub struct PendingWorktree {
     pub name: String,
 }
 
-/// Path of the new worktree once a Projects update contains it (non-main, path ends with `name`).
-pub fn match_pending_worktree(pending: &PendingWorktree, projects: &[ProjectInfo]) -> Option<PathBuf> {
+/// Project root and new worktree path once a Projects update contains the created branch and folder.
+pub fn match_pending_worktree<'a>(
+    pending: &PendingWorktree,
+    projects: &'a [ProjectInfo],
+) -> Option<(&'a Path, &'a Path)> {
     let want = normalize_str(&pending.name);
     if want.is_empty() {
         return None;
     }
     let sep = if cfg!(windows) { '\\' } else { '/' };
+    let suffix = format!("{sep}{want}");
     let project = projects.iter().find(|p| p.id == pending.project_id)?;
     project
         .worktrees
         .iter()
-        .filter(|w| !w.is_main)
+        .filter(|w| !w.is_main && w.branch.as_deref() == Some(&pending.name))
         .find(|w| {
             let have = normalize_path(&w.path);
-            have == want || have.ends_with(&format!("{sep}{want}"))
+            have == want || have.ends_with(&suffix)
         })
-        .map(|w| w.path.clone())
+        .map(|w| (project.path.as_path(), w.path.as_path()))
 }
 
 #[cfg(test)]
@@ -281,18 +285,22 @@ mod tests {
     #[test]
     fn pending_worktree_matches_by_folder_name() {
         let pending = PendingWorktree { project_id: 7, name: "feature-x".into() };
+        let named = |path, main| WorktreeInfo { branch: Some(pending.name.clone()), ..wt(path, main) };
         let projects = vec![
-            project(1, vec![wt("/w/feature-x", false)]),
-            project(7, vec![wt("/w/app", true), wt("/w/app-wt/feature-x/", false)]),
+            project(1, vec![named("/w/feature-x", false)]),
+            project(7, vec![wt("/w/app", true), named("/w/app-wt/feature-x/", false)]),
         ];
-        assert_eq!(match_pending_worktree(&pending, &projects), Some(PathBuf::from("/w/app-wt/feature-x/")));
+        assert_eq!(match_pending_worktree(&pending, &projects), Some((projects[1].path.as_path(), Path::new("/w/app-wt/feature-x/"))));
         let early = vec![project(7, vec![wt("/w/app", true)])];
         assert_eq!(match_pending_worktree(&pending, &early), None);
         // A partial folder-name match is not a match.
-        let other = vec![project(7, vec![wt("/w/old-feature-x", false)])];
+        let other = vec![project(7, vec![named("/w/old-feature-x", false)])];
         assert_eq!(match_pending_worktree(&pending, &other), None);
         // The main worktree is never the new one.
-        let main = vec![project(7, vec![wt("/w/feature-x", true)])];
+        let main = vec![project(7, vec![named("/w/feature-x", true)])];
         assert_eq!(match_pending_worktree(&pending, &main), None);
+        // A detached checkout in an unrelated directory with this basename is external.
+        let detached = vec![project(7, vec![wt("/other/feature-x", false)])];
+        assert_eq!(match_pending_worktree(&pending, &detached), None);
     }
 }

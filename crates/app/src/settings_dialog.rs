@@ -37,6 +37,12 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                     .pb_2()
                     .child(section(tr(lang, Tr::Language), language_picker(lang, cx), cx))
                     .child(section(tr(lang, Tr::Theme), theme_cards(lang, cx), cx))
+                    .child(
+                        Switch::new("show-external-worktrees")
+                            .checked(settings::get(cx).show_external_worktrees)
+                            .label(tr(lang, Tr::ShowExternalWorktrees))
+                            .on_click(|checked, _, cx| settings::set_show_external_worktrees(*checked, cx)),
+                    )
                     .child(section(tr(lang, Tr::AgentsSection), agents_section(lang, cx), cx))
                     .child(
                         Switch::new("resume-agents-on-restore")

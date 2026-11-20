@@ -180,19 +180,7 @@ impl GitPanel {
             .px_2()
             .gap_1()
             .child(Icon::new(Ic::GitBranch).size(px(14.)).flex_shrink_0())
-            .child(
-                div()
-                    .id("git-branch")
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .text_size(px(12.5))
-                    .tooltip({
-                        let tooltip = branch.clone();
-                        move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx)
-                    })
-                    .child(branch),
-            )
+            .child(self.branch_trigger(branch, lang, cx))
             .children(
                 [(status.ahead, '↑'), (status.behind, '↓')]
                     .into_iter()
