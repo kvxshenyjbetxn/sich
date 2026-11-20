@@ -236,7 +236,7 @@ mod tests {
         let mut db = Db::open(&path).unwrap();
         let run = db.ensure_run(1, 500, 600).unwrap();
         let (_, dispatch) = db
-            .create_task_with_dispatch(&run.id, "t_00000001", "d_00000001", "Fix parser", "spec", 2, Agent::Claude, None, None, 700)
+            .create_task_with_dispatch(&run.id, "t_00000001", "d_00000001", "Fix parser", "spec", 2, Agent::Claude, None, None, None, 700)
             .unwrap();
         db.mark_working(&dispatch.id).unwrap();
         let dispatch = db.get_dispatch(&dispatch.id).unwrap().unwrap();

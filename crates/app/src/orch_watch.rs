@@ -14,6 +14,7 @@ use crate::i18n::{Language, Tr, tr};
 
 /// How often the watcher looks at the database and the terminals.
 pub const TICK: Duration = Duration::from_millis(500);
+pub const WORKTREE_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 /// Pause between the pasted pointer text and the Enter that submits it.
 pub const ENTER_DELAY: Duration = Duration::from_millis(300);
 
@@ -83,6 +84,14 @@ pub fn release_due(dispatches: &[String], socket: &str, rt: &tokio::runtime::Han
         if let Err(e) = crate::orch_cli::release_worker(&mut db, dispatch, ReleaseMode::AutoClose, socket, rt) {
             tracing::warn!("could not auto-close worker {dispatch}: {e:#}");
         }
+    }
+}
+
+pub fn cleanup_worktrees(socket: &str, rt: &tokio::runtime::Handle) {
+    let Some(path) = sich_orch::paths::db_path().filter(|p| p.is_file()) else { return };
+    let result = Db::open(&path).and_then(|db| rt.block_on(sich_app::orch_worktree::cleanup_worktrees(&db, socket, true)));
+    if let Err(e) = result {
+        tracing::warn!("could not clean up orchestration worktrees: {e:#}");
     }
 }
 

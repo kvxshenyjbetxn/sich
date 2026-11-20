@@ -40,6 +40,7 @@ pub struct AppSettings {
     pub(crate) diff_wrap_lines: bool,
     /// Close finished orchestration workers after their grace period.
     pub orch_auto_close_workers: bool,
+    pub orch_cleanup_worktrees: bool,
 }
 
 impl Default for AppSettings {
@@ -58,6 +59,7 @@ impl Default for AppSettings {
             diff_mode: DiffMode::default(),
             diff_wrap_lines: false,
             orch_auto_close_workers: true,
+            orch_cleanup_worktrees: true,
         }
     }
 }
@@ -183,6 +185,14 @@ pub fn set_orch_auto_close_workers(enabled: bool, cx: &mut App) {
         s.orch_auto_close_workers = enabled;
         store(s, cx);
         cx.refresh_windows();
+    }
+}
+
+pub fn set_orch_cleanup_worktrees(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.orch_cleanup_worktrees != enabled {
+        s.orch_cleanup_worktrees = enabled;
+        store(s, cx);
     }
 }
 
@@ -338,6 +348,16 @@ mod tests {
         let off = AppSettings { orch_auto_close_workers: false, ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!back.orch_auto_close_workers);
+    }
+
+    #[test]
+    fn orch_cleanup_worktrees_defaults_to_true_and_round_trips() {
+        let old: AppSettings = serde_json::from_str(r#"{"orch_auto_close_workers":false}"#).unwrap();
+        assert!(old.orch_cleanup_worktrees);
+        assert!(AppSettings::default().orch_cleanup_worktrees);
+        let off = AppSettings { orch_cleanup_worktrees: false, ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.orch_cleanup_worktrees);
     }
 
     #[test]

@@ -14,6 +14,7 @@ pub mod scrollback;
 mod server;
 mod shell;
 mod terminal;
+pub mod worker_worktree;
 
 use std::path::PathBuf;
 use std::time::Duration;

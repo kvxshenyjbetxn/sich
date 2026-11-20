@@ -1,6 +1,7 @@
 //! Plain data types shared by the database, the CLI and the GUI watcher.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::auto_close::{self, AutoClose};
 
@@ -92,6 +93,17 @@ pub struct Dispatch {
     pub ended_ms: Option<i64>,
     pub keep_open: bool,
     pub auto_close_allowed_ms: Option<i64>,
+    pub owned_worktree: Option<OwnedWorktree>,
+}
+
+/// A worktree created for this dispatch. The identity lives in its Git administrative directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedWorktree {
+    pub path: PathBuf,
+    pub branch: String,
+    pub base_branch: String,
+    pub identity: String,
+    pub cleaned: bool,
 }
 
 impl Dispatch {

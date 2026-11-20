@@ -11,6 +11,10 @@ pub type GitResult<T> = Result<T, String>;
 fn command(dir: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C").arg(dir).env("GIT_TERMINAL_PROMPT", "0");
+    for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX"] {
+        cmd.env_remove(key);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;

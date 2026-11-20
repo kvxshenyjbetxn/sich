@@ -24,6 +24,7 @@ pub enum Command {
         effort: Option<String>,
         title: Option<String>,
         spec: SpecSource,
+        worktree: Option<String>,
     },
     Send { to: Target, body: String, subject: Option<String> },
     Check,
@@ -31,23 +32,23 @@ pub enum Command {
     Reply { id: i64, body: String },
     Done { outcome: Outcome, summary: String, report: Option<String>, files: Vec<String> },
     List,
-    Release { dispatch: String },
+    Release { dispatch: String, remove_worktree: bool },
     Help,
 }
 
 pub const USAGE: &str = "\
 usage: sich orch <command>
-  start --agent claude|codex [--model M] [--effort E] [--title T] (--spec TEXT | --spec-file PATH)
+  start --agent claude|codex [--model M] [--effort E] [--title T] [--worktree NAME] (--spec TEXT | --spec-file PATH)
   send --to dispatch:<id>|coordinator --body TEXT [--subject S]
   check
   ask --question TEXT
   reply --id MSG_ID --body TEXT
   done --outcome succeeded|failed --summary TEXT [--report PATH] [--files a,b]
   list
-  release --dispatch ID";
+  release --dispatch ID [--remove-worktree]";
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["keep-open"];
+const SWITCHES: &[&str] = &["keep-open", "remove-worktree"];
 
 struct Flags {
     values: HashMap<String, String>,
@@ -66,8 +67,11 @@ impl Flags {
                 Some((n, v)) => (n, Some(v.to_string())),
                 None => (flag, None),
             };
-            if !allowed.contains(&name) && !SWITCHES.contains(&name) {
+            if !allowed.contains(&name) && name != "keep-open" {
                 return Err(format!("unknown option `--{name}`"));
+            }
+            if name == "remove-worktree" && inline.is_some() {
+                return Err("`--remove-worktree` takes no value".into());
             }
             let value = if SWITCHES.contains(&name) {
                 inline.unwrap_or_else(|| "true".into())
@@ -99,12 +103,23 @@ impl Flags {
     }
 }
 
+fn valid_worktree_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name != "HEAD"
+        && !name.starts_with('-')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && name.bytes().all(|c| c.is_ascii_alphanumeric() || b"-_/.".contains(&c))
+        && name.split('/').all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
 pub fn parse(args: &[String]) -> Result<Command, String> {
     let Some((cmd, rest)) = args.split_first() else { return Ok(Command::Help) };
     match cmd.as_str() {
         "help" | "--help" | "-h" => Ok(Command::Help),
         "start" => {
-            let f = Flags::parse(rest, &["agent", "model", "effort", "title", "spec", "spec-file"])?;
+            let f = Flags::parse(rest, &["agent", "model", "effort", "title", "spec", "spec-file", "worktree"])?;
             let agent_text = f.require("agent")?;
             let agent = Agent::parse(&agent_text)
                 .ok_or_else(|| format!("unknown agent `{agent_text}` (use claude or codex)"))?;
@@ -121,7 +136,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                     return Err("`--keep-open` takes no value (workers are always kept open)".into());
                 }
             }
-            Ok(Command::Start { agent, model: f.get("model"), effort: f.get("effort"), title: f.get("title"), spec })
+            let worktree = f.get("worktree");
+            if let Some(name) = &worktree
+                && !valid_worktree_name(name)
+            {
+                return Err(format!("invalid worktree branch name `{name}`"));
+            }
+            Ok(Command::Start { agent, model: f.get("model"), effort: f.get("effort"), title: f.get("title"), spec, worktree })
         }
         "send" => {
             let f = Flags::parse(rest, &["to", "body", "subject"])?;
@@ -173,13 +194,13 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::List)
         }
         "release" => {
-            let f = Flags::parse(rest, &["dispatch"])?;
+            let f = Flags::parse(rest, &["dispatch", "remove-worktree"])?;
             let dispatch = f.require("dispatch")?;
             let dispatch = dispatch.strip_prefix("dispatch:").unwrap_or(&dispatch).to_string();
             if !crate::paths::is_id('d', &dispatch) {
                 return Err(format!("invalid dispatch id `{dispatch}`"));
             }
-            Ok(Command::Release { dispatch })
+            Ok(Command::Release { dispatch, remove_worktree: f.get("remove-worktree").is_some() })
         }
         other => Err(format!("unknown orch command `{other}`")),
     }
@@ -227,6 +248,7 @@ mod tests {
                 effort: Some("high".into()),
                 title: Some("Fix it".into()),
                 spec: SpecSource::Text("do the thing".into()),
+                worktree: None,
             }
         );
     }
@@ -242,6 +264,7 @@ mod tests {
                 effort: None,
                 title: None,
                 spec: SpecSource::File("C:/t/spec.md".into()),
+                worktree: None,
             }
         );
     }
@@ -257,6 +280,18 @@ mod tests {
         assert!(p("start --agent claude --spec").unwrap_err().contains("needs a value"));
         assert!(p("start --agent claude --agent codex --spec x").unwrap_err().contains("twice"));
         assert!(p("start --agent claude --spec x stray").unwrap_err().contains("unexpected argument"));
+    }
+
+    #[test]
+    fn worktree_names_follow_git_branch_rules() {
+        for name in ["worker", "team/Worker-1.2_alpha", "a/b/c", &"x".repeat(64)] {
+            let cmd = p(&format!("start --agent codex --spec task --worktree {name}")).unwrap();
+            assert!(matches!(cmd, Command::Start { worktree: Some(branch), .. } if branch == name));
+        }
+        for name in ["", "-bad", "x..y", "/x", "x/", "x//y", ".hidden", "a/.hidden", "x.lock/y", "x.", "HEAD",
+            "a\\b", "with space", "a:b", "a~b", "дані", &"x".repeat(65)] {
+            assert!(p(&format!("start --agent codex --spec task --worktree \"{name}\"")).is_err(), "{name}");
+        }
     }
 
     #[test]
@@ -319,10 +354,20 @@ mod tests {
 
     #[test]
     fn release_accepts_both_id_forms() {
-        let want = Command::Release { dispatch: "d_0a1b2c3d".into() };
+        let want = Command::Release { dispatch: "d_0a1b2c3d".into(), remove_worktree: false };
         assert_eq!(p("release --dispatch d_0a1b2c3d").unwrap(), want);
         assert_eq!(p("release --dispatch dispatch:d_0a1b2c3d").unwrap(), want);
         assert!(p("release --dispatch t_0a1b2c3d").is_err());
+    }
+
+    #[test]
+    fn remove_worktree_switch_only_applies_to_release() {
+        assert_eq!(
+            p("release --dispatch d_0a1b2c3d --remove-worktree").unwrap(),
+            Command::Release { dispatch: "d_0a1b2c3d".into(), remove_worktree: true }
+        );
+        assert!(p("release --dispatch d_0a1b2c3d --remove-worktree=false").is_err());
+        assert!(p("start --agent codex --spec task --remove-worktree").is_err());
     }
 
     #[test]

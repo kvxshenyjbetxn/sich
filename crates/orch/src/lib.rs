@@ -13,6 +13,7 @@ pub mod model;
 pub mod paths;
 pub mod preamble;
 pub mod watch;
+pub mod worktree;
 
 pub use db::Db;
 pub use model::*;

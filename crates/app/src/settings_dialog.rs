@@ -51,6 +51,12 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                             .on_click(|checked, _, cx| settings::set_orch_auto_close_workers(*checked, cx)),
                     )
                     .child(
+                        Switch::new("orch-cleanup-worktrees")
+                            .checked(settings::get(cx).orch_cleanup_worktrees)
+                            .label(tr(lang, Tr::OrchCleanupWorktrees))
+                            .on_click(|checked, _, cx| settings::set_orch_cleanup_worktrees(*checked, cx)),
+                    )
+                    .child(
                         Switch::new("orchestration-skill")
                             .checked(settings::get(cx).orchestration_skill)
                             .label(tr(lang, Tr::OrchestrationSkill))

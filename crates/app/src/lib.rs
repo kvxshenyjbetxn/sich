@@ -1,3 +1,6 @@
+pub mod orch_ipc;
+pub mod orch_worktree;
+
 /// Identifier shared by the GUI and daemon compiled in this build (changes on every rebuild).
 pub fn build_id() -> &'static str {
     env!("SICH_BUILD_ID")

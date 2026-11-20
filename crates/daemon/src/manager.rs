@@ -20,6 +20,8 @@ pub struct Manager {
     pub socket_name: String,
     pub build_id: String,
     pub started_unix_ms: u64,
+    /// Serializes worktree removal with terminal creation in a project.
+    pub(crate) worktree_operations: tokio::sync::Mutex<()>,
     scrollback_lock: Mutex<()>,
     terminals: Mutex<BTreeMap<TermId, Arc<Terminal>>>,
     next_term: AtomicU64,
@@ -34,6 +36,7 @@ impl Manager {
             socket_name: socket_name.to_string(),
             build_id: build_id.into(),
             started_unix_ms: crate::terminal::now_ms(),
+            worktree_operations: tokio::sync::Mutex::new(()),
             scrollback_lock: Mutex::new(()),
             shutdown: CancellationToken::new(),
             terminals: Mutex::new(BTreeMap::new()),
@@ -60,6 +63,7 @@ impl Manager {
         req: SpawnRequest,
         before_broadcast: impl FnOnce(&TerminalInfo),
     ) -> anyhow::Result<()> {
+        let _operation = self.worktree_operations.lock().await;
         let me = self.clone();
         let term = tokio::task::spawn_blocking(move || {
             let id = me.next_term.fetch_add(1, Ordering::Relaxed);

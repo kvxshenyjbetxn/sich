@@ -102,6 +102,7 @@ pub enum Tr {
     OrchCoordinator,
     OrchWorker,
     OrchAutoCloseWorkers,
+    OrchCleanupWorktrees,
     OrchTemporary,
     OrchAutoCloseRunning,
     OrchAutoCloseFinished,
@@ -252,6 +253,7 @@ impl Tr {
         Tr::OrchCoordinator,
         Tr::OrchWorker,
         Tr::OrchAutoCloseWorkers,
+        Tr::OrchCleanupWorktrees,
         Tr::OrchTemporary,
         Tr::OrchAutoCloseRunning,
         Tr::OrchAutoCloseFinished,
@@ -867,6 +869,11 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Uk => "Автоматично закривати завершених воркерів (через 2 хв, якщо не натиснути «Залишити відкритим»)",
             Ru => "Автоматически закрывать завершённых воркеров (через 2 мин, если не нажать «Оставить открытым»)",
             En => "Auto-close finished workers (after 2 minutes unless you choose Keep open)",
+        },
+        Tr::OrchCleanupWorktrees => match lang {
+            Uk => "Видаляти worktree воркерів після злиття їхньої гілки",
+            Ru => "Удалять worktree воркеров после слияния их ветки",
+            En => "Remove worker worktrees after their branch is merged",
         },
         Tr::OrchTemporary => match lang {
             Uk => "Тимчасовий",

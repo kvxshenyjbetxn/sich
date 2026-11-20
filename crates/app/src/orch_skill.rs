@@ -12,8 +12,9 @@ use crate::agent_hooks::auto_install_here;
 use crate::settings;
 
 pub const SKILL_DIR: &str = "sich-orchestration";
-pub const MARKER: &str = "<!-- sich:managed sich-orchestration-skill v2 -->";
-const PREVIOUS_MARKER: &str = "<!-- sich:managed sich-orchestration-skill v1 -->";
+pub const MARKER: &str = "<!-- sich:managed sich-orchestration-skill v3 -->";
+const PREVIOUS_MARKER: &str = "<!-- sich:managed sich-orchestration-skill v2 -->";
+const ORIGINAL_MARKER: &str = "<!-- sich:managed sich-orchestration-skill v1 -->";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallOutcome {
@@ -36,7 +37,7 @@ fn skill_file(claude_dir: &Path) -> PathBuf {
 }
 
 fn is_managed(content: &str) -> bool {
-    content.contains(MARKER) || content.contains(PREVIOUS_MARKER)
+    [MARKER, PREVIOUS_MARKER, ORIGINAL_MARKER].iter().any(|marker| content.contains(marker))
 }
 
 /// The exe as a quoted command word that works in bash and (after `&`) PowerShell.
@@ -65,12 +66,12 @@ All commands are `{x} orch <command>`. In PowerShell write `& {x} orch <command>
 
 ## Commands
 
-- `start --agent claude|codex [--model M] [--effort E] [--title T] (--spec TEXT | --spec-file PATH)`: opens a new terminal in the same project, starts the agent and gives it the task. Prints `dispatch=<id> task=<id> terminal=<n> state=working` when the worker is running. Use `--spec-file` for anything longer than a sentence.
+- `start --agent claude|codex [--model M] [--effort E] [--title T] [--worktree <name>] (--spec TEXT | --spec-file PATH)`: opens a new terminal in the same project, starts the agent and gives it the task. Prints `dispatch=<id> task=<id> terminal=<n> state=working` when the worker is running. Use `--spec-file` for anything longer than a sentence.
 - `send --to dispatch:<id> --body TEXT [--subject S]`: a follow-up or guidance for a worker. A worker that already reported starts working again.
 - `check`: prints and consumes the mail addressed to you (questions, results, escalations).
 - `reply --id <message id> --body TEXT`: answers a worker's question.
-- `list`: your tasks and workers with their states.
-- `release --dispatch <id>`: closes a worker early, for example if it is stuck or no longer needed. It is refused if the user chose Keep open.
+- `list`: your tasks and workers with their states and worktree branches.
+- `release --dispatch <id> [--remove-worktree]`: closes a worker early, for example if it is stuck or no longer needed. It is refused if the user chose Keep open.
 
 Workers use `ask`, `send --to coordinator`, `done` and `check` themselves; their instructions are in the task file Sich writes for them.
 
@@ -85,6 +86,12 @@ Workers use `ask`, `send --to coordinator`, `done` and `check` themselves; their
    - an escalation (a worker stopped without reporting, or its terminal exited): look at `list`, then re-brief the worker with `send`, start a replacement or tell the user.
 5. For follow-up work on the same worker use `send --to dispatch:<id>`; it reopens a finished worker.
 6. When auto-close is enabled, finished workers close automatically two minutes after `worker_done`. Reserve `release` for workers you need to close early.
+
+## Worker worktrees
+
+- Use `--worktree <name>` for every task that changes code when more than one worker may edit the same repository at the same time. Give each worker its own worktree. Never put two workers in one worktree.
+- After `worker_done`, review the worker's commits and merge its branch into your own branch. Once the worker is closed, Sich automatically removes the merged worktree and branch if the worktree is clean and cleanup is enabled.
+- Use `release --dispatch <id> --remove-worktree` to discard abandoned work. This removes the worktree and its branch even when they contain unmerged changes.
 
 ## Rules
 
@@ -245,6 +252,21 @@ mod tests {
         }
         assert!(text.contains("finished workers close automatically two minutes after `worker_done`"));
         assert!(text.contains("It is refused if the user chose Keep open"));
+    }
+
+    #[test]
+    fn body_documents_worktree_lifecycle() {
+        let text = render(&exe());
+        let (_, worktrees) = text.split_once("## Worker worktrees\n").unwrap();
+        for instruction in [
+            "`--worktree <name>` for every task that changes code when more than one worker",
+            "Never put two workers in one worktree",
+            "After `worker_done`, review the worker's commits and merge its branch into your own branch",
+            "Sich automatically removes the merged worktree and branch",
+            "`release --dispatch <id> --remove-worktree` to discard abandoned work",
+        ] {
+            assert!(worktrees.contains(instruction), "missing {instruction}");
+        }
     }
 
     #[test]

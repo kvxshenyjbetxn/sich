@@ -234,8 +234,15 @@ pub async fn list(mgr: &Arc<Manager>) -> ServerMsg {
 }
 
 pub async fn broadcast(mgr: &Arc<Manager>) {
-    let list = scan(mgr).await;
-    mgr.hub.broadcast(ServerMsg::Projects { projects: list, groups: mgr.projects.groups() });
+    broadcast_change(mgr, None).await;
+}
+
+async fn broadcast_change(mgr: &Arc<Manager>, requester: Option<&ConnHandle>) {
+    let snapshot = list(mgr).await;
+    if let Some(conn) = requester.filter(|conn| conn.worker_worktrees) {
+        conn.send(snapshot.clone());
+    }
+    mgr.hub.broadcast(snapshot);
 }
 
 fn fail(conn: &ConnHandle, op: &str, message: impl Into<String>) {
@@ -320,24 +327,43 @@ pub async fn create_worktree(
         return fail(conn, OP, "Unknown project");
     };
     let root = worktree_root();
+    let owner = conn.worktree_owner.clone();
+    if conn.worker_worktrees && owner.is_none() {
+        return fail(conn, OP, "A worker dispatch is required");
+    }
+    let operation = mgr.worktree_operations.lock().await;
     let res = blocking(move || -> Result<(), String> {
         if git::toplevel(&entry.path).is_none() {
             return Err("Project is not a git repository".into());
         }
-        git::validate_name(&entry.path, &name)?;
+        if owner.is_some() {
+            crate::worker_worktree::validate_name(&entry.path, &name)?;
+            if git::branch_exists(&entry.path, &name) {
+                return Err(format!("Branch '{name}' already exists"));
+            }
+        } else {
+            git::validate_name(&entry.path, &name)?;
+        }
         let repo_name = entry.path.file_name().map(PathBuf::from).unwrap_or_else(|| "repo".into());
         let target = root.join(repo_name).join(&name);
-        if target.exists() {
-            return Err(format!("Folder already exists: {}", target.display()));
+        match target.symlink_metadata() {
+            Ok(_) => return Err(format!("Folder already exists: {}", target.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("check worktree folder: {e}")),
         }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create folder: {e}"))?;
         }
-        git::add_worktree(&entry.path, &target, &name, base.as_deref())
+        if let Some(owner) = owner {
+            crate::worker_worktree::add(&entry.path, &target, &name, base.as_deref(), &owner)
+        } else {
+            git::add_worktree(&entry.path, &target, &name, base.as_deref())
+        }
     })
     .await;
+    drop(operation);
     match res {
-        Some(Ok(())) => broadcast(mgr).await,
+        Some(Ok(())) => broadcast_change(mgr, Some(conn)).await,
         Some(Err(msg)) => fail(conn, OP, msg),
         None => fail(conn, OP, "internal error"),
     }
@@ -355,6 +381,7 @@ pub async fn remove_worktree(
     let Some(entry) = mgr.projects.get(project_id) else {
         return fail(conn, OP, "Unknown project");
     };
+    let operation = mgr.worktree_operations.lock().await;
     let (repo, wt) = (entry.path.clone(), path.clone());
     let info = blocking(move || {
         let list = git::list_worktrees(&repo).ok()?;
@@ -371,6 +398,18 @@ pub async fn remove_worktree(
         return fail(conn, OP, "Worktree has uncommitted changes");
     }
 
+    if conn.worker_worktrees {
+        let Some(info) = &info else { return fail(conn, OP, "Worker worktree is not registered") };
+        let Some(owner) = conn.worktree_owner.clone() else { return fail(conn, OP, "A worker dispatch is required") };
+        let terminals = if force { Vec::new() } else { mgr.list() };
+        let (path, branch) = (path.clone(), info.branch.clone());
+        match blocking(move || crate::worker_worktree::validate_removal(&path, branch.as_deref(), &owner, force, &terminals)).await {
+            Some(Ok(())) => {}
+            Some(Err(msg)) => return fail(conn, OP, msg),
+            None => return fail(conn, OP, "internal error"),
+        }
+    }
+
     mgr.kill_in_worktree(&path);
 
     let branch = info.and_then(|w| w.branch);
@@ -383,12 +422,18 @@ pub async fn remove_worktree(
         }
     })
     .await;
+    drop(operation);
     match res {
-        Some(Err(msg)) => fail(conn, OP, msg),
-        Some(Ok(())) => {}
-        None => fail(conn, OP, "internal error"),
+        Some(Ok(())) => broadcast_change(mgr, Some(conn)).await,
+        Some(Err(msg)) => {
+            fail(conn, OP, msg);
+            broadcast(mgr).await;
+        }
+        None => {
+            fail(conn, OP, "internal error");
+            broadcast(mgr).await;
+        }
     }
-    broadcast(mgr).await;
 }
 
 #[cfg(test)]

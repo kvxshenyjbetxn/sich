@@ -38,9 +38,10 @@ where
     // Handshake: the first message must be Hello with a matching version.
     // `Shutdown` is accepted before Hello so any client can stop any daemon version.
     let first = source.next().await.context("closed before Hello")?.context("read Hello")?;
-    match decode::<ClientMsg>(&first).context("decode Hello")? {
+    let client_name = match decode::<ClientMsg>(&first).context("decode Hello")? {
         ClientMsg::Hello { proto_version, client_name } if proto_version == PROTO_VERSION => {
             tracing::info!(conn = conn_id, %client_name, "client connected");
+            client_name
         }
         ClientMsg::Hello { proto_version, .. } => {
             // Welcome first, so the client can learn our version and pid.
@@ -63,11 +64,13 @@ where
             sink.send(encode(&ServerMsg::Error { message: message.clone() })?).await.ok();
             anyhow::bail!(message);
         }
-    }
+    };
 
     let (tx, mut rx) = mpsc::channel::<ServerMsg>(WRITE_QUEUE);
     let cancel = CancellationToken::new();
-    let conn = ConnHandle::new(conn_id, tx, cancel.clone());
+    let mut conn = ConnHandle::new(conn_id, tx, cancel.clone());
+    conn.worktree_owner = crate::worker_worktree::client_owner(&client_name).map(str::to_owned);
+    conn.worker_worktrees = client_name == crate::worker_worktree::CLIENT_NAME || conn.worktree_owner.is_some();
 
     // Welcome goes first in the queue, then the connection starts receiving broadcasts.
     conn.send(ServerMsg::Welcome { proto_version: PROTO_VERSION, daemon_pid: std::process::id() });

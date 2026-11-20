@@ -187,11 +187,13 @@ impl AppView {
         })
         .detach();
 
-        // The watcher wakes agents with mail, raises escalations and releases finished workers.
+        // The watcher delivers mail, raises escalations, closes workers and cleans up merged worktrees.
         let orch_socket = socket.clone();
         cx.spawn(async move |this, cx| {
             let mut watcher = Some(sich_orch::watch::Watcher::new(sich_orch::paths::db_path()));
             let mut closing: Option<gpui_kit::Task<()>> = None;
+            let mut cleanup: Option<gpui_kit::Task<()>> = None;
+            let mut last_cleanup: Option<Instant> = None;
             loop {
                 cx.background_executor().timer(orch_watch::TICK).await;
                 let Ok((data, auto_close_workers)) = this.update(cx, |this, cx| {
@@ -214,9 +216,11 @@ impl AppView {
                     .await;
                 watcher = Some(w);
                 let due = std::mem::take(&mut out.due);
-                let Ok(should_close) = this.update(cx, |this, cx| {
+                let Ok((should_close, should_clean)) = this.update(cx, |this, cx| {
                     this.apply_orch(out, cx);
-                    settings::get(cx).orch_auto_close_workers && this.client.terminals_synced()
+                    let synced = this.client.terminals_synced();
+                    let settings = settings::get(cx);
+                    (synced && settings.orch_auto_close_workers, synced && settings.orch_cleanup_worktrees)
                 }) else { break };
                 if closing.as_mut().is_some_and(|close| close.now_or_never().is_some()) {
                     closing = None;
@@ -226,6 +230,19 @@ impl AppView {
                     let rt = rt.clone();
                     closing = Some(cx.background_executor().spawn(async move {
                         orch_watch::release_due(&due, &socket, &rt);
+                    }));
+                }
+                if cleanup.as_mut().is_some_and(|task| task.now_or_never().is_some()) {
+                    cleanup = None;
+                }
+                if should_clean && cleanup.is_none()
+                    && last_cleanup.is_none_or(|t| t.elapsed() >= orch_watch::WORKTREE_CLEANUP_INTERVAL)
+                {
+                    last_cleanup = Some(Instant::now());
+                    let socket = orch_socket.clone();
+                    let rt = rt.clone();
+                    cleanup = Some(cx.background_executor().spawn(async move {
+                        orch_watch::cleanup_worktrees(&socket, &rt);
                     }));
                 }
             }

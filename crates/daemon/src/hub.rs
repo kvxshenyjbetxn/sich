@@ -14,13 +14,15 @@ pub type ConnId = u64;
 #[derive(Clone)]
 pub struct ConnHandle {
     pub id: ConnId,
+    pub worker_worktrees: bool,
+    pub worktree_owner: Option<String>,
     tx: mpsc::Sender<ServerMsg>,
     cancel: CancellationToken,
 }
 
 impl ConnHandle {
     pub fn new(id: ConnId, tx: mpsc::Sender<ServerMsg>, cancel: CancellationToken) -> Self {
-        Self { id, tx, cancel }
+        Self { id, tx, cancel, worker_worktrees: false, worktree_owner: None }
     }
 
     /// Returns false if the message could not be queued (connection closed or dropped).
@@ -54,6 +56,10 @@ impl Hub {
     pub fn broadcast(&self, msg: ServerMsg) {
         let conns: Vec<ConnHandle> = self.conns.lock().values().cloned().collect();
         for c in conns {
+            // Worktree RPCs use Projects as their direct reply. They don't need sidebar updates.
+            if c.worker_worktrees && matches!(msg, ServerMsg::Projects { .. }) {
+                continue;
+            }
             c.send(msg.clone());
         }
     }

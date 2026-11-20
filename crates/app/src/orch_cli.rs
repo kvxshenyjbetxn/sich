@@ -1,13 +1,14 @@
 //! `sich orch <cmd>`: the coordinator/worker command line of the orchestration feature.
 //!
-//! State lives in the SQLite database of `sich-orch`; the daemon is only used to create and kill
-//! worker terminals and to type the launch command, using the ordinary client protocol.
+//! State lives in the SQLite database of `sich-orch`; the daemon manages worker terminals and
+//! worktrees and types launch commands through the client protocol.
 
 use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use futures::{SinkExt as _, StreamExt as _};
+use sich_app::orch_ipc::Link;
+use sich_app::orch_worktree::WorktreeClient;
 use sich_orch::cli_parse::{self, Command, SpecSource, Target};
 use sich_orch::db::ReleaseMode;
 use sich_orch::launch::{self, LaunchSpec};
@@ -15,8 +16,7 @@ use sich_orch::model::*;
 use sich_orch::paths;
 use sich_orch::preamble::{self, PreambleInput};
 use sich_orch::{Db, dialogs};
-use sich_proto::{AgentState, ClientMsg, PROTO_VERSION, ServerMsg, TermId, TerminalInfo, decode, encode, frame_codec};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use sich_proto::{AgentState, ClientMsg, ServerMsg, TermId, TerminalInfo};
 
 use crate::settings::AppSettings;
 
@@ -87,13 +87,13 @@ fn execute(command: Command) -> Result<i32> {
     let caller = caller()?;
     match command {
         Command::Help => unreachable!("handled by run"),
-        Command::Start { agent, model, effort, title, spec } => {
+        Command::Start { agent, model, effort, title, spec, worktree } => {
             let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-            rt.block_on(start(&caller, StartArgs { agent, model, effort, title, spec }))
+            rt.block_on(start(&caller, StartArgs { agent, model, effort, title, spec, worktree }))
         }
-        Command::Release { dispatch } => {
+        Command::Release { dispatch, remove_worktree } => {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
-            release(&caller, &dispatch, rt.handle())
+            release(&caller, &dispatch, remove_worktree, rt.handle())
         }
         Command::Check => check(&caller),
         Command::Send { to, body, subject } => send(&caller, to, body, subject),
@@ -338,6 +338,9 @@ pub fn format_list(run: &Run, tasks: &[Task], dispatches: &[Dispatch]) -> String
                 line.push_str(&format!(" {e}"));
             }
             line.push_str(&format!(" terminal={}", d.worker_term));
+            if let Some(w) = &d.owned_worktree {
+                line.push_str(&format!(" branch={}", w.branch));
+            }
             if let Some(o) = &d.outcome {
                 line.push_str(&format!(" outcome={o}"));
             }
@@ -365,51 +368,6 @@ pub fn status_line(dispatch: &str, task: &str, term: TermId, state: &str, reason
     line
 }
 
-// ---- daemon link --------------------------------------------------------------------------
-
-struct Link {
-    framed: Framed<sich_daemon::ClientStream, LengthDelimitedCodec>,
-}
-
-impl Link {
-    async fn connect(socket: &str) -> Result<Link> {
-        let stream = sich_daemon::connect(socket).await.context("the Sich daemon is not running")?;
-        let mut link = Link { framed: Framed::new(stream, frame_codec()) };
-        link.send(&ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: "sich-orch".into() }).await?;
-        match link.recv(Duration::from_secs(10)).await? {
-            Some(ServerMsg::Welcome { proto_version, .. }) if proto_version == PROTO_VERSION => Ok(link),
-            Some(ServerMsg::Welcome { proto_version, .. }) => {
-                bail!("the daemon speaks protocol {proto_version}, expected {PROTO_VERSION}; restart Sich")
-            }
-            other => bail!("unexpected daemon answer: {other:?}"),
-        }
-    }
-
-    async fn send(&mut self, msg: &ClientMsg) -> Result<()> {
-        self.framed.send(encode(msg)?).await.context("send to the daemon")
-    }
-
-    /// Next server message, `None` on timeout.
-    async fn recv(&mut self, timeout: Duration) -> Result<Option<ServerMsg>> {
-        match tokio::time::timeout(timeout, self.framed.next()).await {
-            Err(_) => Ok(None),
-            Ok(None) => bail!("the daemon closed the connection"),
-            Ok(Some(frame)) => Ok(Some(decode(&frame.context("read frame")?)?)),
-        }
-    }
-
-    async fn list_terminals(&mut self) -> Result<Vec<TerminalInfo>> {
-        self.send(&ClientMsg::ListTerminals).await?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            if let Some(ServerMsg::Terminals(list)) = self.recv(left).await? {
-                return Ok(list);
-            }
-        }
-        bail!("the daemon did not answer ListTerminals")
-    }
-}
-
 // ---- start --------------------------------------------------------------------------------
 
 struct StartArgs {
@@ -418,6 +376,7 @@ struct StartArgs {
     effort: Option<String>,
     title: Option<String>,
     spec: SpecSource,
+    worktree: Option<String>,
 }
 
 /// What `wait_for_prompt` should do next (pure, see tests).
@@ -576,6 +535,52 @@ fn ready_timeout() -> Duration {
         .map_or(DEFAULT_READY_TIMEOUT, Duration::from_millis)
 }
 
+async fn create_worker_terminal(
+    link: &mut Link,
+    coordinator: &TerminalInfo,
+    worker_worktree: Option<&OwnedWorktree>,
+) -> Result<TerminalInfo> {
+    let request = if let Some(wt) = worker_worktree {
+        // Same terminal spawn with a correlated response, so parallel starts cannot pick up
+        // another client's TerminalCreated broadcast.
+        ClientMsg::RestoreTerminal {
+            request_id: 1,
+            cwd: Some(wt.path.clone()),
+            cols: coordinator.cols,
+            rows: coordinator.rows,
+            worktree: Some(wt.path.clone()),
+        }
+    } else {
+        ClientMsg::CreateTerminal {
+            cwd: Some(coordinator.cwd.clone()),
+            shell: None,
+            args: Vec::new(),
+            cols: coordinator.cols,
+            rows: coordinator.rows,
+            worktree: coordinator.worktree.clone(),
+        }
+    };
+    link.send(&request).await?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        match link.recv(left).await? {
+            Some(ServerMsg::TerminalCreated(info)) if worker_worktree.is_none() => return Ok(info),
+            Some(ServerMsg::TerminalRestored { request_id: 1, terminal: Some(info) }) if let Some(wt) = worker_worktree => {
+                if !sich_daemon::worker_worktree::same_path(&info.cwd, &wt.path) {
+                    let _ = link.send(&ClientMsg::KillTerminal { id: info.id }).await;
+                    let _ = link.list_terminals().await;
+                    bail!("the worker worktree disappeared while the terminal was opening");
+                }
+                return Ok(info);
+            }
+            Some(ServerMsg::Error { message }) => bail!("daemon: {message}"),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    bail!("the daemon did not create the worker terminal")
+}
+
 async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
     let spec = match &args.spec {
         SpecSource::Text(t) => t.clone(),
@@ -601,13 +606,21 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
     // Validate everything before any side effect.
     let command = launch::build_command(&launch_spec)?;
 
-    let mut link = Link::connect(&caller.socket).await?;
+    let mut link = Link::connect(&caller.socket, "sich-orch").await?;
     let terminals = link.list_terminals().await?;
     let me = terminals
         .iter()
         .find(|t| t.id == caller.term)
         .ok_or_else(|| anyhow!("terminal {} is not known to the daemon", caller.term))?;
 
+    let worker_worktree = if let Some(branch) = &args.worktree {
+        let mut client = WorktreeClient::connect(&caller.socket, Some(&dispatch_id)).await?;
+        let (project_id, worktree) = client.create(me, branch).await?;
+        Some((client, project_id, worktree))
+    } else {
+        None
+    };
+    let owned = worker_worktree.as_ref().map(|(_, _, wt)| wt);
     let exe = exe_text();
     let text = preamble::render(&PreambleInput {
         exe: &exe,
@@ -616,49 +629,49 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
         coordinator_term: caller.term,
         title: &title,
         spec: &spec,
+        worktree: owned,
     });
-    paths::write_atomic(&task_file, text.as_bytes()).with_context(|| format!("write {}", task_file.display()))?;
-
-    link.send(&ClientMsg::CreateTerminal {
-        cwd: Some(me.cwd.clone()),
-        shell: None,
-        args: Vec::new(),
-        cols: me.cols,
-        rows: me.rows,
-        worktree: me.worktree.clone(),
-    })
-    .await?;
-    // The first TerminalCreated after our request is ours (it is broadcast to every client).
-    let created = loop {
-        match link.recv(Duration::from_secs(15)).await? {
-            Some(ServerMsg::TerminalCreated(info)) => break info,
-            Some(ServerMsg::OpFailed { message, .. } | ServerMsg::Error { message }) => bail!("daemon: {message}"),
-            Some(_) => {}
-            None => bail!("the daemon did not create the worker terminal"),
+    let prepared = async {
+        paths::write_atomic(&task_file, text.as_bytes()).with_context(|| format!("write {}", task_file.display()))?;
+        let created = create_worker_terminal(&mut link, me, owned).await?;
+        let worker_term = created.id;
+        let now = paths::now_ms();
+        let recorded = open_db().and_then(|mut db| {
+            let run = db.ensure_run(caller.term, me.created_unix_ms as i64, now)?;
+            db.create_task_with_dispatch(
+                &run.id,
+                &task_id,
+                &dispatch_id,
+                &title,
+                &spec,
+                worker_term,
+                args.agent,
+                args.model.as_deref(),
+                args.effort.as_deref(),
+                owned,
+                now.max(created.created_unix_ms as i64),
+            )
+        });
+        if let Err(e) = recorded {
+            let _ = link.send(&ClientMsg::KillTerminal { id: worker_term }).await;
+            let _ = link.list_terminals().await;
+            return Err(e.context("could not record the dispatch"));
+        }
+        Ok(worker_term)
+    }
+    .await;
+    let worker_term = match prepared {
+        Ok(term) => term,
+        Err(e) => {
+            let _ = std::fs::remove_file(&task_file);
+            if let Some((mut client, project_id, wt)) = worker_worktree
+                && let Err(cleanup) = client.remove(project_id, &wt, false).await
+            {
+                warn(&format!("could not roll back worker worktree {}: {cleanup:#}", wt.path.display()));
+            }
+            return Err(e);
         }
     };
-    let worker_term = created.id;
-
-    let now = paths::now_ms();
-    let recorded = open_db().and_then(|mut db| {
-        let run = db.ensure_run(caller.term, me.created_unix_ms as i64, now)?;
-        db.create_task_with_dispatch(
-            &run.id,
-            &task_id,
-            &dispatch_id,
-            &title,
-            &spec,
-            worker_term,
-            args.agent,
-            args.model.as_deref(),
-            args.effort.as_deref(),
-            now.max(created.created_unix_ms as i64),
-        )
-    });
-    if let Err(e) = recorded {
-        let _ = link.send(&ClientMsg::KillTerminal { id: worker_term }).await;
-        return Err(e.context("could not record the dispatch"));
-    }
 
     link.send(&ClientMsg::Subscribe { id: worker_term, resume_from_seq: None }).await?;
     wait_for_prompt(&mut link, worker_term).await?;
@@ -695,7 +708,7 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
 
 // ---- release ------------------------------------------------------------------------------
 
-fn release(caller: &Caller, dispatch_id: &str, rt: &tokio::runtime::Handle) -> Result<i32> {
+fn release(caller: &Caller, dispatch_id: &str, remove_worktree: bool, rt: &tokio::runtime::Handle) -> Result<i32> {
     let mut db = open_db()?;
     let id = identify(&db, caller.term)?;
     let run = require_run(&id)?;
@@ -703,7 +716,18 @@ fn release(caller: &Caller, dispatch_id: &str, rt: &tokio::runtime::Handle) -> R
     if d.run_id != run.id {
         bail!("dispatch {dispatch_id} does not belong to your run");
     }
+    let worktree = if remove_worktree {
+        Some(d.owned_worktree.as_ref().context("this dispatch has no orchestration-created worktree")?)
+    } else {
+        None
+    };
     release_worker(&mut db, dispatch_id, ReleaseMode::Manual, &caller.socket, rt)?;
+    if let Some(wt) = worktree.filter(|wt| !wt.cleaned) {
+        rt.block_on(async {
+            WorktreeClient::connect(&caller.socket, Some(&wt.identity)).await?.discard(wt).await
+        }).context("worker terminal closed, but worktree removal failed")?;
+        db.mark_worktree_cleaned(dispatch_id)?;
+    }
     say(&format!("Released {dispatch_id} (terminal {} closed).", d.worker_term));
     Ok(0)
 }
@@ -728,7 +752,7 @@ pub(crate) fn release_worker(
 }
 
 async fn close_worker_terminal(socket: &str, dispatch: &Dispatch) -> Result<()> {
-    let mut link = Link::connect(socket).await?;
+    let mut link = Link::connect(socket, "sich-orch").await?;
     let id = dispatch.worker_term;
     // The daemon can reuse terminal ids after a restart. Check on the connection that will send
     // KillTerminal so a stale dispatch cannot close an unrelated terminal in the new daemon.
@@ -762,6 +786,7 @@ mod tests {
             ended_ms: None,
             keep_open: false,
             auto_close_allowed_ms: None,
+            owned_worktree: None,
         }
     }
 

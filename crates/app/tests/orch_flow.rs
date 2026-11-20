@@ -4,12 +4,14 @@
 #![cfg(windows)]
 
 use std::collections::{HashMap, HashSet};
+use std::os::windows::process::CommandExt as _;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::{SinkExt as _, StreamExt as _};
 use sich_orch::{Db, DispatchState, TaskStatus};
-use sich_proto::{AgentKind, ClientMsg, PROTO_VERSION, ServerMsg, TermId, decode, encode, frame_codec};
+use sich_proto::{AgentKind, ClientMsg, PROTO_VERSION, ServerMsg, TermId, TerminalInfo, decode, encode, frame_codec};
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
@@ -24,6 +26,7 @@ struct Harness {
     hooked: HashSet<TermId>,
     removed: Vec<TermId>,
     created: Vec<TermId>,
+    terminal_info: HashMap<TermId, TerminalInfo>,
     fake_agent: String,
 }
 
@@ -38,6 +41,7 @@ impl Harness {
             ServerMsg::TerminalCreated(info) => {
                 self.created.push(info.id);
                 send(&mut self.conn, ClientMsg::Subscribe { id: info.id, resume_from_seq: None }).await;
+                self.terminal_info.insert(info.id, info);
             }
             ServerMsg::TerminalRemoved { id } => self.removed.push(id),
             ServerMsg::Output { id, bytes, .. } => {
@@ -99,6 +103,24 @@ impl Harness {
         assert!(out.status.success(), "{args:?} failed: {stdout}\n{}", String::from_utf8_lossy(&out.stderr));
         stdout
     }
+
+    async fn open_shell(&mut self, cwd: &Path, worktree: Option<PathBuf>) -> TermId {
+        let next = self.created.len();
+        send(&mut self.conn, ClientMsg::CreateTerminal {
+            cwd: Some(cwd.into()), shell: Some("cmd.exe".into()), args: vec![], cols: 120, rows: 30, worktree,
+        }).await;
+        timeout(Duration::from_secs(10), async {
+            while self.created.len() == next {
+                self.pump_for(Duration::from_millis(100)).await;
+            }
+        }).await.expect("terminal created");
+        self.created[next]
+    }
+
+    async fn cleanup(&mut self, db: &Db, enabled: bool) {
+        sich_app::orch_worktree::cleanup_worktrees(db, &self.socket, enabled).await.unwrap();
+        self.pump_for(Duration::from_millis(100)).await;
+    }
 }
 
 fn field(line: &str, key: &str) -> String {
@@ -110,14 +132,16 @@ fn field(line: &str, key: &str) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coordinator_and_worker_round_trip_through_the_cli() {
-    let base = std::env::temp_dir().join(format!("sich-orch-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path();
     // SAFETY: the only test in this binary; set before the daemon or any child starts.
     unsafe {
         std::env::set_var("SICH_CONFIG_DIR", base.join("cfg"));
         std::env::set_var("SICH_WORKTREE_ROOT", base.join("wt"));
         std::env::set_var("SICH_DATA_DIR", base.join("data"));
+        std::env::set_var("GIT_CONFIG_GLOBAL", base.join("empty-gitconfig"));
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        std::env::set_var("GIT_CONFIG_COUNT", "0");
     }
     let fake = base.join("fake-agent.cmd");
     std::fs::write(&fake, "@echo off\r\necho FAKE-AGENT-STARTED %*\r\nping -n 180 127.0.0.1 >nul\r\n").unwrap();
@@ -128,7 +152,7 @@ async fn coordinator_and_worker_round_trip_through_the_cli() {
     let socket = format!("sich-test-orch-{}-{stamp}", std::process::id());
     let daemon = tokio::spawn({
         let socket = socket.clone();
-        async move { sich_daemon::run(&socket).await }
+        async move { sich_daemon::run_with_build(&socket, sich_app::daemon_build_id()).await }
     });
     let mut conn = None;
     for _ in 0..100 {
@@ -147,6 +171,7 @@ async fn coordinator_and_worker_round_trip_through_the_cli() {
         hooked: HashSet::new(),
         removed: Vec::new(),
         created: Vec::new(),
+        terminal_info: HashMap::new(),
         fake_agent: fake.to_string_lossy().into_owned(),
     };
 
@@ -272,7 +297,143 @@ async fn coordinator_and_worker_round_trip_through_the_cli() {
     assert!(h.removed.contains(&worker), "terminal {worker} should be gone; removed: {:?}", h.removed);
     assert_eq!(db.get_dispatch(&dispatch).unwrap().unwrap().state, DispatchState::Released);
 
+    worker_worktree_lifecycle(&mut h, &mut db, base).await;
+
     send(&mut h.conn, ClientMsg::Shutdown).await;
     timeout(Duration::from_secs(10), daemon).await.expect("daemon did not stop").unwrap().unwrap();
-    let _ = std::fs::remove_dir_all(&base);
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .arg("-C").arg(repo)
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgSign=false"])
+        .args(args).output().unwrap()
+}
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let out = git_output(repo, args);
+    assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().into()
+}
+
+async fn worker_worktree_lifecycle(h: &mut Harness, db: &mut Db, base: &Path) {
+    use sich_app::orch_worktree::WorktreeClient;
+    use sich_daemon::worker_worktree::same_path;
+
+    let repo = base.join("repo");
+    let linked = base.join("coordinator");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-m", "Initial"]);
+    git(&repo, &["worktree", "add", "-b", "base/coordinator", linked.to_str().unwrap(), "main"]);
+    let linked = dunce::canonicalize(&linked).unwrap();
+    git(&linked, &["commit", "--allow-empty", "-m", "Advance the coordinator branch"]);
+    git(&repo, &["commit", "--allow-empty", "-m", "Advance main independently"]);
+    send(&mut h.conn, ClientMsg::AddProject { path: repo.clone(), group: None }).await;
+    let project_id = timeout(Duration::from_secs(10), async {
+        loop {
+            let msg = decode(&h.conn.next().await.unwrap().unwrap()).unwrap();
+            if let ServerMsg::Projects { projects, .. } = &msg
+                && let Some(project) = projects.iter().find(|p| same_path(&p.path, &repo))
+            {
+                break project.id;
+            }
+            h.handle(msg).await;
+        }
+    }).await.expect("project registered");
+    let coord = h.open_shell(&linked, Some(linked.clone())).await;
+
+    let start = |branch| ["start", "--agent", "codex", "--spec", "Change code", "--worktree", branch];
+    let branch = "workers/parser";
+    let started = h.orch_ok(coord, &start(branch)).await;
+    let dispatch_id = field(&started, "dispatch");
+    let worker: TermId = field(&started, "terminal").parse().unwrap();
+    let dispatch = db.get_dispatch(&dispatch_id).unwrap().unwrap();
+    let wt = dispatch.owned_worktree.unwrap();
+    assert_eq!(wt.branch, branch);
+    assert_eq!(wt.base_branch, "base/coordinator");
+    assert!(wt.path.is_dir() && !wt.cleaned);
+    assert_eq!(git(&wt.path, &["branch", "--show-current"]), branch);
+    assert_eq!(git(&wt.path, &["rev-parse", "HEAD"]), git(&linked, &["rev-parse", "HEAD"]));
+    assert_ne!(git(&wt.path, &["rev-parse", "HEAD"]), git(&repo, &["rev-parse", "HEAD"]));
+    let term = &h.terminal_info[&worker];
+    assert!(same_path(term.worktree.as_deref().unwrap(), &wt.path));
+    assert!(same_path(&term.cwd, &wt.path));
+    let task_file = base.join("cfg/sich/orch/tasks").join(format!("{}.md", dispatch.task_id));
+    let task = std::fs::read_to_string(task_file).unwrap();
+    assert!(task.contains(&format!("{} on branch {branch} (based on base/coordinator)", wt.path.display())));
+    assert!(h.orch_ok(coord, &["list"]).await.contains("branch=workers/parser"));
+    assert_eq!(wt.identity, dispatch_id);
+    let other_id = if dispatch_id == "d_ffffffff" { "d_00000000" } else { "d_ffffffff" };
+    let mut stranger = WorktreeClient::connect(&h.socket, Some(other_id)).await.unwrap();
+    assert!(stranger.remove(project_id, &wt, true).await.unwrap_err().to_string().contains("different dispatch"));
+    assert!(wt.path.is_dir());
+
+    git(&repo, &["branch", "unused/already-exists"]);
+    let created = h.created.len();
+    let dispatches = db.list_dispatches(&dispatch.run_id).unwrap();
+    let tasks = db.list_tasks(&dispatch.run_id).unwrap();
+    let tree_list = git(&repo, &["worktree", "list", "--porcelain"]);
+    for existing in [branch, "unused/already-exists"] {
+        let duplicate = h.orch(Some(coord), &start(existing), &[]).await;
+        assert_eq!(duplicate.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&duplicate.stderr).contains("already exists"));
+    }
+    h.pump_for(Duration::from_millis(150)).await;
+    assert_eq!(h.created.len(), created);
+    assert_eq!(db.list_dispatches(&dispatch.run_id).unwrap(), dispatches);
+    assert_eq!(db.list_tasks(&dispatch.run_id).unwrap(), tasks);
+    assert_eq!(git(&repo, &["worktree", "list", "--porcelain"]), tree_list);
+    assert!(!base.join("wt/repo/unused").exists());
+
+    git(&wt.path, &["commit", "--allow-empty", "-m", "Worker change"]);
+    h.orch_ok(coord, &["release", "--dispatch", &dispatch_id]).await;
+    assert!(wt.path.is_dir());
+    h.cleanup(db, true).await;
+    assert!(wt.path.is_dir(), "unmerged worktree is kept");
+    assert!(!db.get_dispatch(&dispatch_id).unwrap().unwrap().owned_worktree.unwrap().cleaned);
+
+    git(&linked, &["merge", "--ff-only", branch]);
+    std::fs::write(wt.path.join("untracked.txt"), "pending").unwrap();
+    h.cleanup(db, true).await;
+    assert!(wt.path.is_dir(), "dirty worktree is kept");
+    std::fs::remove_file(wt.path.join("untracked.txt")).unwrap();
+    h.cleanup(db, false).await;
+    assert!(wt.path.is_dir(), "disabled cleanup keeps the worktree");
+    let live = h.open_shell(&wt.path, None).await;
+    h.cleanup(db, true).await;
+    assert!(wt.path.is_dir(), "a terminal at the worktree cwd keeps it open");
+    let mut owner = WorktreeClient::connect(&h.socket, Some(&dispatch_id)).await.unwrap();
+    assert!(owner.remove(project_id, &wt, false).await.unwrap_err().to_string().contains("live terminal"));
+    send(&mut h.conn, ClientMsg::KillTerminal { id: live }).await;
+    h.pump_for(Duration::from_millis(150)).await;
+    assert!(h.removed.contains(&live));
+    std::fs::write(wt.path.join("ignored.txt"), "can be removed").unwrap();
+    h.cleanup(db, true).await;
+    assert!(!wt.path.exists(), "merged and clean worktree was removed");
+    assert_eq!(git(&repo, &["branch", "--list", branch]), "");
+    assert!(db.get_dispatch(&dispatch_id).unwrap().unwrap().owned_worktree.unwrap().cleaned);
+
+    let abandoned_branch = "workers/abandoned";
+    let started = h.orch_ok(coord, &start(abandoned_branch)).await;
+    let abandoned = field(&started, "dispatch");
+    let d = db.get_dispatch(&abandoned).unwrap().unwrap();
+    let wt = d.owned_worktree.unwrap();
+    git(&wt.path, &["commit", "--allow-empty", "-m", "Unmerged work"]);
+    std::fs::write(wt.path.join("untracked.txt"), "discard me").unwrap();
+    let discard = ["release", "--dispatch", &abandoned, "--remove-worktree"];
+    db.set_keep_open(&abandoned, true, sich_orch::paths::now_ms()).unwrap();
+    let kept = h.orch(Some(coord), &discard, &[]).await;
+    assert_eq!(kept.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&kept.stderr).contains("Keep open"));
+    assert!(wt.path.is_dir() && !h.removed.contains(&d.worker_term));
+    db.set_keep_open(&abandoned, false, sich_orch::paths::now_ms()).unwrap();
+    h.orch_ok(coord, &discard).await;
+    assert!(!wt.path.exists());
+    assert_eq!(git(&repo, &["branch", "--list", abandoned_branch]), "");
+    assert!(db.get_dispatch(&abandoned).unwrap().unwrap().owned_worktree.unwrap().cleaned);
+    h.orch_ok(coord, &discard).await;
 }

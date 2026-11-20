@@ -1,6 +1,8 @@
 //! The task file a worker reads first: who it is, the exact commands to use, the rules, then the
 //! task itself.
 
+use crate::model::OwnedWorktree;
+
 #[derive(Clone, Debug)]
 pub struct PreambleInput<'a> {
     /// Absolute path of the sich executable, as the worker must type it.
@@ -10,6 +12,7 @@ pub struct PreambleInput<'a> {
     pub coordinator_term: u64,
     pub title: &'a str,
     pub spec: &'a str,
+    pub worktree: Option<&'a OwnedWorktree>,
 }
 
 /// The exe as it appears in a command: quoted when it contains spaces.
@@ -20,6 +23,11 @@ pub fn exe_command(exe: &str) -> String {
 pub fn render(p: &PreambleInput<'_>) -> String {
     let exe = exe_command(p.exe);
     let call = if p.exe.contains(' ') { format!("& {exe}") } else { exe };
+    let worktree = p.worktree.map_or_else(String::new, |w| format!(
+        "You work in your own git worktree {} on branch {} (based on {}).\n\
+         Commit your work there with short imperative messages. Do not merge, push or switch branches.\n\n",
+        w.path.display(), w.branch, w.base_branch
+    ));
     format!(
         "# Sich worker task\n\
 \n\
@@ -49,7 +57,7 @@ Run these in your shell (they identify you automatically; in PowerShell keep the
 4. Later messages arrive as a typed pointer (\"You have N Sich orchestration message(s)...\"). When you see one, run `check`, act on it, and run `done` again when that work is finished.\n\
 5. Do not exit the shell or the agent when you are done.\n\
 \n\
-=== TASK ===\n\
+{worktree}=== TASK ===\n\
 {spec}\n",
         coord = p.coordinator_term,
         task = p.task_id,
@@ -72,6 +80,7 @@ mod tests {
             coordinator_term: 7,
             title: "Fix the parser",
             spec: "Make `parse()` handle empty input.\nAdd a test.",
+            worktree: None,
         }
     }
 
@@ -109,6 +118,23 @@ mod tests {
         let (head, tail) = text.split_once("=== TASK ===\n").expect("marker");
         assert!(!head.contains("Add a test."));
         assert_eq!(tail, "Make `parse()` handle empty input.\nAdd a test.\n");
+    }
+
+    #[test]
+    fn owned_worktree_instructions_precede_the_spec() {
+        let mut p = input("sich");
+        let wt = OwnedWorktree {
+            path: "worktree".into(),
+            branch: "workers/parser".into(),
+            base_branch: "coordinator".into(),
+            identity: "id".into(),
+            cleaned: false,
+        };
+        p.worktree = Some(&wt);
+        let text = render(&p);
+        let (head, _) = text.split_once("=== TASK ===").unwrap();
+        assert!(head.contains("You work in your own git worktree worktree on branch workers/parser (based on coordinator)."));
+        assert!(head.contains("Commit your work there with short imperative messages. Do not merge, push or switch branches."));
     }
 
     #[test]

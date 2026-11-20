@@ -78,6 +78,15 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE dispatches ADD COLUMN keep_open INTEGER NOT NULL DEFAULT 0 CHECK (keep_open IN (0,1));
     ALTER TABLE dispatches ADD COLUMN auto_close_allowed_ms INTEGER;
     ",
+    "
+    ALTER TABLE dispatches ADD COLUMN worktree_path TEXT;
+    ALTER TABLE dispatches ADD COLUMN worktree_branch TEXT;
+    ALTER TABLE dispatches ADD COLUMN worktree_base_branch TEXT;
+    ALTER TABLE dispatches ADD COLUMN worktree_identity TEXT;
+    ALTER TABLE dispatches ADD COLUMN worktree_cleaned INTEGER NOT NULL DEFAULT 0 CHECK (worktree_cleaned IN (0,1));
+    CREATE INDEX dispatches_worktree_cleanup ON dispatches(state)
+        WHERE worktree_identity IS NOT NULL AND worktree_cleaned = 0;
+    ",
 ];
 
 pub struct Db {
@@ -133,7 +142,8 @@ fn endpoint_cols(e: &Endpoint) -> (&'static str, Option<&str>) {
 
 const TASK_COLS: &str = "id, run_id, title, spec, status, result_summary, report_path, files_modified, created_ms, updated_ms";
 const DISPATCH_COLS: &str =
-    "id, task_id, run_id, worker_term, agent, model, effort, state, outcome, started_ms, ended_ms, keep_open, auto_close_allowed_ms";
+    "id, task_id, run_id, worker_term, agent, model, effort, state, outcome, started_ms, ended_ms, keep_open, auto_close_allowed_ms,
+     worktree_path, worktree_branch, worktree_base_branch, worktree_identity, worktree_cleaned";
 const MESSAGE_COLS: &str =
     "id, run_id, from_kind, from_dispatch, to_kind, to_dispatch, type, subject, body, reply_to, payload, created_ms, read_ms";
 
@@ -153,6 +163,16 @@ fn task_of(r: &Row<'_>) -> rusqlite::Result<Task> {
 }
 
 fn dispatch_of(r: &Row<'_>) -> rusqlite::Result<Dispatch> {
+    let owned_worktree = match r.get::<_, Option<String>>(13)? {
+        Some(path) => Some(OwnedWorktree {
+            path: path.into(),
+            branch: r.get(14)?,
+            base_branch: r.get(15)?,
+            identity: r.get(16)?,
+            cleaned: r.get(17)?,
+        }),
+        None => None,
+    };
     Ok(Dispatch {
         id: r.get(0)?,
         task_id: r.get(1)?,
@@ -167,6 +187,7 @@ fn dispatch_of(r: &Row<'_>) -> rusqlite::Result<Dispatch> {
         ended_ms: r.get(10)?,
         keep_open: r.get(11)?,
         auto_close_allowed_ms: r.get(12)?,
+        owned_worktree,
     })
 }
 
@@ -312,6 +333,7 @@ impl Db {
         agent: Agent,
         model: Option<&str>,
         effort: Option<&str>,
+        owned_worktree: Option<&OwnedWorktree>,
         now: i64,
     ) -> Result<(Task, Dispatch)> {
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -321,9 +343,16 @@ impl Db {
             params![task_id, run_id, title, spec, now],
         )?;
         tx.execute(
-            "INSERT INTO dispatches (id, task_id, run_id, worker_term, agent, model, effort, state, started_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'starting', ?8)",
-            params![dispatch_id, task_id, run_id, worker_term as i64, agent.as_str(), model, effort, now],
+            "INSERT INTO dispatches (id, task_id, run_id, worker_term, agent, model, effort, state, started_ms,
+                                     worktree_path, worktree_branch, worktree_base_branch, worktree_identity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'starting', ?8, ?9, ?10, ?11, ?12)",
+            params![
+                dispatch_id, task_id, run_id, worker_term as i64, agent.as_str(), model, effort, now,
+                owned_worktree.map(|w| w.path.to_string_lossy()),
+                owned_worktree.map(|w| &w.branch),
+                owned_worktree.map(|w| &w.base_branch),
+                owned_worktree.map(|w| &w.identity),
+            ],
         )?;
         tx.commit()?;
         Ok((
@@ -358,6 +387,23 @@ impl Db {
             "SELECT {DISPATCH_COLS} FROM dispatches WHERE state IN ({list}) ORDER BY started_ms, rowid"
         ))?;
         Ok(st.query_map([], dispatch_of)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn worktrees_pending_cleanup(&self) -> Result<Vec<Dispatch>> {
+        let mut st = self.conn.prepare(&format!(
+            "SELECT {DISPATCH_COLS} FROM dispatches
+             WHERE state IN ('lost', 'released') AND worktree_identity IS NOT NULL AND worktree_cleaned = 0"
+        ))?;
+        Ok(st.query_map([], dispatch_of)?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn mark_worktree_cleaned(&self, dispatch_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE dispatches SET worktree_cleaned = 1
+             WHERE id = ?1 AND state IN ('lost', 'released') AND worktree_identity IS NOT NULL",
+            [dispatch_id],
+        )?;
+        Ok(())
     }
 
     /// The newest live (not lost/released) dispatch whose worker terminal is `term` and that was
@@ -778,7 +824,7 @@ mod tests {
         let run = f.db.ensure_run(1, 0, 1000).unwrap();
         let (task, d) = f
             .db
-            .create_task_with_dispatch(&run.id, "t_00000001", "d_00000001", "Fix parser", "spec text", 2, Agent::Codex, Some("gpt-5"), Some("high"), 1100)
+            .create_task_with_dispatch(&run.id, "t_00000001", "d_00000001", "Fix parser", "spec text", 2, Agent::Codex, Some("gpt-5"), Some("high"), None, 1100)
             .unwrap();
         (run, task, d)
     }
@@ -824,6 +870,53 @@ mod tests {
         assert!(!d.keep_open);
         assert_eq!(d.auto_close_allowed_ms, None);
         assert_eq!(d.auto_close_state(true), Some(AutoClose::ClosesAt(250 + AUTO_CLOSE_DELAY_MS)));
+    }
+
+    #[test]
+    fn migrates_v2_dispatches_and_round_trips_worktree_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orchestration.db");
+        let conn = Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..2] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version VALUES (2);
+             INSERT INTO runs VALUES ('r_1', 1, 100);
+             INSERT INTO tasks (id, run_id, title, spec, status, created_ms, updated_ms)
+                 VALUES ('t_1', 'r_1', 'Fix parser', 'spec', 'completed', 100, 250);
+             INSERT INTO dispatches (id, task_id, run_id, worker_term, agent, state, started_ms, keep_open, auto_close_allowed_ms)
+                 VALUES ('d_1', 't_1', 'r_1', 2, 'codex', 'released', 100, 1, 220);",
+        ).unwrap();
+        drop(conn);
+
+        let mut db = Db::open(&path).unwrap();
+        assert_eq!(db.schema_version().unwrap(), Db::latest_schema_version());
+        let legacy = db.get_dispatch("d_1").unwrap().unwrap();
+        assert!(legacy.keep_open);
+        assert_eq!(legacy.auto_close_allowed_ms, Some(220));
+        assert_eq!(legacy.owned_worktree, None);
+        let wt = OwnedWorktree {
+            path: dir.path().join("worktrees").join("team").join("приклад"),
+            branch: "team/example".into(),
+            base_branch: "release/1".into(),
+            identity: "job-identity".into(),
+            cleaned: false,
+        };
+        db.create_task_with_dispatch(
+            "r_1", "t_2", "d_2", "Example", "spec", 3, Agent::Claude, None, None, Some(&wt), 300,
+        ).unwrap();
+        assert!(db.worktrees_pending_cleanup().unwrap().is_empty());
+        db.set_dispatch_state("d_2", DispatchState::Released, 400).unwrap();
+        let db = Db::open(&path).unwrap();
+        let pending = db.worktrees_pending_cleanup().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].owned_worktree.as_ref(), Some(&wt));
+        db.mark_worktree_cleaned("d_2").unwrap();
+        assert!(db.worktrees_pending_cleanup().unwrap().is_empty());
+        let cleaned = db.get_dispatch("d_2").unwrap().unwrap().owned_worktree.unwrap();
+        assert_eq!(cleaned, OwnedWorktree { cleaned: true, ..wt });
     }
 
     #[test]
@@ -934,7 +1027,7 @@ mod tests {
     fn duplicate_dispatch_ids_are_rejected_atomically() {
         let mut f = fixture();
         let (run, _, _) = started(&mut f);
-        let err = f.db.create_task_with_dispatch(&run.id, "t_00000002", "d_00000001", "x", "y", 3, Agent::Claude, None, None, 1200);
+        let err = f.db.create_task_with_dispatch(&run.id, "t_00000002", "d_00000001", "x", "y", 3, Agent::Claude, None, None, None, 1200);
         assert!(err.is_err());
         // The task insert rolled back with the failed dispatch.
         assert!(f.db.get_task("t_00000002").unwrap().is_none());
