@@ -54,6 +54,11 @@ use crate::session::{Rect, Session};
 use crate::single_instance::Acquire;
 use crate::tray::UiEvent;
 
+/// Window title: `Sich 1.2.3`, with a `-dev` suffix for non-release builds.
+fn window_title(version: &str, official: bool) -> String {
+    if official { format!("Sich {version}") } else { format!("Sich {version}-dev") }
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `sich hook <agent>` runs on every agent hook event: dispatch before any other init. It
@@ -134,8 +139,12 @@ fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
         })
         .detach();
 
-        let displays: Vec<Rect> = cx
-            .displays()
+        let platform_displays = cx.displays();
+        let display_keys: Vec<Option<u64>> = platform_displays
+            .iter()
+            .map(|d| d.uuid().ok().map(|u| session::display_key(u.as_u128())))
+            .collect();
+        let displays: Vec<Rect> = platform_displays
             .iter()
             .map(|d| {
                 let b = d.bounds();
@@ -147,7 +156,11 @@ fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
                 }
             })
             .collect();
-        let placement = session::window_placement(session.as_ref().and_then(|s| s.window.as_ref()), &displays);
+        let placement = session::window_placement_on(
+            session.as_ref().and_then(|s| s.window.as_ref()),
+            &displays,
+            &display_keys,
+        );
         let win_size = size(px(placement.width), px(placement.height));
         let bounds = match placement.origin {
             Some((x, y)) => Bounds { origin: point(px(x), px(y)), size: win_size },
@@ -159,8 +172,11 @@ fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
             } else {
                 WindowBounds::Windowed(bounds)
             }),
+            // Open on the monitor the window was saved on: with no display id gpui assumes the
+            // primary one, and rejects a position that lies on any other monitor.
+            display_id: placement.display.map(|i| platform_displays[i].id()),
             titlebar: Some(TitlebarOptions {
-                title: Some("Sich".into()),
+                title: Some(window_title(env!("CARGO_PKG_VERSION"), updater::OFFICIAL).into()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -178,4 +194,15 @@ fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
 
     drop(rt);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_title;
+
+    #[test]
+    fn window_title_has_version_and_dev_suffix() {
+        assert_eq!(window_title("0.1.2", true), "Sich 0.1.2");
+        assert_eq!(window_title("0.1.2", false), "Sich 0.1.2-dev");
+    }
 }

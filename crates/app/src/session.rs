@@ -152,6 +152,9 @@ pub struct SavedWindow {
     pub width: f32,
     pub height: f32,
     pub maximized: bool,
+    /// Stable key of the monitor the window was on (`display_key`). Needed because logical
+    /// coordinates are per-monitor on Windows, so the position alone does not name a monitor.
+    pub display: Option<u64>,
 }
 
 impl Session {
@@ -220,8 +223,13 @@ impl SavedWindow {
             && height >= 100.
             && x > -10_000.
             && y > -10_000.;
-        ok.then_some(SavedWindow { x, y, width, height, maximized })
+        ok.then_some(SavedWindow { x, y, width, height, maximized, display: None })
     }
+}
+
+/// Folds a display UUID into the compact key stored in `SavedWindow::display`.
+pub fn display_key(uuid: u128) -> u64 {
+    (uuid >> 64) as u64 ^ uuid as u64
 }
 
 /// Live state a `Session` is built from.
@@ -385,24 +393,39 @@ pub struct Placement {
     /// `None` = let the caller center it (no saved position, or it is off-screen).
     pub origin: Option<(f32, f32)>,
     pub maximized: bool,
+    /// Index into the displays slice of the monitor the window must be opened on.
+    pub display: Option<usize>,
 }
 
 /// Placement for the saved window: size clamped to a sane minimum, position kept only when the
 /// title-bar area is reasonably visible on one of `displays`.
+#[cfg(test)]
 pub fn window_placement(saved: Option<&SavedWindow>, displays: &[Rect]) -> Placement {
+    window_placement_on(saved, displays, &[])
+}
+
+/// Like `window_placement`, also picking the monitor to open on. `keys[i]` is the `display_key`
+/// of `displays[i]`. The saved monitor wins when the window is still visible on it; otherwise the
+/// first monitor showing the title-bar area is used.
+pub fn window_placement_on(saved: Option<&SavedWindow>, displays: &[Rect], keys: &[Option<u64>]) -> Placement {
     let Some(s) = saved.filter(|s| [s.x, s.y, s.width, s.height].iter().all(|v| v.is_finite())) else {
-        return Placement { width: DEFAULT_WINDOW.0, height: DEFAULT_WINDOW.1, origin: None, maximized: false };
+        return Placement { width: DEFAULT_WINDOW.0, height: DEFAULT_WINDOW.1, origin: None, maximized: false, display: None };
     };
     let width = s.width.max(MIN_WINDOW.0);
     let height = s.height.max(MIN_WINDOW.1);
     // The strip that must stay reachable: top-left part of the title bar.
     let grab = Rect { x: s.x, y: s.y, w: 120_f32.min(width), h: 40_f32.min(height) };
-    let on_screen = displays.iter().any(|d| {
+    let visible_on = |d: &Rect| {
         let ix = (grab.x + grab.w).min(d.x + d.w) - grab.x.max(d.x);
         let iy = (grab.y + grab.h).min(d.y + d.h) - grab.y.max(d.y);
         ix >= grab.w.min(80.) && iy >= grab.h.min(30.)
-    });
-    Placement { width, height, origin: on_screen.then_some((s.x, s.y)), maximized: s.maximized }
+    };
+    let saved_idx = s
+        .display
+        .and_then(|k| keys.iter().position(|x| *x == Some(k)))
+        .filter(|&i| displays.get(i).is_some_and(visible_on));
+    let display = saved_idx.or_else(|| displays.iter().position(visible_on));
+    Placement { width, height, origin: display.map(|_| (s.x, s.y)), maximized: s.maximized, display }
 }
 
 #[cfg(test)]
@@ -550,7 +573,7 @@ mod tests {
             workspaces: vec![saved_ws(None, &["/h"], Some(0)), saved_ws(Some("/w/a"), &["/w/a", "/w/a/src"], Some(1))],
             collapsed_projects: vec!["/w".into()],
             collapsed_groups: vec!["game".into()],
-            window: Some(SavedWindow { x: 10., y: 20., width: 900., height: 700., maximized: true }),
+            window: Some(SavedWindow { x: 10., y: 20., width: 900., height: 700., maximized: true, display: None }),
             sidebar_w: Some(345.5),
             right_panel: RightPanelState::default(),
         };
@@ -631,7 +654,7 @@ mod tests {
             groups: &groups,
             collapsed: &collapsed,
             collapsed_groups: &cg,
-            window: Some(SavedWindow { x: 1., y: 2., width: 800., height: 600., maximized: false }),
+            window: Some(SavedWindow { x: 1., y: 2., width: 800., height: 600., maximized: false, display: None }),
             sidebar_w: Some(250.),
             right_panel: RightPanelState::default(),
         });
@@ -770,35 +793,74 @@ mod tests {
 
     #[test]
     fn saved_window_on_screen_is_kept() {
-        let s = SavedWindow { x: 100., y: 50., width: 1000., height: 700., maximized: true };
+        let s = SavedWindow { x: 100., y: 50., width: 1000., height: 700., maximized: true, display: None };
         let p = window_placement(Some(&s), &screen());
         assert_eq!((p.width, p.height, p.origin, p.maximized), (1000., 700., Some((100., 50.)), true));
     }
 
     #[test]
     fn off_screen_position_is_dropped_but_size_kept() {
-        let s = SavedWindow { x: 5000., y: 50., width: 1000., height: 700., maximized: false };
+        let s = SavedWindow { x: 5000., y: 50., width: 1000., height: 700., maximized: false, display: None };
         let p = window_placement(Some(&s), &screen());
         assert_eq!((p.width, p.height, p.origin), (1000., 700., None));
         // A second monitor that is gone.
-        let s = SavedWindow { x: -1800., y: 100., width: 800., height: 600., maximized: false };
+        let s = SavedWindow { x: -1800., y: 100., width: 800., height: 600., maximized: false, display: None };
         assert_eq!(window_placement(Some(&s), &screen()).origin, None);
         // ...but present when the monitor is there.
         let two = vec![Rect { x: -1920., y: 0., w: 1920., h: 1080. }, screen()[0]];
         assert_eq!(window_placement(Some(&s), &two).origin, Some((-1800., 100.)));
         // Barely touching an edge does not count.
-        let s = SavedWindow { x: 1915., y: 50., width: 800., height: 600., maximized: false };
+        let s = SavedWindow { x: 1915., y: 50., width: 800., height: 600., maximized: false, display: None };
         assert_eq!(window_placement(Some(&s), &screen()).origin, None);
     }
 
     #[test]
     fn tiny_size_is_clamped_and_nan_ignored() {
-        let s = SavedWindow { x: 0., y: 0., width: 10., height: 10., maximized: false };
+        let s = SavedWindow { x: 0., y: 0., width: 10., height: 10., maximized: false, display: None };
         let p = window_placement(Some(&s), &screen());
         assert_eq!((p.width, p.height), MIN_WINDOW);
-        let s = SavedWindow { x: f32::NAN, y: 0., width: 800., height: 600., maximized: true };
+        let s = SavedWindow { x: f32::NAN, y: 0., width: 800., height: 600., maximized: true, display: None };
         let p = window_placement(Some(&s), &screen());
         assert_eq!((p.width, p.height, p.origin, p.maximized), (1200., 760., None, false));
+    }
+
+    #[test]
+    fn placement_prefers_saved_display_and_falls_back() {
+        let two = [
+            Rect { x: 0., y: 0., w: 1920., h: 1080. },
+            Rect { x: -1440., y: -300., w: 1440., h: 1700. },
+        ];
+        let keys = [Some(1), Some(2)];
+        let mut s = SavedWindow { x: -1439., y: -273., width: 1438., height: 1649., maximized: false, display: Some(2) };
+        let p = window_placement_on(Some(&s), &two, &keys);
+        assert_eq!((p.origin, p.display), (Some((-1439., -273.)), Some(1)));
+        // unknown key: monitor found by position
+        s.display = Some(99);
+        assert_eq!(window_placement_on(Some(&s), &two, &keys).display, Some(1));
+        s.display = None;
+        assert_eq!(window_placement_on(Some(&s), &two, &keys).display, Some(1));
+        // saved monitor no longer shows the window: use the one that does
+        s.x = 100.;
+        s.y = 100.;
+        s.display = Some(2);
+        assert_eq!(window_placement_on(Some(&s), &two, &keys).display, Some(0));
+        // off-screen: no origin, no display
+        s.x = 9000.;
+        let p = window_placement_on(Some(&s), &two, &keys);
+        assert_eq!((p.origin, p.display), (None, None));
+    }
+
+    #[test]
+    fn display_key_is_stable_and_mixes_halves() {
+        assert_eq!(display_key(5), display_key(5));
+        assert_ne!(display_key(2), display_key((1 << 64) | 2));
+        assert_eq!(display_key(0), 0);
+    }
+
+    #[test]
+    fn saved_window_without_display_field_still_loads() {
+        let w: SavedWindow = serde_json::from_str(r#"{"x":1.0,"y":2.0,"width":800.0,"height":600.0,"maximized":false}"#).unwrap();
+        assert_eq!(w.display, None);
     }
 
     #[test]

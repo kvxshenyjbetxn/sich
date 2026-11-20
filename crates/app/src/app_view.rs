@@ -321,7 +321,7 @@ impl AppView {
         }).detach();
         self.window_active = window.is_window_active();
         self.hwnd = win_flash::hwnd_of(window);
-        self.window_state = saved_window_of(window);
+        self.window_state = saved_window_of(window, cx);
 
         let lang = settings::language(cx);
         match Tray::new(lang, &tray::tray_tooltip(lang, 0, 0), self.events_tx.clone()) {
@@ -343,7 +343,7 @@ impl AppView {
             false
         });
         cx.observe_window_bounds(window, |this, window, cx| {
-            this.window_state = saved_window_of(window).or(this.window_state);
+            this.window_state = saved_window_of(window, cx).or(this.window_state);
             let infos: Vec<TerminalInfo> =
                 this.client.snapshot().terminals.iter().map(|t| t.info.clone()).collect();
             this.touch_session(&infos, cx);
@@ -1200,7 +1200,7 @@ impl AppView {
 }
 
 /// Window bounds for the session (logical pixels); `None` when they look bogus.
-fn saved_window_of(window: &Window) -> Option<SavedWindow> {
+fn saved_window_of(window: &Window, cx: &gpui_kit::gpui::App) -> Option<SavedWindow> {
     let (bounds, maximized) = match window.window_bounds() {
         WindowBounds::Windowed(b) => (b, false),
         WindowBounds::Maximized(b) => (b, true),
@@ -1213,6 +1213,10 @@ fn saved_window_of(window: &Window) -> Option<SavedWindow> {
         f32::from(bounds.size.height),
         maximized,
     )
+    .map(|w| SavedWindow {
+        display: window.display(cx).and_then(|d| d.uuid().ok()).map(|u| session::display_key(u.as_u128())),
+        ..w
+    })
 }
 
 /// Width of the invisible sidebar resize hit area.
