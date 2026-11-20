@@ -37,6 +37,7 @@ mod term_settings;
 mod theme;
 mod tray;
 mod update_dialog;
+mod update_status;
 mod updater;
 mod view;
 mod win_caret;

@@ -35,6 +35,7 @@ use crate::settings;
 use crate::settings_dialog;
 use crate::tray::{self, Tray, UiEvent};
 use crate::update_dialog::{self, UpdateFlow};
+use crate::update_status::{self, CheckStatus};
 use crate::updater;
 use crate::view::TerminalView;
 use crate::workspace::{
@@ -453,27 +454,66 @@ impl AppView {
                     })
                     .unwrap_or(false);
                 if wanted {
-                    let found = cx
-                        .background_executor()
-                        .spawn(async { updater::fetch_latest(&updater::current_version()) })
-                        .await;
-                    match found {
-                        Ok(release) => {
-                            let alive = this.update(cx, |this, cx| {
-                                if this.update_flow.is_none() {
-                                    this.update_available = release;
-                                    cx.notify();
-                                }
-                            });
-                            if alive.is_err() {
-                                break;
-                            }
-                        }
-                        Err(err) => tracing::debug!("update check failed: {err:#}"),
+                    let found = cx.background_executor().spawn(fetch_latest_now()).await;
+                    if let Err(err) = &found {
+                        tracing::debug!("update check failed: {err:#}");
+                    }
+                    if this.update(cx, |this, cx| this.apply_check(&found, cx)).is_err() {
+                        break;
                     }
                 }
                 cx.background_executor().timer(updater::CHECK_INTERVAL).await;
             }
+        })
+        .detach();
+    }
+
+    /// Records a check result: sets the pending release (unless an update flow is running)
+    /// and the status shown in settings. Returns the release when a newer one exists.
+    fn apply_check(&mut self, result: &anyhow::Result<Option<updater::Release>>, cx: &mut Context<Self>) -> Option<updater::Release> {
+        let release = match result {
+            Ok(release) => {
+                if self.update_flow.is_none() {
+                    self.update_available = release.clone();
+                    cx.notify();
+                }
+                release.clone()
+            }
+            Err(_) => None,
+        };
+        let status = match result {
+            Ok(Some(r)) => CheckStatus::Available(r.version.to_string()),
+            Ok(None) => CheckStatus::UpToDate,
+            Err(err) => CheckStatus::Failed(format!("{err:#}")),
+        };
+        update_status::set(status, cx);
+        release
+    }
+
+    /// Manual "check now" from settings. Works regardless of the auto-check toggle.
+    pub(crate) fn check_updates_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !updater::OFFICIAL {
+            return;
+        }
+        if self.update_flow.is_some() {
+            window.close_dialog(cx);
+            update_dialog::open(cx.entity(), window, cx);
+            return;
+        }
+        if update_status::get(cx) == CheckStatus::Checking {
+            return;
+        }
+        update_status::set(CheckStatus::Checking, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let found = cx.background_executor().spawn(fetch_latest_now()).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(release) = this.apply_check(&found, cx) {
+                    // Dialogs can't coexist: close settings, then show the update dialog.
+                    window.close_dialog(cx);
+                    this.update_available = Some(release);
+                    update_dialog::open(cx.entity(), window, cx);
+                }
+            });
         })
         .detach();
     }
@@ -968,7 +1008,7 @@ impl AppView {
         match ks.key.as_str() {
             "t" if m.shift => self.new_terminal_here(cx),
             "g" if m.shift => self.toggle_right_panel(window, cx),
-            "," if !m.shift => settings_dialog::open(window, cx),
+            "," if !m.shift => settings_dialog::open(cx.entity(), window, cx),
             "tab" => self.cycle(if m.shift { -1 } else { 1 }, window, cx),
             _ => return,
         }
@@ -1193,10 +1233,15 @@ impl AppView {
                     .icon(Icon::new(IconName::Settings))
                     .tooltip(tr(lang, Tr::Settings))
                     .on_click(cx.listener(|_this, _: &ClickEvent, window, cx| {
-                        settings_dialog::open(window, cx)
+                        settings_dialog::open(cx.entity(), window, cx)
                     })),
             )
     }
+}
+
+/// Blocking release lookup; run it on the background executor.
+async fn fetch_latest_now() -> anyhow::Result<Option<updater::Release>> {
+    updater::fetch_latest(&updater::current_version())
 }
 
 /// Window bounds for the session (logical pixels); `None` when they look bogus.

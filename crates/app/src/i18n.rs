@@ -117,6 +117,9 @@ pub enum Tr {
     Verifying,
     Installing,
     CheckUpdates,
+    CheckNow,
+    CheckingUpdates,
+    UpdatesDevBuild,
     NoWriteAccess,
     TrayShow,
     TrayQuit,
@@ -256,6 +259,9 @@ impl Tr {
         Tr::Verifying,
         Tr::Installing,
         Tr::CheckUpdates,
+        Tr::CheckNow,
+        Tr::CheckingUpdates,
+        Tr::UpdatesDevBuild,
         Tr::NoWriteAccess,
         Tr::TrayShow,
         Tr::TrayQuit,
@@ -936,6 +942,21 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "Проверять обновления",
             En => "Check for updates",
         },
+        Tr::CheckNow => match lang {
+            Uk => "Перевірити зараз",
+            Ru => "Проверить сейчас",
+            En => "Check now",
+        },
+        Tr::CheckingUpdates => match lang {
+            Uk => "Перевірка…",
+            Ru => "Проверка…",
+            En => "Checking…",
+        },
+        Tr::UpdatesDevBuild => match lang {
+            Uk => "Dev-збірка: оновлення вимкнені",
+            Ru => "Dev-сборка: обновления отключены",
+            En => "Dev build: updates disabled",
+        },
         Tr::NoWriteAccess => match lang {
             Uk => "Немає прав на запис у теку програми. Перенесіть Sich у теку користувача.",
             Ru => "Нет прав на запись в папку программы. Перенесите Sich в папку пользователя.",
@@ -1125,6 +1146,22 @@ pub fn update_available(lang: Language, version: &str) -> String {
     }
 }
 
+pub fn up_to_date(lang: Language, current: &str) -> String {
+    match lang {
+        Language::Uk => format!("У вас остання версія ({current})"),
+        Language::Ru => format!("У вас последняя версия ({current})"),
+        Language::En => format!("You're up to date ({current})"),
+    }
+}
+
+pub fn check_failed(lang: Language, err: &str) -> String {
+    match lang {
+        Language::Uk => format!("Не вдалося перевірити: {err}"),
+        Language::Ru => format!("Не удалось проверить: {err}"),
+        Language::En => format!("Check failed: {err}"),
+    }
+}
+
 pub fn update_failed(lang: Language, err: &str) -> String {
     match lang {
         Language::Uk => format!("Не вдалося оновити: {err}"),
@@ -1245,6 +1282,8 @@ mod tests {
             assert!(more_subagents(lang, 7).contains('7'));
             assert!(update_available(lang, "1.2.3").contains("1.2.3"));
             assert!(update_failed(lang, "boom").contains("boom"));
+            assert!(up_to_date(lang, "1.2.3").contains("1.2.3"));
+            assert!(check_failed(lang, "boom").contains("boom"));
             assert!(download_progress(lang, 1024 * 1024, 4 * 1024 * 1024).contains("(25%)"));
             assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains('9'));
             assert!(hooks_installed(lang, Some(9), Some("2.1.3")).contains("v2.1.3"));

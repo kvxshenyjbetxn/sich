@@ -1,27 +1,32 @@
 //! Settings dialog: language, theme and agent tracking, applied immediately.
 
 use gpui_kit::component::Disableable as _;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    App, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window, div, px, rgb,
 };
 
 use crate::agent_hooks;
+use crate::app_view::AppView;
+use crate::update_status::{self, CheckStatus};
+use crate::updater;
 use crate::codex_hooks::{self, CodexStatus};
 use crate::i18n::{Language, Tr, tr};
 use crate::orch_skill;
 use crate::settings;
 use crate::theme::{self, ThemeKind};
 
-pub fn open(window: &mut Window, cx: &mut App) {
+pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
     }
     // The builder runs on every render, so the dialog follows language and theme changes.
-    window.open_dialog(cx, |dialog, _window, cx| {
+    window.open_dialog(cx, move |dialog, _window, cx| {
         let lang = settings::language(cx);
+        let app = app.clone();
         dialog
             .title(tr(lang, Tr::Settings))
             .w(px(520.))
@@ -53,6 +58,7 @@ pub fn open(window: &mut Window, cx: &mut App) {
                             .label(tr(lang, Tr::CheckUpdates))
                             .on_click(|checked, _window, cx| settings::set_check_updates(*checked, cx)),
                     )
+                    .child(update_check_row(lang, app, cx))
                     .child(
                         Switch::new("close-to-tray")
                             .checked(settings::get(cx).close_to_tray)
@@ -61,6 +67,31 @@ pub fn open(window: &mut Window, cx: &mut App) {
                     ),
             )
     });
+}
+
+fn update_check_row(lang: Language, app: Entity<AppView>, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let status = if updater::OFFICIAL { update_status::get(cx) } else { CheckStatus::Dev };
+    let (text, is_error) = update_status::text(lang, &status, env!("CARGO_PKG_VERSION"));
+    let busy = status == CheckStatus::Checking;
+    h_flex()
+        .gap_3()
+        .items_center()
+        .child(
+            Button::new("check-updates-now")
+                .xsmall()
+                .label(tr(lang, Tr::CheckNow))
+                .disabled(!updater::OFFICIAL || busy)
+                .on_click(move |_, window, cx| {
+                    app.update(cx, |this, cx| this.check_updates_now(window, cx))
+                }),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(if is_error { theme.danger } else { theme.muted_foreground })
+                .child(text),
+        )
 }
 
 fn section(title: &'static str, body: impl IntoElement, cx: &App) -> impl IntoElement {
