@@ -17,6 +17,8 @@ use sich_orch::{Db, dialogs};
 use sich_proto::{AgentState, ClientMsg, PROTO_VERSION, ServerMsg, TermId, TerminalInfo, decode, encode, frame_codec};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+use crate::settings::AppSettings;
+
 /// Hidden test hook: replaces the `claude` / `codex` program in the launch command.
 pub const ENV_FAKE_AGENT: &str = "SICH_ORCH_FAKE_AGENT";
 /// Hidden test hook: readiness timeout in milliseconds (default 90 s).
@@ -592,6 +594,7 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
         model: args.model.as_deref(),
         effort: args.effort.as_deref(),
         task_file: &task_file,
+        unattended: AppSettings::load().orch_unattended_workers,
         program: program.as_deref(),
     };
     // Validate everything before any side effect.

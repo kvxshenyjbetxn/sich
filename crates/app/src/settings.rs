@@ -29,6 +29,8 @@ pub struct AppSettings {
     pub codex_hooks: bool,
     /// Install the Claude Code skill that teaches a coordinator agent `sich orch`.
     pub orchestration_skill: bool,
+    /// Start orchestration workers with the agent's full-autonomy flag.
+    pub orch_unattended_workers: bool,
     /// Closing the window hides it to the system tray instead of quitting.
     pub close_to_tray: bool,
     pub resume_agents_on_restore: bool,
@@ -47,6 +49,7 @@ impl Default for AppSettings {
             agent_hooks: true,
             codex_hooks: true,
             orchestration_skill: true,
+            orch_unattended_workers: true,
             close_to_tray: true,
             resume_agents_on_restore: true,
             check_updates: true,
@@ -161,6 +164,14 @@ pub fn set_orchestration_skill(enabled: bool, cx: &mut App) {
     }
     s.orchestration_skill = enabled;
     store(s, cx);
+}
+
+pub fn set_orch_unattended_workers(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.orch_unattended_workers != enabled {
+        s.orch_unattended_workers = enabled;
+        store(s, cx);
+    }
 }
 
 pub fn set_resume_agents_on_restore(enabled: bool, cx: &mut App) {
@@ -295,6 +306,16 @@ mod tests {
         let off = AppSettings { orchestration_skill: false, ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!back.orchestration_skill);
+    }
+
+    #[test]
+    fn unattended_workers_default_to_true_and_can_be_disabled() {
+        assert!(AppSettings::default().orch_unattended_workers);
+        let old: AppSettings = serde_json::from_str(r#"{"orchestration_skill":false}"#).unwrap();
+        assert!(old.orch_unattended_workers);
+        let off = AppSettings { orch_unattended_workers: false, ..old };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.orch_unattended_workers);
     }
 
     #[test]

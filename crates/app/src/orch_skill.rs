@@ -51,6 +51,7 @@ description: Use when the user asks to delegate or orchestrate work to Codex or 
 # Sich orchestration
 
 You are a coordinator running inside a Sich terminal. You can start worker agents (Codex or Claude) in new Sich terminals, give them tasks, answer their questions and collect their results. Workers are ordinary agent CLIs started with their own login; you never touch their terminals.
+Workers start with the agent's full-autonomy flag unless the user turned that off in Sich settings.
 
 All commands are `{x} orch <command>`. In PowerShell write `& {x} orch <command>`. They identify you through the `SICH_TERM_ID` environment variable of this terminal, so they only work inside Sich.
 
@@ -185,6 +186,19 @@ mod tests {
         for rule in ["END YOUR TURN", "Never poll", "Never type into a worker's terminal", "state=blocked", "state=unknown"] {
             assert!(text.contains(rule), "missing {rule}");
         }
+    }
+
+    #[test]
+    fn install_updates_an_existing_skill_with_the_worker_autonomy_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = skill_file(dir.path());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, format!("{MARKER}\n\n# Sich orchestration\n")).unwrap();
+
+        assert_eq!(install(dir.path(), &exe()).unwrap(), InstallOutcome::Written);
+        assert!(std::fs::read_to_string(file).unwrap().contains(
+            "Workers start with the agent's full-autonomy flag unless the user turned that off in Sich settings."
+        ));
     }
 
     #[test]
