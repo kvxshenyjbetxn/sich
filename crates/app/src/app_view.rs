@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::assets::IconName as Ic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::tooltip::Tooltip;
 use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
@@ -1181,17 +1182,28 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
-        let old_build = matches!(snap.status, ConnStatus::Connected { .. })
-            && snap.daemon_build.as_deref().is_some_and(|id| id != sich_app::daemon_build_id());
-        let text = if self.restarting_daemon {
-            tr(lang, Tr::DaemonRestarting).to_string()
-        } else {
-            match snap.status {
-                ConnStatus::Connected { .. } if old_build => tr(lang, Tr::DaemonOlderBuild).to_string(),
-                ConnStatus::Connected { pid } => i18n::connected(lang, pid),
-                ConnStatus::Reconnecting => tr(lang, Tr::Reconnecting).to_string(),
-                ConnStatus::Incompatible { version, .. } => i18n::daemon_incompatible(lang, version, PROTO_VERSION),
+        let status = status_line(
+            lang,
+            &snap.status,
+            self.restarting_daemon,
+            snap.daemon_build.as_deref(),
+            sich_app::daemon_build_id(),
+        );
+        let old_build = matches!(&status, StatusLine::Text { old_build: true, .. });
+        let indicator = match status {
+            StatusLine::Dot { tooltip } => {
+                div()
+                    .id("daemon-connected")
+                    .size(px(16.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                    .child(div().size(px(8.)).rounded_full().bg(theme.success))
+                    .into_any_element()
             }
+            StatusLine::Text { text, .. } => text.into_any_element(),
         };
         let restart = old_build && self.session_ready();
         let app = cx.entity();
@@ -1207,7 +1219,7 @@ impl AppView {
             .border_color(theme.status_bar_border)
             .text_size(px(12.))
             .text_color(if old_build { theme.warning } else { theme.muted_foreground })
-            .child(div().flex_1().child(text))
+            .child(div().flex_1().child(indicator))
             .children(self.update_available.as_ref().map(|release| {
                 let app = app.clone();
                 h_flex()
@@ -1240,6 +1252,40 @@ impl AppView {
                     })),
             )
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StatusLine {
+    Dot { tooltip: String },
+    Text { text: String, old_build: bool },
+}
+
+fn status_line(
+    lang: i18n::Language,
+    status: &ConnStatus,
+    restarting: bool,
+    daemon_build: Option<&str>,
+    own_build: &str,
+) -> StatusLine {
+    let old_build = matches!(status, ConnStatus::Connected { .. })
+        && daemon_build.is_some_and(|id| id != own_build);
+    let text = if restarting {
+        tr(lang, Tr::DaemonRestarting).to_string()
+    } else {
+        match *status {
+            ConnStatus::Connected { .. } if old_build => tr(lang, Tr::DaemonOlderBuild).to_string(),
+            ConnStatus::Connected { pid } => {
+                return StatusLine::Dot {
+                    tooltip: i18n::connected(lang, pid),
+                };
+            }
+            ConnStatus::Reconnecting => tr(lang, Tr::Reconnecting).to_string(),
+            ConnStatus::Incompatible { version, .. } => {
+                i18n::daemon_incompatible(lang, version, PROTO_VERSION)
+            }
+        }
+    };
+    StatusLine::Text { text, old_build }
 }
 
 /// Blocking release lookup; run it on the background executor.
@@ -1458,5 +1504,91 @@ impl Render for AppView {
             );
         }
         root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LANG: i18n::Language = i18n::Language::En;
+    const CONNECTED: ConnStatus = ConnStatus::Connected { pid: 12345 };
+    const INCOMPATIBLE: ConnStatus = ConnStatus::Incompatible {
+        pid: None,
+        version: None,
+    };
+
+    #[test]
+    fn connected_with_matching_build_shows_dot_with_pid() {
+        assert_eq!(
+            status_line(LANG, &CONNECTED, false, Some("current"), "current"),
+            StatusLine::Dot {
+                tooltip: "Connected to daemon (pid 12345)".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn connected_with_different_build_shows_warning() {
+        assert_eq!(
+            status_line(LANG, &CONNECTED, false, Some("old"), "current"),
+            StatusLine::Text {
+                text: tr(LANG, Tr::DaemonOlderBuild).into(),
+                old_build: true,
+            },
+        );
+    }
+
+    #[test]
+    fn connected_without_build_info_shows_dot() {
+        assert_eq!(
+            status_line(LANG, &CONNECTED, false, None, "current"),
+            StatusLine::Dot {
+                tooltip: i18n::connected(LANG, 12345),
+            },
+        );
+    }
+
+    #[test]
+    fn restarting_takes_precedence_and_preserves_old_build_warning() {
+        for (status, build, old_build) in [
+            (CONNECTED, Some("old"), true),
+            (CONNECTED, Some("current"), false),
+            (ConnStatus::Reconnecting, Some("old"), false),
+            (INCOMPATIBLE, Some("old"), false),
+        ] {
+            assert_eq!(
+                status_line(LANG, &status, true, build, "current"),
+                StatusLine::Text {
+                    text: tr(LANG, Tr::DaemonRestarting).into(),
+                    old_build,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn reconnecting_shows_muted_text() {
+        assert_eq!(
+            status_line(LANG, &ConnStatus::Reconnecting, false, Some("old"), "current"),
+            StatusLine::Text {
+                text: tr(LANG, Tr::Reconnecting).into(),
+                old_build: false,
+            },
+        );
+    }
+
+    #[test]
+    fn incompatible_shows_muted_text_with_or_without_version() {
+        for version in [None, Some(PROTO_VERSION - 1)] {
+            let status = ConnStatus::Incompatible { pid: None, version };
+            assert_eq!(
+                status_line(LANG, &status, false, Some("old"), "current"),
+                StatusLine::Text {
+                    text: i18n::daemon_incompatible(LANG, version, PROTO_VERSION),
+                    old_build: false,
+                },
+            );
+        }
     }
 }
