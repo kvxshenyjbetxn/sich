@@ -53,11 +53,13 @@ pub struct RightPanelState {
     pub open: bool,
     pub tab: RightTab,
     pub history_collapsed: bool,
+    /// Explicit commit-history height; `None` keeps the responsive 40% default.
+    pub history_height: Option<f32>,
 }
 
 impl Default for RightPanelState {
     fn default() -> Self {
-        Self { width: None, open: true, tab: RightTab::default(), history_collapsed: false }
+        Self { width: None, open: true, tab: RightTab::default(), history_collapsed: false, history_height: None }
     }
 }
 
@@ -69,6 +71,7 @@ impl From<serde_json::Value> for RightPanelState {
             open: value["open"].as_bool().unwrap_or(default.open),
             tab: serde_json::from_value(value["tab"].clone()).unwrap_or_default(),
             history_collapsed: value["history_collapsed"].as_bool().unwrap_or(default.history_collapsed),
+            history_height: width_value(&value["history_height"]),
         }
     }
 }
@@ -648,10 +651,14 @@ mod tests {
             let session = Session::parse(&format!(r#"{{"right_panel":{right_panel}}}"#)).unwrap();
             assert_eq!(session.right_panel, RightPanelState::default());
         }
-        let prefs = RightPanelState { width: Some(520.), open: false, tab: RightTab::Git, history_collapsed: true };
+        let prefs = RightPanelState { width: Some(520.), open: false, tab: RightTab::Git, history_collapsed: true, history_height: Some(280.) };
         let session = Session { right_panel: prefs, ..Default::default() };
         let json = serde_json::to_string(&session).unwrap();
         assert_eq!(Session::parse(&json).unwrap().right_panel, prefs);
+        for value in [r#"{"history_height":-1}"#, r#"{"history_height":"tall"}"#] {
+            let session = Session::parse(&format!(r#"{{"right_panel":{value}}}"#)).unwrap();
+            assert_eq!(session.right_panel.history_height, None);
+        }
     }
 
     #[test]

@@ -10,8 +10,9 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, Context, ElementId, Hsla, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
+    AnyElement, Context, CursorStyle, ElementId, Hsla, InteractiveElement as _, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
 use sich_git::STATUS_LIMIT;
 
@@ -27,6 +28,10 @@ const REF_LABEL_CHARS: usize = 16;
 
 impl Render for GitPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let available = (f32::from(window.viewport_size().height) - 56.).max(28.);
+        if let Some(height) = self.history_height {
+            self.history_height = Some(clamp_history_height(height, available));
+        }
         let theme = cx.theme().clone();
         let lang = settings::language(cx);
         let input = if self.status.is_some() {
@@ -64,9 +69,20 @@ impl Render for GitPanel {
         v_flex()
             .size_full()
             .min_h_0()
+            .relative()
             .overflow_hidden()
             .bg(theme.sidebar)
             .child(content)
+            .children(self.history_drag.is_some().then(|| {
+                div()
+                    .id("git-history-drag-overlay")
+                    .absolute()
+                    .size_full()
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .on_mouse_move(cx.listener(Self::on_history_drag_move))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_history_drag_end))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_history_drag_end))
+            }))
     }
 }
 
@@ -487,6 +503,40 @@ impl GitPanel {
             )
     }
 
+    fn on_history_handle_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        if event.click_count >= 2 {
+            self.history_drag = None;
+            self.history_height = None;
+        } else {
+            let available = (f32::from(window.viewport_size().height) - 56.).max(28.);
+            self.history_drag = Some(HistoryDrag {
+                start_y: event.position.y.into(),
+                start_height: clamp_history_height(self.history_height.unwrap_or(f32::NAN), available),
+            });
+        }
+        cx.notify();
+    }
+
+    fn on_history_drag_move(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(drag) = self.history_drag else { return };
+        let available = (f32::from(window.viewport_size().height) - 56.).max(28.);
+        let y: f32 = event.position.y.into();
+        self.history_height = Some(clamp_history_height(drag.start_height + drag.start_y - y, available));
+        cx.notify();
+    }
+
+    fn on_history_drag_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
     fn history_section(&self, lang: Language, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let header = h_flex()
@@ -512,9 +562,31 @@ impl GitPanel {
             )));
         v_flex()
             .w_full()
+            .relative()
             .flex_shrink_0()
             .border_t_1()
             .border_color(theme.border)
+            .children((!self.history_collapsed).then(|| {
+                div()
+                    .id("git-history-resize")
+                    .group("git-history-resize")
+                    .absolute()
+                    .top(px(-3.))
+                    .left_0()
+                    .right_0()
+                    .h(px(6.))
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_history_handle_down))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(2.))
+                            .left_0()
+                            .right_0()
+                            .h(px(2.))
+                            .group_hover("git-history-resize", |s| s.bg(theme.primary.opacity(0.6))),
+                    )
+            }))
             .child(header)
             .children((!self.history_collapsed).then(|| {
                 div()
@@ -550,8 +622,10 @@ impl GitPanel {
             }))
             .h(if self.history_collapsed {
                 px(28.).into()
+            } else if let Some(height) = self.history_height {
+                px(height).into()
             } else {
-                relative(0.4)
+                relative(DEFAULT_HISTORY_RATIO)
             })
     }
 

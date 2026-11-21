@@ -97,12 +97,14 @@ pub(crate) struct RestoreData {
     pub separator: &'static str,
     pub interruption: Option<&'static str>,
     pub resume: Option<String>,
+    /// Quick commands must still run if the user types while the shell is starting.
+    pub protect_resume: bool,
     pub split: bool,
 }
 
 impl RestoreData {
     pub(crate) fn fresh_split(token: u64) -> Self {
-        Self { token, scrollback: None, separator: "", interruption: None, resume: None, split: true }
+        Self { token, scrollback: None, separator: "", interruption: None, resume: None, protect_resume: false, split: true }
     }
 }
 
@@ -410,8 +412,23 @@ impl DaemonPool {
     }
 
     pub(crate) fn open_split(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, size: (u16, u16), token: u64) -> bool {
+        self.open_split_data(worktree, cwd, size, RestoreData::fresh_split(token))
+    }
+
+    pub(crate) fn open_quick_split(
+        &self,
+        worktree: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+        size: (u16, u16),
+        token: u64,
+        command: String,
+    ) -> bool {
+        let data = RestoreData { resume: Some(command), protect_resume: true, ..RestoreData::fresh_split(token) };
+        self.open_split_data(worktree, cwd, size, data)
+    }
+
+    fn open_split_data(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, size: (u16, u16), data: RestoreData) -> bool {
         let state = self.0.primary.state.lock();
-        let data = RestoreData::fresh_split(token);
         matches!(state.status, ConnStatus::Connected { .. })
             && self.0.primary.cmd_tx.send(Cmd::Restore { worktree, cwd, cols: size.0, rows: size.1, data }).is_ok()
     }
@@ -604,7 +621,7 @@ mod tests {
         static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         DIR.get_or_init(|| {
             let dir = tempfile::tempdir().unwrap();
-            // SAFETY: only this test reads these overrides; they are set once before it starts a daemon.
+            // SAFETY: initialize once before starting the in-process daemon fixtures.
             unsafe {
                 std::env::set_var("SICH_CONFIG_DIR", dir.path().join("config"));
                 std::env::set_var("SICH_DATA_DIR", dir.path().join("data"));
@@ -647,6 +664,35 @@ mod tests {
 
     async fn reachable(socket: &str) -> bool {
         sich_daemon::connect(socket).await.is_ok()
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn quick_split_runs_in_requested_directory_before_shell_exits() {
+        isolate();
+        let cwd = tempfile::tempdir().unwrap();
+        let base = unique_base();
+        let build = "quick-command-test";
+        let daemon = tokio::spawn({
+            let base = base.clone();
+            async move { sich_daemon::run_generation(&base, build).await }
+        });
+        let pool = DaemonPool::start_on(&Handle::current(), base, build, Arc::new(|| {}), false);
+        eventually("quick command daemon", || pool.terminals_synced()).await;
+
+        let command = crate::quick_commands::startup_command(
+            "Set-Content -LiteralPath quick-command-result.txt -Value quick-ok # trailing comment",
+        );
+        assert!(pool.open_quick_split(None, Some(cwd.path().to_owned()), (80, 24), 42, command));
+        eventually("quick command to finish", || {
+            pool.snapshot().terminals.iter().any(|entry| {
+                entry.restore_token == Some(42) && entry.info.exited.is_some()
+            })
+        }).await;
+        let result = std::fs::read_to_string(cwd.path().join("quick-command-result.txt")).unwrap();
+        assert_eq!(result.trim(), "quick-ok");
+        crate::cli::shutdown(pool.primary_socket()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), daemon).await.unwrap().unwrap().unwrap();
     }
 
     #[test]

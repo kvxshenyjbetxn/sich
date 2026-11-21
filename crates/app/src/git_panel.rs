@@ -28,6 +28,22 @@ pub(crate) const DEFAULT_RIGHT_W: f32 = 340.;
 pub(crate) const MIN_RIGHT_W: f32 = 260.;
 const MAX_RIGHT_W: f32 = 700.;
 const MIN_TERMINAL_W: f32 = 400.;
+const MIN_HISTORY_H: f32 = 88.;
+const MIN_HISTORY_SIBLINGS_H: f32 = 240.;
+const DEFAULT_HISTORY_RATIO: f32 = 0.4;
+
+fn clamp_history_height(height: f32, available: f32) -> f32 {
+    let min = MIN_HISTORY_H.min(available.max(28.));
+    let max = (available - MIN_HISTORY_SIBLINGS_H).max(min);
+    let height = if height.is_finite() { height } else { available * DEFAULT_HISTORY_RATIO };
+    height.clamp(min, max)
+}
+
+#[derive(Clone, Copy)]
+struct HistoryDrag {
+    start_y: f32,
+    start_height: f32,
+}
 
 /// Keep 400 px for the terminal. In a window too narrow for both sidebars, the right panel
 /// yields space below its normal minimum.
@@ -235,6 +251,8 @@ pub(crate) struct GitPanel {
     refreshing: bool,
     refreshing_history: bool,
     history_collapsed: bool,
+    history_height: Option<f32>,
+    history_drag: Option<HistoryDrag>,
     history: History,
     collapsed: HashSet<Section>,
     active_diff: Option<CompareKey>,
@@ -251,7 +269,7 @@ pub(crate) struct GitPanel {
 impl EventEmitter<GitPanelEvent> for GitPanel {}
 
 impl GitPanel {
-    pub(crate) fn new(history_collapsed: bool) -> Self {
+    pub(crate) fn new(history_collapsed: bool, history_height: Option<f32>) -> Self {
         Self {
             worktree: None,
             generation: Generation::default(),
@@ -262,6 +280,8 @@ impl GitPanel {
             refreshing: false,
             refreshing_history: false,
             history_collapsed,
+            history_height,
+            history_drag: None,
             history: History::default(),
             collapsed: HashSet::new(),
             active_diff: None,
@@ -278,6 +298,10 @@ impl GitPanel {
 
     pub(crate) fn history_collapsed(&self) -> bool {
         self.history_collapsed
+    }
+
+    pub(crate) fn history_height(&self) -> Option<f32> {
+        self.history_height
     }
 
     pub(crate) fn select(&mut self, worktree: Option<&Path>, cx: &mut Context<Self>) {
@@ -852,6 +876,15 @@ mod tests {
         assert_eq!(clamp_right_w(600., 1100., 300.), 400.);
         assert_eq!(clamp_right_w(340., 640., 200.), 40.);
         assert_eq!(clamp_right_w(f32::NAN, f32::INFINITY, 0.), 340.);
+    }
+
+    #[test]
+    fn history_bounds_keep_both_sections_usable() {
+        assert_eq!(clamp_history_height(280., 700.), 280.);
+        assert_eq!(clamp_history_height(10., 700.), MIN_HISTORY_H);
+        assert_eq!(clamp_history_height(900., 700.), 700. - MIN_HISTORY_SIBLINGS_H);
+        assert_eq!(clamp_history_height(f32::NAN, 700.), 280.);
+        assert_eq!(clamp_history_height(200., 100.), MIN_HISTORY_H);
     }
 
     #[test]

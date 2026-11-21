@@ -6,6 +6,7 @@ use gpui_kit::{App, Global};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::Language;
+use crate::quick_commands::QuickCommand;
 use crate::theme::{self, ThemeKind};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +47,7 @@ pub struct AppSettings {
     /// Close finished orchestration workers after their grace period.
     pub orch_auto_close_workers: bool,
     pub orch_cleanup_worktrees: bool,
+    pub quick_commands: Vec<QuickCommand>,
 }
 
 impl Default for AppSettings {
@@ -69,6 +71,7 @@ impl Default for AppSettings {
             diff_wrap_lines: false,
             orch_auto_close_workers: true,
             orch_cleanup_worktrees: true,
+            quick_commands: Vec::new(),
         }
     }
 }
@@ -233,6 +236,26 @@ pub fn set_orch_cleanup_worktrees(enabled: bool, cx: &mut App) {
     if s.orch_cleanup_worktrees != enabled {
         s.orch_cleanup_worktrees = enabled;
         store(s, cx);
+    }
+}
+
+pub fn save_quick_command(index: Option<usize>, command: QuickCommand, cx: &mut App) {
+    let mut s = get(cx);
+    match index {
+        Some(index) if index < s.quick_commands.len() => s.quick_commands[index] = command,
+        Some(_) => return,
+        None => s.quick_commands.push(command),
+    }
+    store(s, cx);
+    cx.refresh_windows();
+}
+
+pub fn remove_quick_command(index: usize, cx: &mut App) {
+    let mut s = get(cx);
+    if index < s.quick_commands.len() {
+        s.quick_commands.remove(index);
+        store(s, cx);
+        cx.refresh_windows();
     }
 }
 
@@ -419,6 +442,22 @@ mod tests {
         let off = AppSettings { orch_cleanup_worktrees: false, ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!back.orch_cleanup_worktrees);
+    }
+
+    #[test]
+    fn quick_commands_default_empty_and_round_trip_unicode() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(old.quick_commands.is_empty());
+        let prefs = AppSettings {
+            quick_commands: vec![
+                QuickCommand { name: "Тести".into(), command: "cargo test --workspace".into() },
+                QuickCommand { name: "Статус".into(), command: "git status".into() },
+            ],
+            ..old
+        };
+        let json = serde_json::to_string(&prefs).unwrap();
+        let back: AppSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.quick_commands, prefs.quick_commands);
     }
 
     #[test]

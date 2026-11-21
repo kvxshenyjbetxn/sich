@@ -29,6 +29,7 @@ use crate::diff_view::DiffView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
+use crate::quick_commands::{self, QuickCommand, TemporaryCommand};
 use crate::orch_watch;
 use crate::sidebar::{DEFAULT_SIDEBAR_W, clamp_sidebar_w};
 use crate::session::{self, RightPanelState, RightTab, SavedWindow, Session, SessionInput};
@@ -81,6 +82,7 @@ struct PendingSplit {
     token: u64,
     target: TerminalDrag,
     edge: Edge,
+    temporary: bool,
     started: Instant,
 }
 
@@ -120,6 +122,7 @@ pub struct AppView {
     /// Workspaces this window asked a terminal for; the matching new terminal gets activated.
     pending_creates: VecDeque<WorkspaceKey>,
     pending_splits: Vec<PendingSplit>,
+    pub(crate) quick_terminals: HashMap<TermId, TemporaryCommand>,
     seen_projects_rev: u64,
     shown_error: Option<Instant>,
     /// Terminal that last received keyboard focus.
@@ -180,7 +183,7 @@ impl AppView {
             .map_or(DEFAULT_SIDEBAR_W, |w| clamp_sidebar_w(w, f32::INFINITY));
         let mut right_panel = saved.as_ref().map_or_else(RightPanelState::default, |s| s.right_panel);
         right_panel.width = right_panel.width.map(|width| clamp_right_w(width, f32::INFINITY, 0.));
-        let git_panel = cx.new(|_| GitPanel::new(right_panel.history_collapsed));
+        let git_panel = cx.new(|_| GitPanel::new(right_panel.history_collapsed, right_panel.history_height));
         // Coalescing wake path: bounded(1), try_send never blocks.
         let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
         let client = DaemonPool::start(
@@ -308,6 +311,7 @@ impl AppView {
             collapsed: HashSet::new(),
             pending_creates: VecDeque::new(),
             pending_splits: Vec::new(),
+            quick_terminals: HashMap::new(),
             seen_projects_rev: 0,
             shown_error: None,
             focused: None,
@@ -363,6 +367,13 @@ impl AppView {
         let now_ms = sich_orch::paths::now_ms();
         let enabled = settings::get(cx).orch_auto_close_workers;
         self.tick_activity_tabs(enabled, now_ms, cx);
+        let quick_countdown_changed = !self.hidden_to_tray && self.active_tab().is_none()
+            && self.quick_terminals.values().any(|command| {
+                countdown_changed(command.auto_close_state(enabled), self.orch_now_ms, now_ms)
+            });
+        if !self.quick_terminals.is_empty() {
+            self.tick_quick_terminals(&self.client.snapshot(), enabled, now_ms);
+        }
         let worker_state = if !self.hidden_to_tray && self.active_tab().is_none() {
             self.focused
                 .and_then(|id| self.orch.workers.get(&id))
@@ -376,7 +387,7 @@ impl AppView {
         if let Some(snapshot) = out.snapshot {
             self.orch = snapshot;
         }
-        if snapshot_changed || worker_countdown_changed {
+        if snapshot_changed || worker_countdown_changed || quick_countdown_changed {
             cx.notify();
         }
         for pointer in out.pointers {
@@ -388,6 +399,22 @@ impl AppView {
             })
             .detach();
         }
+    }
+
+    fn tick_quick_terminals(&mut self, snap: &Snapshot, enabled: bool, now_ms: i64) {
+        if self.quick_terminals.is_empty() || !self.client.terminals_synced() {
+            return;
+        }
+        self.quick_terminals.retain(|&id, command| {
+            let Some(entry) = snap.terminals.iter().find(|entry| entry.info.id == id) else { return false };
+            command.observe(entry.info.exited.is_some(), now_ms);
+            if due_for_close(command.auto_close_state(enabled), now_ms) {
+                self.client.kill_terminal(id);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     fn tick_activity_tabs(&mut self, enabled: bool, now_ms: i64, cx: &mut Context<Self>) {
@@ -431,6 +458,7 @@ impl AppView {
         self.track_agents(&snap);
         // The window may be hidden in the tray (no renders), so keep these going from here too.
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
+        self.tick_quick_terminals(&snap, settings::get(cx).orch_auto_close_workers, sich_orch::paths::now_ms());
         self.update_tray(&infos, cx);
         self.touch_session(&infos, cx);
         cx.notify();
@@ -443,9 +471,12 @@ impl AppView {
         self.usage_bar.watch(window, cx);
         Self::start_update_checks(window, cx);
         cx.observe(&self.git_panel, |this, panel, cx| {
-            let collapsed = panel.read(cx).history_collapsed();
-            if this.right_panel.history_collapsed != collapsed {
+            let panel = panel.read(cx);
+            let collapsed = panel.history_collapsed();
+            let height = panel.history_height();
+            if this.right_panel.history_collapsed != collapsed || this.right_panel.history_height != height {
                 this.right_panel.history_collapsed = collapsed;
+                this.right_panel.history_height = height;
                 this.sidebar_changed(cx);
             }
         }).detach();
@@ -785,6 +816,7 @@ impl AppView {
             self.restore_started = None;
             self.pending_creates.clear();
             self.pending_splits.clear();
+            self.quick_terminals.clear();
             self.views.clear();
             self.terminal_layouts.clear();
             self.ws.prune(&[]);
@@ -903,6 +935,7 @@ impl AppView {
                     separator: tr(lang, Tr::RestoredScrollback),
                     interruption: term.interrupted.then(|| tr(lang, Tr::AgentInterrupted)),
                     resume,
+                    protect_resume: false,
                     split: false,
                 };
                 let cwd = (!term.cwd.as_os_str().is_empty()).then_some(term.cwd);
@@ -1367,7 +1400,37 @@ impl AppView {
         self.dragged_terminal.is_some_and(|id| self.terminal_is_split(id))
     }
 
+    pub(crate) fn run_quick_command(
+        &mut self,
+        source: TermId,
+        command: QuickCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let snap = self.client.snapshot();
+        let Some(entry) = snap.terminals.iter().find(|entry| {
+            entry.info.id == source && self.ws.selected.contains(entry.info.worktree.as_deref())
+        }) else { return };
+        if !quick_commands::requires_temporary(entry.info.agent.is_some(), entry.info.exited.is_some()) {
+            self.client.send_input(source, quick_commands::command_input(&command.command));
+            return;
+        }
+        let target = TerminalDrag { workspace: self.ws.selected.clone(), id: source };
+        self.request_split(&target, Edge::Right, Some(command), window, cx);
+    }
+
     pub(crate) fn request_terminal_split(&mut self, target: &TerminalDrag, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_split(target, edge, None, window, cx);
+    }
+
+    fn request_split(
+        &mut self,
+        target: &TerminalDrag,
+        edge: Edge,
+        quick_command: Option<QuickCommand>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if target.workspace != self.ws.selected { return; }
         let snap = self.client.snapshot();
         let Some(entry) = snap.terminals.iter().find(|entry| {
@@ -1377,13 +1440,21 @@ impl AppView {
         let size = entry.session.size();
         self.next_restore_token += 1;
         let token = self.next_restore_token;
-        if !self.client.open_split(target.workspace.path().map(PathBuf::from), cwd, size, token) {
+        let worktree = target.workspace.path().map(PathBuf::from);
+        let opened = if let Some(command) = &quick_command {
+            self.client.open_quick_split(worktree, cwd, size, token, quick_commands::startup_command(&command.command))
+        } else {
+            self.client.open_split(worktree, cwd, size, token)
+        };
+        if !opened {
             let message = tr(settings::language(cx), Tr::TerminalSplitDisconnected);
             notifications::show_error(message.to_owned(), window, cx);
             return;
         }
         self.activate_terminal(target.id, window, cx);
-        self.pending_splits.push(PendingSplit { token, target: target.clone(), edge, started: Instant::now() });
+        self.pending_splits.push(PendingSplit {
+            token, target: target.clone(), edge, temporary: quick_command.is_some(), started: Instant::now(),
+        });
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RESTORE_TIMEOUT + Duration::from_millis(1)).await;
             let _ = this.update(cx, |this, cx| {
@@ -1419,6 +1490,9 @@ impl AppView {
             }
             let layout = self.terminal_layouts.remove(key).unwrap();
             self.terminal_layouts.insert(key.clone(), layout.split(entry.info.id, request.target.id, request.edge));
+            if request.temporary {
+                self.quick_terminals.insert(entry.info.id, TemporaryCommand::default());
+            }
             if self.ws.selected == *key && self.active_tab().is_none() {
                 self.activate_terminal(entry.info.id, window, cx);
             }
@@ -1473,8 +1547,10 @@ impl AppView {
                     return div().size_full().into_any_element();
                 };
                 let header = show_header.then(|| self.render_pane_header(entry, self.focused == Some(id), lang, cx));
-                let banner = orch_watch::worker_for_terminal(&self.orch, &entry.info)
-                    .and_then(|worker| crate::orch_banner::render(worker, self.orch_now_ms, lang, cx));
+                let banner = self.quick_terminals.get(&id)
+                    .and_then(|command| quick_commands::banner(id, command, self.orch_now_ms, lang, cx))
+                    .or_else(|| orch_watch::worker_for_terminal(&self.orch, &entry.info)
+                        .and_then(|worker| crate::orch_banner::render(worker, self.orch_now_ms, lang, cx)));
                 let tint = self.dragged_terminal.filter(|&source| source != id && cx.has_active_drag())
                     .map(|_| cx.theme().primary.opacity(0.25));
                 let feedback = tint.map(|tint| gpui_kit::canvas(

@@ -5,8 +5,8 @@ use std::path::Path;
 use gpui_kit::assets::IconName as Ic;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::menu::ContextMenuExt as _;
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
@@ -203,6 +203,7 @@ impl AppView {
             })
         });
         let detaching = self.dragging_split_pane();
+        let quick_app = cx.entity();
         let caption: SharedString = if detaching {
             tr(lang, Tr::DropPaneHere).into()
         } else {
@@ -252,6 +253,33 @@ impl AppView {
                     .text_size(px(11.))
                     .text_color(if detaching { theme.foreground } else { theme.muted_foreground })
                     .child(caption),
+            )
+            .child(
+                div().px_1().flex_shrink_0().child(
+                    Button::new("quick-commands")
+                        .ghost()
+                        .xsmall()
+                        .label(tr(lang, Tr::QuickCommands))
+                        .tooltip(tr(lang, Tr::QuickCommands))
+                        .disabled(active.is_none())
+                        .dropdown_menu(move |mut menu, _, cx| {
+                            let commands = crate::settings::get(cx).quick_commands;
+                            for command in commands {
+                                let label = format!("{} — {}", command.name, command.command);
+                                let app = quick_app.clone();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                    if let Some(id) = active {
+                                        let command = command.clone();
+                                        app.update(cx, |this, cx| this.run_quick_command(id, command, window, cx));
+                                    }
+                                }));
+                            }
+                            menu.separator().item(
+                                PopupMenuItem::new(tr(lang, Tr::QuickCommandManage))
+                                    .on_click(|_, window, cx| crate::quick_command_dialogs::open_manager(window, cx)),
+                            )
+                        }),
+                ),
             )
             .child(
                 div().px_1().flex_shrink_0().child(

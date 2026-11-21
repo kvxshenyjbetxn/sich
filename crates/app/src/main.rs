@@ -14,6 +14,8 @@ mod daemon_restart;
 mod diff_view;
 mod element;
 mod paste_image;
+mod quick_command_dialogs;
+mod quick_commands;
 mod git_panel;
 mod group_dialogs;
 mod groups;
