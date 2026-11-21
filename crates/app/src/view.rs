@@ -2,6 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use gpui_kit::{
@@ -202,6 +203,26 @@ impl TerminalView {
             }
             Err(e) => tracing::warn!("cannot paste the clipboard image: {e}"),
         }
+    }
+
+    /// Inserts paths into this PTY without submitting a command or prompt.
+    pub(crate) fn paste_dropped_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> bool {
+        if self.session.exited().is_some() {
+            return false;
+        }
+        let Some((text, force_bracketed)) = dropped_path_text(paths, self.agent, cfg!(windows)) else {
+            return false;
+        };
+        crate::orch_watch::note_user_input(self.term_id);
+        self.session.clear_selection();
+        self.session.scroll_to_bottom();
+        if force_bracketed {
+            self.session.paste_bracketed(&text);
+        } else {
+            self.session.paste(&text);
+        }
+        cx.notify();
+        true
     }
 
     /// Maps a window position to a grid point and side, clamped to the visible grid.
@@ -677,9 +698,110 @@ impl Render for TerminalView {
     }
 }
 
+fn plain_path_char(c: char, windows: bool) -> bool {
+    c.is_alphanumeric() || matches!(c, '/' | ':' | '.' | '_' | '-') || (windows && c == '\\')
+}
+
+fn dropped_path_text(paths: &[PathBuf], agent: Option<AgentKind>, windows: bool) -> Option<(String, bool)> {
+    // A filename may contain control characters on Unix. Never send them to a PTY as input,
+    // and don't insert a lossy substitute for a path that can't be represented as UTF-8.
+    let mut valid = paths.iter().filter_map(|path| {
+        let text = path.to_str()?;
+        (!text.is_empty() && !text.chars().any(char::is_control)).then_some((path, text))
+    });
+    let (first, text) = valid.next()?;
+    let second = valid.next();
+    if second.is_none()
+        && paste_image::force_bracketed(agent)
+        && first.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+            ["png", "jpg", "jpeg", "gif", "webp", "bmp"]
+                .iter()
+                .any(|image_ext| ext.eq_ignore_ascii_case(image_ext))
+        })
+    {
+        // Give the CLI the image path by itself, just like a pasted screenshot.
+        let text = if text.chars().all(|c| plain_path_char(c, windows)) {
+            text.to_owned()
+        } else if windows {
+            format!("\"{text}\"")
+        } else {
+            let mut escaped = String::with_capacity(text.len());
+            for c in text.chars() {
+                if !plain_path_char(c, false) {
+                    escaped.push('\\');
+                }
+                escaped.push(c);
+            }
+            escaped
+        };
+        return Some((text, true));
+    }
+
+    // Separate the first path from any text already at the cursor and leave room to type after it.
+    let mut result = String::with_capacity(text.len() + 2);
+    result.push(' ');
+    for path in std::iter::once(text).chain(second.into_iter().chain(valid).map(|(_, text)| text)) {
+        if path.chars().all(|c| plain_path_char(c, windows)) {
+            result.push_str(path);
+        } else {
+            result.push('\'');
+            for c in path.chars() {
+                if windows && matches!(c, '\'' | '‘' | '’' | '‚' | '‛') {
+                    result.push(c);
+                } else if c == '\'' {
+                    result.push_str("'\\''");
+                    continue;
+                }
+                result.push(c);
+            }
+            result.push('\'');
+        }
+        result.push(' ');
+    }
+    Some((result, false))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropped_paths_are_separate_literal_arguments() {
+        assert_eq!(
+            dropped_path_text(&[r"C:\folder".into(), r"C:\Ben's photos\$cover.png".into()], None, true),
+            Some((r" C:\folder 'C:\Ben''s photos\$cover.png' ".into(), false)),
+        );
+        assert_eq!(
+            dropped_path_text(&["/tmp/проєкт".into(), "/tmp/Ben's $(echo file)".into()], None, false),
+            Some((r" /tmp/проєкт '/tmp/Ben'\''s $(echo file)' ".into(), false)),
+        );
+    }
+
+    #[test]
+    fn a_single_agent_image_preserves_the_attachment_paste() {
+        assert_eq!(
+            dropped_path_text(&[r"C:\My photos\cover.PNG".into()], Some(AgentKind::Codex), true),
+            Some((r#""C:\My photos\cover.PNG""#.into(), true)),
+        );
+        assert_eq!(
+            dropped_path_text(&["/tmp/My photos/cover.png".into()], Some(AgentKind::Claude), false),
+            Some((r"/tmp/My\ photos/cover.png".into(), true)),
+        );
+        assert_eq!(
+            dropped_path_text(&["/tmp/cover.png".into()], None, false),
+            Some((" /tmp/cover.png ".into(), false)),
+        );
+    }
+
+    #[test]
+    fn dropped_path_controls_cannot_send_enter_or_escape() {
+        let control_paths = ["/tmp/first\nsecond".into(), "/tmp/\x1b[201~".into()];
+        assert_eq!(dropped_path_text(&control_paths, None, false), None);
+        assert_eq!(
+            dropped_path_text(&[control_paths[0].clone(), "/tmp/ordinary".into()], None, false),
+            Some((" /tmp/ordinary ".into(), false)),
+        );
+    }
 
     #[test]
     fn cell_rect_is_offset_by_cell_size() {

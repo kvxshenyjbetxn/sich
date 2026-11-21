@@ -13,9 +13,9 @@ use futures::{FutureExt as _, StreamExt as _};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, Entity, InteractiveElement as _, IntoElement,
+    AppContext as _, ClickEvent, Context, Entity, ExternalPaths, InteractiveElement as _, IntoElement,
     CursorStyle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render,
-    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, WindowBounds,
+    PlatformInput, ScrollHandle, StatefulInteractiveElement as _, Styled as _, Window, WindowBounds,
     div, px,
 };
 use sich_git::Repo;
@@ -1585,6 +1585,13 @@ impl AppView {
                             this.split_terminal(drag, id, edge, window, cx);
                         }
                     }))
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                        if this.views.get(&id).is_some_and(|view| {
+                            view.update(cx, |view, cx| view.paste_dropped_paths(paths.paths(), cx))
+                        }) {
+                            this.activate_terminal(id, window, cx);
+                        }
+                    }))
                     .child(view.clone()).children(banner).children(feedback);
                 v_flex().size_full().min_w_0().min_h_0().overflow_hidden()
                     .children(header).child(body).into_any_element()
@@ -2001,6 +2008,21 @@ impl Render for AppView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .capture_key_down(cx.listener(Self::on_key_capture))
+            .on_drag_move::<ExternalPaths>(|_, window, cx| {
+                // GPUI 0.3.12 translates file drags to mouse events but leaves the window
+                // in keyboard modality after typing, which suppresses drop hit-testing.
+                if window.last_input_was_keyboard() {
+                    window.defer(cx, |window, cx| {
+                        if cx.has_active_drag() && window.last_input_was_keyboard() {
+                            window.dispatch_event(PlatformInput::MouseMove(MouseMoveEvent {
+                                position: window.mouse_position(),
+                                modifiers: window.modifiers(),
+                                pressed_button: None,
+                            }), cx);
+                        }
+                    });
+                }
+            })
             .child(
                 h_flex().relative().flex_1().min_h_0().child(sidebar).child(main)
                     .children(right).child(handle).children(right_handle),

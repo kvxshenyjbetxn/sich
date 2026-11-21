@@ -1068,9 +1068,9 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             En => "New terminal here",
         },
         Tr::NoProjectsHint => match lang {
-            Uk => "Проєктів ще немає. Додайте теку з кодом.",
-            Ru => "Проектов пока нет. Добавьте папку с кодом.",
-            En => "No projects yet. Add a folder with your code.",
+            Uk => "Проєктів ще немає. Перетягніть сюди папку з кодом.",
+            Ru => "Проектов пока нет. Перетащите сюда папку с кодом.",
+            En => "No projects yet. Drop a folder here to add it.",
         },
         Tr::NameLabel => match lang {
             Uk => "Назва",

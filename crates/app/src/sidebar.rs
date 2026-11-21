@@ -8,7 +8,7 @@ use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMen
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, ClickEvent, ClipboardItem, Context, Div, Entity, Hsla, InteractiveElement as _,
+    AnyElement, ClickEvent, ClipboardItem, Context, Div, Entity, ExternalPaths, Hsla, InteractiveElement as _,
     IntoElement, MouseButton, ParentElement as _, PathPromptOptions, SharedString, Stateful,
     StatefulInteractiveElement as _, Styled as _, div, px,
 };
@@ -309,6 +309,11 @@ fn row_base(
         .hover(move |s| if selected { s } else { s.bg(hover) })
 }
 
+fn dropped_directories(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.retain(|path| path.is_dir());
+    paths
+}
+
 impl AppView {
     /// Opens the native folder picker and adds the chosen folder as a project (into `group`).
     pub(crate) fn pick_project(&mut self, group: Option<GroupId>, cx: &mut Context<Self>) {
@@ -328,6 +333,21 @@ impl AppView {
         .detach();
     }
 
+    fn add_dropped_projects(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+        let paths = paths.paths().to_vec();
+        // Checking a folder (e.g. on a network drive) must not block the UI thread.
+        let directories = cx.background_executor().spawn(async move { dropped_directories(paths) });
+        cx.spawn(async move |this, cx| {
+            let directories = directories.await;
+            let _ = this.update(cx, |this, _| {
+                for path in directories {
+                    this.client.add_project(path, None);
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn render_sidebar(
         &self,
         snap: &Snapshot,
@@ -337,6 +357,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
+        let drop_bg = theme.list_hover;
         let muted = theme.muted_foreground;
         let app = cx.entity();
 
@@ -453,6 +474,10 @@ impl AppView {
             .h_full()
             .flex_shrink_0()
             .bg(theme.sidebar)
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                this.add_dropped_projects(paths, cx);
+            }))
             .text_color(theme.sidebar_foreground)
             .border_r_1()
             .border_color(theme.sidebar_border)
@@ -1017,6 +1042,21 @@ mod tests {
     use super::*;
     use crate::agent_badge::BadgeKind;
     use sich_proto::{AgentKind, AgentState, AgentStatus};
+
+    #[test]
+    fn project_drop_keeps_folders_and_ignores_files_and_missing_paths() {
+        let scratch = tempfile::tempdir().unwrap();
+        let first = scratch.path().join("Перший проєкт");
+        let second = scratch.path().join("second");
+        let file = scratch.path().join("not-a-project.txt");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(
+            dropped_directories(vec![first.clone(), file, scratch.path().join("missing"), second.clone()]),
+            [first, second],
+        );
+    }
 
     #[test]
     fn visible_subagents_caps_and_counts_hidden() {
