@@ -8,9 +8,9 @@ use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMen
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyElement, ClickEvent, ClipboardItem, Context, Div, Entity, ExternalPaths, Hsla, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement as _, PathPromptOptions, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, div, px,
+    AnyElement, AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity, ExternalPaths, Hsla,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use sich_proto::{AgentStatus, GroupId, GroupInfo, ProjectId, ProjectInfo, SubagentActivityKey, SubagentStatus, TermId, TerminalInfo, WorktreeInfo};
 
@@ -154,6 +154,36 @@ struct ProjectRef {
 impl ProjectRef {
     fn of(p: &ProjectInfo) -> Self {
         Self { id: p.id, name: p.name.clone(), path: p.path.clone(), is_git: p.is_git, group: p.group }
+    }
+}
+
+struct ProjectDrag(ProjectId);
+
+impl ProjectDrag {
+    fn can_move_to(&self, projects: &[ProjectInfo], target: GroupId) -> bool {
+        projects.iter().any(|p| p.id == self.0 && p.group != Some(target))
+    }
+}
+
+struct ProjectDragPreview(SharedString);
+
+impl Render for ProjectDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div().pt(px(ROW_H)).child(
+            h_flex()
+                .max_w(px(240.))
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .rounded_md()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.popover)
+                .text_color(theme.popover_foreground)
+                .child(Icon::new(Ic::Folder).small())
+                .child(div().min_w_0().truncate().text_size(px(13.)).child(self.0.clone())),
+        )
     }
 }
 
@@ -501,6 +531,8 @@ impl AppView {
         let gid = group.id;
         let expanded = !self.collapsed_groups.contains(&gid);
         let hover_group = SharedString::from(format!("group-{gid}"));
+        let drop_app = app.downgrade();
+        let drop_bg = theme.primary.opacity(0.25);
 
         let (add_app, menu_app, ctx_app) = (app.clone(), app.clone(), app.clone());
         let (menu_g, ctx_g) = (group.clone(), group.clone());
@@ -531,6 +563,22 @@ impl AppView {
         let badge = if expanded { None } else { group_badge(projects, infos) };
         let row = row_base(("group", gid), false, 0., &theme)
             .group(hover_group)
+            .drag_over::<ProjectDrag>(move |style, drag, _, cx| {
+                if drop_app.upgrade().is_some_and(|app| drag.can_move_to(&app.read(cx).projects, gid)) {
+                    style.bg(drop_bg)
+                } else {
+                    style
+                }
+            })
+            .on_drop(cx.listener(move |this, drag: &ProjectDrag, _, cx| {
+                if !drag.can_move_to(&this.projects, gid) {
+                    return;
+                }
+                this.client.set_project_group(drag.0, Some(gid));
+                if this.collapsed_groups.remove(&gid) {
+                    cx.notify();
+                }
+            }))
             .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
                 if !this.collapsed_groups.remove(&gid) {
                     this.collapsed_groups.insert(gid);
@@ -608,8 +656,12 @@ impl AppView {
 
         let collapsed_badge = if expanded { None } else { project_badge(project, infos) };
         let (ctx_app, ctx_p, ctx_groups) = (app.clone(), pref.clone(), self.groups.clone());
+        let name = SharedString::from(project.name.as_str());
+        let preview = name.clone();
         let row = row_base(("proj", pid), false, base, &theme)
             .group(group)
+            .cursor_grab()
+            .on_drag(ProjectDrag(pid), move |_, _, _, cx| cx.new(|_| ProjectDragPreview(preview.clone())))
             .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
                 if !this.collapsed.remove(&pid) {
                     this.collapsed.insert(pid);
@@ -624,7 +676,7 @@ impl AppView {
                     .truncate()
                     .text_size(px(13.))
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .child(project.name.clone()),
+                    .child(name),
             )
             .children(collapsed_badge.map(|b| badge_element(&b, false, lang, ("proj-agent", pid), cx)))
             .child(actions)
@@ -1292,6 +1344,25 @@ mod tests {
         assert!(move_targets(&groups[..1], Some(1)).is_empty());
         // An unknown current group excludes nothing.
         assert_eq!(move_targets(&groups, Some(9)).len(), 2);
+    }
+
+    #[test]
+    fn project_drag_accepts_a_new_group_but_not_the_current_group() {
+        let mut projects = [ProjectInfo {
+            id: 7,
+            name: "folder".into(),
+            path: "/folder".into(),
+            is_git: false,
+            worktrees: vec![],
+            error: None,
+            group: None,
+        }];
+        let drag = ProjectDrag(7);
+        assert!(drag.can_move_to(&projects, 1));
+        projects[0].group = Some(1);
+        assert!(!drag.can_move_to(&projects, 1));
+        assert!(drag.can_move_to(&projects, 2));
+        assert!(!ProjectDrag(8).can_move_to(&projects, 2));
     }
 
     #[test]
