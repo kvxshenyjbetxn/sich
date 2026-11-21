@@ -10,7 +10,7 @@ use gpui_kit::{
     App, BorderStyle, Bounds, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
     Corners, FocusHandle, Font, FontStyle,
     FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId, MouseMoveEvent,
-    Pixels, Point, RenderImage, SharedString,
+    Pixels, RenderImage, SharedString,
     StrikethroughStyle, Style, TextAlign, TextRun, UnderlineStyle, Window, fill, outline, point,
     px, relative, size,
 };
@@ -25,7 +25,7 @@ use crate::win_caret::{self, Caret};
 /// Layout of the grid in window coordinates, shared with the view for mouse hit-testing.
 #[derive(Clone, Copy)]
 pub struct Geometry {
-    pub origin: Point<Pixels>,
+    pub bounds: Bounds<Pixels>,
     pub cell_w: Pixels,
     pub line_h: Pixels,
     pub cols: usize,
@@ -207,7 +207,7 @@ impl Element for TerminalElement {
         );
 
         self.geometry.set(Some(Geometry {
-            origin: bounds.origin,
+            bounds,
             cell_w,
             line_h,
             cols: cols as usize,

@@ -7,7 +7,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
 use gpui_kit::{
-    ClickEvent, Context, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
+    AppContext as _, ClickEvent, Context, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
     SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
 };
 use sich_proto::TermId;
@@ -17,6 +17,7 @@ use crate::app_view::{AppView, TabKey, TabView};
 use crate::daemon_client::{Snapshot, TermEntry};
 use crate::diff_view::{source_label, split_file_label};
 use crate::i18n::{self, Language, Tr, tr};
+use crate::split_drag::{DragGhost, TerminalDrag};
 
 pub const TAB_BAR_H: f32 = 34.;
 
@@ -67,6 +68,8 @@ impl AppView {
             let is_active = active == Some(id);
             let group = SharedString::from(format!("tab-{id}"));
             let label = tab_label(lang, entry_title(entry), exited);
+            let drag = TerminalDrag { workspace: self.ws.selected.clone(), id };
+            let app = cx.entity().downgrade();
             let badge = entry
                 .info
                 .agent
@@ -112,6 +115,10 @@ impl AppView {
                     .bg(if is_active { theme.background } else { theme.tab_bar.opacity(0.) })
                     .text_color(if exited { theme.muted_foreground } else { theme.foreground })
                     .hover(|s| if is_active { s } else { s.bg(theme.list_hover) })
+                    .on_drag(drag, move |drag, _, _, cx| {
+                        let _ = app.update(cx, |app, cx| app.begin_terminal_drag(drag, cx));
+                        cx.new(|_| DragGhost)
+                    })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.activate_terminal(id, window, cx)
                     }))
@@ -203,6 +210,9 @@ impl AppView {
                     .min_w_0()
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll)
+                    .on_drop(cx.listener(|this, drag: &TerminalDrag, window, cx| {
+                        this.detach_terminal(drag, window, cx);
+                    }))
                     .children(tabs)
                     .children(workspace_tabs),
             )

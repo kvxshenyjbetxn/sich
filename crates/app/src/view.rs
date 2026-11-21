@@ -81,6 +81,10 @@ impl TerminalView {
         window.focus(&self.focus, cx);
     }
 
+    pub(crate) fn grid_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.geometry.get().map(|geometry| geometry.bounds)
+    }
+
     /// Called when the session changed: forwards clipboard writes and repaints if dirty.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if let Some(text) = self.session.take_clipboard() {
@@ -203,8 +207,8 @@ impl TerminalView {
     /// Maps a window position to a grid point and side, clamped to the visible grid.
     fn grid_point(&self, session: &TermSession, pos: PxPoint<Pixels>) -> Option<(Point, Side)> {
         let g = self.geometry.get()?;
-        let fx = f32::from(pos.x - g.origin.x) / f32::from(g.cell_w);
-        let fy = f32::from(pos.y - g.origin.y) / f32::from(g.line_h);
+        let fx = f32::from(pos.x - g.bounds.origin.x) / f32::from(g.cell_w);
+        let fy = f32::from(pos.y - g.bounds.origin.y) / f32::from(g.line_h);
         let (col, side) = if fx < 0.0 {
             (0, Side::Left)
         } else if fx.floor() as usize >= g.cols {
@@ -233,8 +237,8 @@ impl TerminalView {
     /// Viewport cell (col, row) under a window position, clamped to the grid.
     fn cell_at(&self, pos: PxPoint<Pixels>) -> Option<(usize, usize)> {
         let g = self.geometry.get()?;
-        let fx = f32::from(pos.x - g.origin.x) / f32::from(g.cell_w);
-        let fy = f32::from(pos.y - g.origin.y) / f32::from(g.line_h);
+        let fx = f32::from(pos.x - g.bounds.origin.x) / f32::from(g.cell_w);
+        let fy = f32::from(pos.y - g.bounds.origin.y) / f32::from(g.line_h);
         let col = if fx < 0.0 { 0 } else { (fx.floor() as usize).min(g.cols - 1) };
         let row = if fy < 0.0 { 0 } else { (fy.floor() as usize).min(g.rows - 1) };
         Some((col, row))
@@ -243,8 +247,8 @@ impl TerminalView {
     /// Link under a window position (only inside the grid).
     fn link_at_pos(&self, session: &TermSession, pos: PxPoint<Pixels>) -> Option<Link> {
         let g = self.geometry.get()?;
-        let fx = f32::from(pos.x - g.origin.x) / f32::from(g.cell_w);
-        let fy = f32::from(pos.y - g.origin.y) / f32::from(g.line_h);
+        let fx = f32::from(pos.x - g.bounds.origin.x) / f32::from(g.cell_w);
+        let fy = f32::from(pos.y - g.bounds.origin.y) / f32::from(g.line_h);
         if fx < 0.0 || fy < 0.0 || fx as usize >= g.cols || fy as usize >= g.rows {
             return None;
         }
@@ -405,9 +409,9 @@ impl TerminalView {
         }
         let session = self.session.clone();
         let Some(g) = self.geometry.get() else { return };
-        if ev.position.y < g.origin.y {
+        if ev.position.y < g.bounds.origin.y {
             session.scroll(1);
-        } else if ev.position.y > g.origin.y + g.line_h * g.rows as f32 {
+        } else if ev.position.y > g.bounds.origin.y + g.line_h * g.rows as f32 {
             session.scroll(-1);
         }
         if let Some((point, side)) = self.grid_point(&session, ev.position) {
@@ -580,7 +584,7 @@ impl EntityInputHandler for TerminalView {
     ) -> Option<Bounds<Pixels>> {
         let Some(g) = self.geometry.get() else { return Some(element_bounds) };
         let (row, col) = g.cursor.unwrap_or((0, 0));
-        Some(cell_rect(g.origin, g.cell_w, g.line_h, row, col))
+        Some(cell_rect(g.bounds.origin, g.cell_w, g.line_h, row, col))
     }
 
     fn character_index_for_point(

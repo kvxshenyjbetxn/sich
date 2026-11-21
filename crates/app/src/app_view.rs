@@ -40,6 +40,8 @@ use crate::update_dialog::{self, UpdateFlow};
 use crate::update_status::{self, CheckStatus};
 use crate::updater;
 use crate::view::TerminalView;
+use crate::terminal_layout::{self, Axis, Edge, Layout, Rect};
+use crate::split_drag::{DragGhost, SeparatorDrag, TerminalDrag};
 use crate::workspace::{
     WorkspaceKey, Workspaces, cycle_id, restore_selection, terminals_in, workspace_exists,
 };
@@ -69,9 +71,10 @@ fn countdown_changed(state: Option<AutoClose>, previous_ms: i64, now_ms: i64) ->
 /// Terminals of one workspace being recreated from the saved session.
 struct RestoreTarget {
     key: WorkspaceKey,
-    existing: Vec<TermId>,
-    expected: usize,
-    active: usize,
+    tokens: Vec<u64>,
+    layout: Option<Layout<session::RestoreLeaf>>,
+    active: Option<usize>,
+    attached_active: Option<TermId>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -88,6 +91,8 @@ pub(crate) enum TabView {
 pub struct AppView {
     pub(crate) client: DaemonPool,
     views: HashMap<TermId, Entity<TerminalView>>,
+    terminal_layouts: HashMap<WorkspaceKey, Layout<TermId>>,
+    dragged_terminal: Option<TermId>,
     workspace_tabs: HashMap<WorkspaceKey, WorkspaceTabs<TabKey, TabView>>,
     next_tab_id: u64,
     focused_tab: Option<u64>,
@@ -129,6 +134,7 @@ pub struct AppView {
     /// Whether the terminal restore decision was made (once per run).
     restored: bool,
     restore_targets: Vec<RestoreTarget>,
+    next_restore_token: u64,
     restore_started: Option<Instant>,
     window_state: Option<SavedWindow>,
     last_session: Option<Session>,
@@ -273,6 +279,8 @@ impl AppView {
         Self {
             client,
             views: HashMap::new(),
+            terminal_layouts: HashMap::new(),
+            dragged_terminal: None,
             workspace_tabs: HashMap::new(),
             next_tab_id: 0,
             focused_tab: None,
@@ -306,6 +314,7 @@ impl AppView {
             saved,
             restored: false,
             restore_targets: Vec::new(),
+            next_restore_token: 0,
             restore_started: None,
             window_state: None,
             last_session: None,
@@ -409,10 +418,12 @@ impl AppView {
             view.update(cx, |v, cx| v.refresh(cx));
         }
         let snap = self.client.snapshot();
+        self.finish_restore_targets(&snap);
         self.track_agents(&snap);
         // The window may be hidden in the tray (no renders), so keep these going from here too.
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
-        self.after_state_change(&infos, cx);
+        self.update_tray(&infos, cx);
+        self.touch_session(&infos, cx);
         cx.notify();
     }
 
@@ -765,6 +776,7 @@ impl AppView {
             self.restore_started = None;
             self.pending_creates.clear();
             self.views.clear();
+            self.terminal_layouts.clear();
             self.ws.prune(&[]);
             self.attention.clear();
             self.seen_sent.clear();
@@ -784,6 +796,7 @@ impl AppView {
         let mut session = session::build_session(&SessionInput {
             terminals: infos,
             ws: &self.ws,
+            layouts: &self.terminal_layouts,
             projects: &self.projects,
             groups: &self.groups,
             home_collapsed: self.home_collapsed,
@@ -839,12 +852,26 @@ impl AppView {
         let attached: Vec<_> = infos.iter().filter_map(|info| Some((info.id, self.client.owner(info.id)?))).collect();
         let peers = self.client.connected_peers();
         let mut plan = Vec::new();
+        let mut layouts = HashMap::new();
+        let mut attached_active = HashMap::new();
         if let Some(saved) = self.saved.take() {
-            let (missing, active) = session::reattach(saved, &attached, &peers, count);
+            let (missing, active, saved_layouts) = session::reattach(saved, &attached, &peers, count);
             for (key, id) in active {
                 self.ws.set_active(&key, id);
+                attached_active.insert(key, id);
             }
+            layouts = saved_layouts;
             plan = session::restore_plan(&missing, 0, &self.projects);
+        }
+        for (key, layout) in &layouts {
+            if !plan.iter().any(|(pending, _, _)| pending == key) {
+                if let Some(mapped) = layout.remap(|leaf| match leaf {
+                    session::RestoreLeaf::Live(id) => Some(id),
+                    session::RestoreLeaf::Missing(_) => None,
+                }) {
+                    self.terminal_layouts.insert(key.clone(), mapped);
+                }
+            }
         }
         if plan.is_empty() && count == 0 {
             self.client.create_terminal_in(DEFAULT_COLS, DEFAULT_ROWS, None);
@@ -853,14 +880,15 @@ impl AppView {
         let resume_agents = settings::get(cx).resume_agents_on_restore;
         for (key, terminals, active) in plan {
             let worktree = key.path().map(PathBuf::from);
-            if let Some(active) = active {
-                let existing = terminals_in(&key, infos);
-                self.restore_targets.push(RestoreTarget { key, existing, expected: terminals.len(), active });
-            }
+            let mut tokens = Vec::with_capacity(terminals.len());
             for term in terminals {
+                self.next_restore_token += 1;
+                let token = self.next_restore_token;
+                tokens.push(token);
                 let resume = term.agent.filter(|_| resume_agents)
                     .and_then(|a| session::resume_command(a.kind, &a.session_id));
                 let data = RestoreData {
+                    token,
                     scrollback: term.scrollback,
                     separator: tr(lang, Tr::RestoredScrollback),
                     interruption: term.interrupted.then(|| tr(lang, Tr::AgentInterrupted)),
@@ -869,34 +897,57 @@ impl AppView {
                 let cwd = (!term.cwd.as_os_str().is_empty()).then_some(term.cwd);
                 self.client.restore_terminal(worktree.clone(), cwd, data);
             }
+            self.restore_targets.push(RestoreTarget {
+                attached_active: attached_active.get(&key).copied(),
+                layout: layouts.remove(&key),
+                key, tokens, active,
+            });
         }
         self.restore_started = Some(Instant::now());
+        if !self.restore_targets.is_empty() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(RESTORE_TIMEOUT + Duration::from_millis(1)).await;
+                let _ = this.update(cx, |this, cx| {
+                    let snap = this.client.snapshot();
+                    this.finish_restore_targets(&snap);
+                    let infos: Vec<_> = snap.terminals.iter().map(|entry| entry.info.clone()).collect();
+                    this.touch_session(&infos, cx);
+                    cx.notify();
+                });
+            }).detach();
+        }
     }
 
-    /// Activates the saved tab in each restored workspace once all its terminals exist.
-    fn finish_restore_targets(&mut self, infos: &[TerminalInfo]) {
-        if self.restore_targets.is_empty() {
-            return;
-        }
+    /// Resolve restored identities only by their request token and workspace.
+    fn finish_restore_targets(&mut self, snap: &Snapshot) {
         let timed_out = self.restore_started.is_some_and(|t| t.elapsed() > RESTORE_TIMEOUT);
-        let ws = &mut self.ws;
-        self.restore_targets.retain(|t| {
-            let ids: Vec<_> = terminals_in(&t.key, infos).into_iter().filter(|id| !t.existing.contains(id)).collect();
-            if ids.len() < t.expected && !timed_out {
+        self.restore_targets.retain(|target| {
+            let ids: Vec<_> = target.tokens.iter().map(|token| {
+                snap.terminals.iter().find(|entry| {
+                    entry.restore_token == Some(*token)
+                        && target.key.contains(entry.info.worktree.as_deref())
+                }).map(|entry| entry.info.id)
+            }).collect();
+            if ids.iter().any(Option::is_none) && !timed_out {
                 return true;
             }
-            if let Some(id) = ids.get(t.active) {
-                ws.set_active(&t.key, *id);
+            let mapped = target.layout.as_ref().and_then(|layout| layout.remap(|leaf| match leaf {
+                session::RestoreLeaf::Live(id) => snap.terminals.iter()
+                    .any(|entry| entry.info.id == id && target.key.contains(entry.info.worktree.as_deref()))
+                    .then_some(id),
+                session::RestoreLeaf::Missing(index) => ids.get(index).copied().flatten(),
+            }));
+            let selected = target.active.and_then(|index| ids.get(index).copied().flatten())
+                .or(target.attached_active)
+                .or_else(|| mapped.as_ref().map(Layout::first_leaf));
+            if let Some(layout) = mapped {
+                self.terminal_layouts.insert(target.key.clone(), layout);
+            }
+            if let Some(id) = selected {
+                self.ws.set_active(&target.key, id);
             }
             false
         });
-    }
-
-    /// Everything that follows terminal / selection changes: restore progress, tray and session.
-    fn after_state_change(&mut self, infos: &[TerminalInfo], cx: &mut Context<Self>) {
-        self.finish_restore_targets(infos);
-        self.update_tray(infos, cx);
-        self.touch_session(infos, cx);
     }
 
     fn update_tray(&mut self, infos: &[TerminalInfo], cx: &mut Context<Self>) {
@@ -919,6 +970,7 @@ impl AppView {
             crate::groups::expand_to(&key, &self.projects, &mut self.collapsed, &mut self.collapsed_groups);
             settings::set_last_workspace(key.path().map(PathBuf::from), cx);
             self.ws.selected = key;
+            self.dragged_terminal = None;
             self.sync_right_worktree(cx);
             self.sync_diff_highlight(cx);
         }
@@ -931,6 +983,23 @@ impl AppView {
 
     pub(crate) fn activate_terminal(&mut self, id: TermId, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.ws.selected.clone();
+        let ids: Vec<_> = self.client.snapshot().terminals.iter()
+            .filter(|entry| key.contains(entry.info.worktree.as_deref()))
+            .map(|entry| entry.info.id).collect();
+        let previous = self.ws.active_in(&key, &ids);
+        if let Some(layout) = self.terminal_layouts.get_mut(&key) {
+            let previous = previous.map_or_else(|| layout.first_leaf(), |id| visible_active(layout, id));
+            layout.replace(previous, id);
+        } else {
+            self.terminal_layouts.insert(key.clone(), Layout::Leaf(id));
+        }
+        for target in &mut self.restore_targets {
+            if target.key == key {
+                target.active = None;
+                target.attached_active = Some(id);
+                target.layout = None;
+            }
+        }
         self.ws.set_active(&key, id);
         self.deactivate_tab(&key, cx);
         self.focused = Some(id);
@@ -1152,6 +1221,11 @@ impl AppView {
 
     fn on_key_capture(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
+        if ks.key == "escape" && self.dragged_terminal.take().is_some() && cx.stop_active_drag(window) {
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         let m = ks.modifiers;
         if !m.control || m.alt || m.platform {
             return;
@@ -1170,6 +1244,7 @@ impl AppView {
 
     /// Makes views, selection and pending actions match the daemon state.
     fn sync(&mut self, snap: &Snapshot, infos: &[TerminalInfo], window: &mut Window, cx: &mut Context<Self>) {
+        if !cx.has_active_drag() { self.dragged_terminal = None; }
         for entry in &snap.terminals {
             let id = entry.info.id;
             if let Some(view) = self.views.get(&id) {
@@ -1182,14 +1257,13 @@ impl AppView {
             self.views.insert(id, view);
             // A terminal this window asked for: show its workspace and activate it.
             let key = WorkspaceKey::of(entry.info.worktree.as_deref());
-            if self.client.owner(id).is_some_and(|owner| owner.socket == self.client.primary_socket())
+            if entry.restore_token.is_none()
+                && self.client.owner(id).is_some_and(|owner| owner.socket == self.client.primary_socket())
                 && let Some(pos) = self.pending_creates.iter().position(|k| *k == key)
             {
                 self.pending_creates.remove(pos);
-                self.ws.set_active(&key, id);
-                self.set_selected(key.clone(), cx);
-                self.deactivate_tab(&key, cx);
-                self.focused = None;
+                self.set_selected(key, cx);
+                self.activate_terminal(id, window, cx);
             }
         }
         let ids: Vec<TermId> = infos.iter().map(|t| t.id).collect();
@@ -1205,7 +1279,18 @@ impl AppView {
         }
 
         self.maybe_restore_terminals(infos, cx);
-        self.finish_restore_targets(infos);
+        self.finish_restore_targets(snap);
+        self.terminal_layouts.retain(|key, layout| {
+            layout.retain_where(|id| infos.iter().any(|info| info.id == id && key.contains(info.worktree.as_deref())))
+        });
+        let key = self.ws.selected.clone();
+        let ids = self.workspace_ids(infos);
+        if let Some(active) = self.ws.active_in(&key, &ids) {
+            let layout = self.terminal_layouts.entry(key.clone()).or_insert(Layout::Leaf(active));
+            if !layout.contains(active) {
+                self.ws.set_active(&key, layout.first_leaf());
+            }
+        }
 
         if let Some(id) = self.active_tab().map(|tab| tab.id) {
             if self.focused_tab != Some(id) {
@@ -1261,6 +1346,134 @@ impl AppView {
 
     // ---- rendering -------------------------------------------------------------------------
 
+    pub(crate) fn begin_terminal_drag(&mut self, drag: &TerminalDrag, cx: &mut Context<Self>) {
+        self.dragged_terminal = Some(drag.id);
+        cx.notify();
+    }
+
+    pub(crate) fn detach_terminal(&mut self, drag: &TerminalDrag, window: &mut Window, cx: &mut Context<Self>) {
+        let key = &drag.workspace;
+        if key != &self.ws.selected
+            || !self.terminal_layouts.get(key).is_some_and(|layout| {
+                matches!(layout, Layout::Split { .. }) && layout.contains(drag.id)
+            })
+        {
+            return;
+        }
+        let layout = self.terminal_layouts.remove(key).unwrap();
+        let active = self.focused.unwrap_or_else(|| layout.first_leaf());
+        let remaining = layout.remove(drag.id).expect("another pane remains");
+        let active = visible_active(&remaining, active);
+        self.terminal_layouts.insert(key.clone(), remaining);
+        self.activate_terminal(active, window, cx);
+    }
+
+    fn split_terminal(&mut self, drag: &TerminalDrag, target: TermId, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
+        let key = &drag.workspace;
+        if key != &self.ws.selected || drag.id == target
+            || !self.terminal_layouts.get(key).is_some_and(|layout| layout.contains(target))
+            || !self.client.snapshot().terminals.iter().any(|entry| {
+                entry.info.id == drag.id && key.contains(entry.info.worktree.as_deref())
+            })
+        {
+            return;
+        }
+        let layout = self.terminal_layouts.remove(key).unwrap();
+        self.terminal_layouts.insert(key.clone(), layout.split(drag.id, target, edge));
+        self.activate_terminal(drag.id, window, cx);
+    }
+
+    fn render_split_node(&self, node: &Layout<TermId>, path: Vec<bool>, infos: &[TerminalInfo],
+        lang: i18n::Language, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        use gpui_kit::{relative, SharedString};
+        match node {
+            Layout::Leaf(id) => {
+                let id = *id;
+                let Some(view) = self.views.get(&id) else { return div().size_full().into_any_element() };
+                let banner = infos.iter().find(|t| t.id == id)
+                    .and_then(|t| orch_watch::worker_for_terminal(&self.orch, t))
+                    .and_then(|worker| crate::orch_banner::render(worker, self.orch_now_ms, lang, cx));
+                let tint = self.dragged_terminal.filter(|&source| source != id && cx.has_active_drag())
+                    .map(|_| cx.theme().primary.opacity(0.25));
+                let feedback = tint.map(|tint| gpui_kit::canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let rect = pane_rect(bounds);
+                        let p = window.mouse_position();
+                        if let Some(edge) = rect.edge_at(p.x.into(), p.y.into()) {
+                            let half = rect.half(edge);
+                            window.paint_quad(gpui_kit::fill(
+                                gpui_kit::Bounds::new(gpui_kit::point(px(half.x), px(half.y)),
+                                    gpui_kit::size(px(half.width), px(half.height))),
+                                tint,
+                            ));
+                        }
+                    },
+                ).absolute().left_0().top_0().size_full());
+                div().id(("split-leaf", id)).relative().size_full().min_w_0().min_h_0().overflow_hidden()
+                    .capture_any_mouse_down(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        if matches!(event.button, MouseButton::Left | MouseButton::Middle | MouseButton::Right)
+                            && this.focused != Some(id)
+                        {
+                            this.activate_terminal(id, window, cx);
+                        }
+                    }))
+                    .on_drop(cx.listener(move |this, drag: &TerminalDrag, window, cx| {
+                        // TerminalElement measures the same pane in prepaint, including
+                        // resizes that occurred while the pointer was stationary.
+                        let rect = this.views.get(&id).and_then(|view| view.read(cx).grid_bounds()).map(pane_rect);
+                        let p = window.mouse_position();
+                        if let Some(edge) = rect.and_then(|rect| rect.edge_at(p.x.into(), p.y.into())) {
+                            this.split_terminal(drag, id, edge, window, cx);
+                        }
+                    }))
+                    .child(view.clone()).children(banner).children(feedback).into_any_element()
+            }
+            Layout::Split { axis, ratio, first, second } => {
+                let axis = *axis;
+                let ratio = terminal_layout::clamp_ratio(*ratio);
+                let mut first_path = path.clone(); first_path.push(false);
+                let mut second_path = path.clone(); second_path.push(true);
+                let first = self.render_split_node(first, first_path, infos, lang, cx);
+                let second = self.render_split_node(second, second_path, infos, lang, cx);
+                let drag = SeparatorDrag { workspace: self.ws.selected.clone(), path: path.clone() };
+                const DIVIDER: f32 = 4.;
+                let handle = div().id(SharedString::from(format!("split-handle-{path:?}")))
+                    .flex_shrink_0().occlude().bg(cx.theme().border)
+                    .on_drag(drag, |_, _, _, cx| cx.new(|_| DragGhost));
+                let (one, two, handle) = match axis {
+                    Axis::Horizontal => (
+                        div().w(relative(ratio)).h_full().min_w_0().child(first),
+                        div().w(relative(1. - ratio)).h_full().min_w_0().child(second),
+                        handle.w(px(DIVIDER)).h_full().cursor(CursorStyle::ResizeLeftRight),
+                    ),
+                    Axis::Vertical => (
+                        div().h(relative(ratio)).w_full().min_h_0().child(first),
+                        div().h(relative(1. - ratio)).w_full().min_h_0().child(second),
+                        handle.h(px(DIVIDER)).w_full().cursor(CursorStyle::ResizeUpDown),
+                    ),
+                };
+                let container = div().id(SharedString::from(format!("split-node-{path:?}")))
+                    .relative().size_full().min_w_0().min_h_0().flex();
+                let container = match axis { Axis::Horizontal => container.flex_row(), Axis::Vertical => container.flex_col() };
+                container.on_drag_move::<SeparatorDrag>(cx.listener(move |this, event: &gpui_kit::DragMoveEvent<SeparatorDrag>, _, cx| {
+                    let drag = event.dragged_item().downcast_ref::<SeparatorDrag>().unwrap();
+                    if drag.workspace != this.ws.selected || drag.path != path { return; }
+                    let rect = pane_rect(event.bounds);
+                    let p = event.event.position;
+                    if let Some(ratio) = rect.ratio_at(axis, p.x.into(), p.y.into(), DIVIDER)
+                        && this.terminal_layouts.get_mut(&drag.workspace).is_some_and(|layout| layout.resize(&drag.path, ratio))
+                    {
+                        for target in &mut this.restore_targets {
+                            if target.key == drag.workspace { target.layout = None; target.active = None; }
+                        }
+                        cx.notify();
+                    }
+                })).child(one).child(handle).child(two).into_any_element()
+            }
+        }
+    }
+
     fn render_main(
         &self,
         snap: &Snapshot,
@@ -1273,14 +1486,12 @@ impl AppView {
         let tab = self.active_tab();
         let active = if tab.is_none() { self.ws.active_in(&self.ws.selected, &ids) } else { None };
         let tab_bar = self.render_tab_bar(snap, &ids, active, lang, cx);
-        let content = match (tab.map(|tab| &tab.view), active.and_then(|a| self.views.get(&a).map(|view| (a, view)))) {
+        let content = match (tab.map(|tab| &tab.view), self.terminal_layouts.get(&self.ws.selected)) {
             (Some(TabView::Diff(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
             (Some(TabView::Activity(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
-            (None, Some((id, view))) => {
-                let banner = infos.iter().find(|t| t.id == id)
-                    .and_then(|t| orch_watch::worker_for_terminal(&self.orch, t))
-                    .and_then(|worker| crate::orch_banner::render(worker, self.orch_now_ms, lang, cx));
-                div().relative().flex_1().min_h_0().w_full().child(view.clone()).children(banner)
+            (None, Some(layout)) => {
+                div().relative().flex_1().min_h_0().w_full()
+                    .child(self.render_split_node(layout, Vec::new(), infos, lang, cx))
             }
             (None, None) => div()
                 .flex_1()
@@ -1656,9 +1867,31 @@ impl Render for AppView {
     }
 }
 
+fn pane_rect(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> Rect {
+    Rect {
+        x: bounds.origin.x.into(),
+        y: bounds.origin.y.into(),
+        width: bounds.size.width.into(),
+        height: bounds.size.height.into(),
+    }
+}
+
+/// Keep the active identity inside the visible tree after a close or detach.
+fn visible_active(layout: &Layout<TermId>, active: TermId) -> TermId {
+    if layout.contains(active) { active } else { layout.first_leaf() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn removed_or_detached_active_falls_back_to_a_visible_leaf() {
+        let layout = Layout::Leaf(1).split(2, 1, Edge::Right).split(3, 2, Edge::Bottom);
+        assert_eq!(visible_active(&layout, 2), 2);
+        let layout = layout.remove(2).unwrap();
+        assert_eq!(visible_active(&layout, 2), 1);
+        assert_eq!(visible_active(&layout, 3), 3);
+    }
 
     const LANG: i18n::Language = i18n::Language::En;
     const CONNECTED: ConnStatus = ConnStatus::Connected { pid: 12345 };

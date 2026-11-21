@@ -43,6 +43,7 @@ pub enum ConnStatus {
 pub struct TermEntry {
     pub info: TerminalInfo,
     pub session: TermSession,
+    pub restore_token: Option<u64>,
 }
 
 pub(crate) struct ClientState {
@@ -90,6 +91,7 @@ pub(crate) enum Cmd {
 }
 
 pub(crate) struct RestoreData {
+    pub token: u64,
     pub scrollback: Option<String>,
     pub separator: &'static str,
     pub interruption: Option<&'static str>,

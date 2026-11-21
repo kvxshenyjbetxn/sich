@@ -4,7 +4,7 @@
 //! Everything except the disk access is pure and unit-tested: building a `Session` from the
 //! live state, planning the terminal restore, resolving collapse state and window placement.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,7 @@ use sich_proto::{AgentKind, AgentState, GroupId, GroupInfo, ProjectId, ProjectIn
 
 use crate::workspace::{WorkspaceKey, Workspaces, same_path, terminals_in, workspace_exists};
 use crate::daemon_client::TerminalOwner;
+use crate::terminal_layout::Layout;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -89,6 +90,13 @@ pub struct SavedWorkspace {
     pub terminals: Vec<SavedTerminal>,
     /// Index into `terminals` of the active tab.
     pub active: Option<usize>,
+    #[serde(default, deserialize_with = "read_layout", skip_serializing_if = "Option::is_none")]
+    pub layout: Option<Layout<usize>>,
+}
+
+fn read_layout<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Layout<usize>>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -246,6 +254,12 @@ impl Session {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum RestoreLeaf {
+    Live(TermId),
+    Missing(usize),
+}
+
 /// Resolve saved tabs to live GUI keys and leave only the terminals that need recreating.
 /// A live owner that no longer lists a terminal means it was closed since the last save.
 pub(crate) fn reattach(
@@ -253,9 +267,12 @@ pub(crate) fn reattach(
     attached: &[(TermId, TerminalOwner)],
     peers: &[(String, u32)],
     initial_count: usize,
-) -> (Session, Vec<(WorkspaceKey, TermId)>) {
+) -> (Session, Vec<(WorkspaceKey, TermId)>, HashMap<WorkspaceKey, Layout<RestoreLeaf>>) {
     let mut selected = Vec::new();
+    let mut layouts = HashMap::new();
     for workspace in &mut session.workspaces {
+        let key = WorkspaceKey::of(workspace.worktree.as_deref());
+        let mut mapping = Vec::with_capacity(workspace.terminals.len());
         let mut missing = Vec::new();
         let mut active = None;
         for (index, term) in std::mem::take(&mut workspace.terminals).into_iter().enumerate() {
@@ -275,21 +292,31 @@ pub(crate) fn reattach(
                     (live, initial_count > 0)
                 }
             };
-            if let Some((key, _)) = live {
+            if let Some((id, _)) = live {
                 if workspace.active == Some(index) {
-                    selected.push((WorkspaceKey::of(workspace.worktree.as_deref()), *key));
+                    selected.push((key.clone(), *id));
                 }
+                mapping.push(Some(RestoreLeaf::Live(*id)));
             } else if !owner_alive {
                 if workspace.active == Some(index) {
                     active = Some(missing.len());
                 }
+                mapping.push(Some(RestoreLeaf::Missing(missing.len())));
                 missing.push(term);
+            } else {
+                mapping.push(None);
             }
+        }
+        if let Some(layout) = workspace.layout.take()
+            .and_then(|layout| layout.remap(|index| mapping.get(index).copied().flatten()))
+            .filter(|layout| matches!(layout, Layout::Split { .. }))
+        {
+            layouts.entry(key).or_insert(layout);
         }
         workspace.terminals = missing;
         workspace.active = active;
     }
-    (session, selected)
+    (session, selected, layouts)
 }
 
 pub(crate) fn file_path() -> Option<PathBuf> {
@@ -318,6 +345,7 @@ pub fn display_key(uuid: u128) -> u64 {
 pub struct SessionInput<'a> {
     pub terminals: &'a [TerminalInfo],
     pub ws: &'a Workspaces,
+    pub layouts: &'a HashMap<WorkspaceKey, Layout<TermId>>,
     pub projects: &'a [ProjectInfo],
     pub groups: &'a [GroupInfo],
     pub home_collapsed: bool,
@@ -355,7 +383,14 @@ pub fn build_session(input: &SessionInput) -> Session {
             .map(SavedTerminal::from_info)
             .collect();
         let active = input.ws.active_in(&key, &ids).and_then(|a| ids.iter().position(|i| *i == a));
-        workspaces.push(SavedWorkspace { worktree: key.path().map(Path::to_path_buf), terminals, active });
+        let layout = input.layouts.get(&key)
+            .and_then(|layout| layout.remap(|id| ids.iter().position(|&saved| saved == id)))
+            .filter(|layout| matches!(layout, Layout::Split { .. }));
+        let active = match &layout {
+            Some(layout) if !active.is_some_and(|index| layout.contains(index)) => Some(layout.first_leaf()),
+            _ => active,
+        };
+        workspaces.push(SavedWorkspace { worktree: key.path().map(Path::to_path_buf), terminals, active, layout });
     }
 
     Session {
@@ -544,6 +579,7 @@ mod tests {
             worktree: wt.map(PathBuf::from),
             terminals: cwds.iter().map(|c| SavedTerminal { cwd: PathBuf::from(c), ..Default::default() }).collect(),
             active,
+            layout: None,
         }
     }
 
@@ -648,6 +684,50 @@ mod tests {
         assert_eq!(Session::parse(r#"{"workspaces":5}"#), None);
         assert_eq!(Session::load_from(&unique_path("missing")), None);
     }
+    #[test]
+    fn malformed_layout_does_not_discard_terminals() {
+        for layout in [r#""bad""#, r#"{"split":{"axis":"future"}}"#, r#"{"leaf":"bad"}"#, "null"] {
+            let text = format!(r#"{{"workspaces":[{{"terminals":[{{"cwd":"kept"}}],"layout":{layout}}}]}}"#);
+            let session = Session::parse(&text).unwrap();
+            assert_eq!(session.workspaces[0].terminals[0].cwd, Path::new("kept"));
+            assert_eq!(session.workspaces[0].layout, None);
+        }
+    }
+
+    #[test]
+    fn persisted_layout_indexes_live_tabs_and_prunes_exited_and_duplicates() {
+        use crate::terminal_layout::Axis;
+        let split = |first, second| Layout::Split {
+            axis: Axis::Vertical, ratio: 0.7, first: Box::new(first), second: Box::new(second),
+        };
+        let mut dead = term(3, None, "dead", 3);
+        dead.exited = Some(Some(0));
+        let hidden = term(4, None, "hidden", 0);
+        let terminals = [term(1, None, "a", 1), term(2, None, "b", 2), dead, hidden];
+        let layouts = HashMap::from([(WorkspaceKey::Home,
+            split(Layout::Leaf(2), split(Layout::Leaf(3), split(Layout::Leaf(1), Layout::Leaf(2)))))]);
+        let mut ws = Workspaces::default();
+        ws.set_active(&WorkspaceKey::Home, 3);
+        let (collapsed, groups) = (HashSet::new(), HashSet::new());
+        let session = build_session(&SessionInput {
+            terminals: &terminals, ws: &ws, layouts: &layouts, projects: &[], groups: &[],
+            home_collapsed: false, collapsed: &collapsed, collapsed_groups: &groups,
+            window: None, sidebar_w: None, right_panel: RightPanelState::default(),
+        });
+        let expected = Layout::Split { axis: Axis::Vertical, ratio: 0.7,
+            first: Box::new(Layout::Leaf(2_usize)), second: Box::new(Layout::Leaf(1_usize)) };
+        assert_eq!(session.workspaces[0].layout, Some(expected));
+        assert_eq!(session.workspaces[0].active, Some(2));
+        let decoded = Session::parse(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!(decoded, session);
+        let solo = HashMap::from([(WorkspaceKey::Home, split(Layout::Leaf(3), Layout::Leaf(1)))]);
+        let input = SessionInput {
+            terminals: &terminals, ws: &ws, layouts: &solo, projects: &[], groups: &[],
+            home_collapsed: false, collapsed: &collapsed, collapsed_groups: &groups,
+            window: None, sidebar_w: None, right_panel: RightPanelState::default(),
+        };
+        assert_eq!(build_session(&input).workspaces[0].layout, None);
+    }
 
     #[test]
     fn round_trips_through_disk_atomically() {
@@ -699,6 +779,7 @@ mod tests {
         let s = build_session(&SessionInput {
             terminals: &terminals,
             ws: &ws,
+            layouts: &HashMap::new(),
             projects: &projects,
             groups: &[],
             home_collapsed: true,
@@ -738,6 +819,7 @@ mod tests {
         let s = build_session(&SessionInput {
             terminals: &terminals,
             ws: &ws,
+            layouts: &HashMap::new(),
             projects: &projects,
             groups: &groups,
             home_collapsed: false,
@@ -764,6 +846,7 @@ mod tests {
         let s = build_session(&SessionInput {
             terminals: &[],
             ws: &ws,
+            layouts: &HashMap::new(),
             projects: &[],
             groups: &[],
             home_collapsed: false,
@@ -983,7 +1066,7 @@ mod generation_tests {
 
     fn session(terminals: Vec<SavedTerminal>, active: Option<usize>) -> Session {
         Session {
-            workspaces: vec![SavedWorkspace { worktree: None, terminals, active }],
+            workspaces: vec![SavedWorkspace { worktree: None, terminals, active, layout: None }],
             ..Session::default()
         }
     }
@@ -1044,7 +1127,7 @@ mod generation_tests {
         );
         let attached = [(11, owner("base-old", 1, 30, 100)), (12, owner("base-new", 1, 40, 200))];
         let peers = [("base-old".to_string(), 30), ("base-new".to_string(), 40)];
-        let (rest, selected) = reattach(s, &attached, &peers, 2);
+        let (rest, selected, _) = reattach(s, &attached, &peers, 2);
         let cwds: Vec<_> = rest.workspaces[0].terminals.iter().map(|t| t.cwd.to_str().unwrap()).collect();
         assert_eq!(cwds, ["owner-died"], "a live owner without the terminal means it was closed");
         assert_eq!(selected, vec![(WorkspaceKey::of(None), 12)]);
@@ -1057,7 +1140,7 @@ mod generation_tests {
         // Same socket and id, but created later: a different terminal.
         let attached = [(11, owner("base", 1, 30, 999))];
         let peers = [("base".to_string(), 30)];
-        let (rest, selected) = reattach(s, &attached, &peers, 1);
+        let (rest, selected, _) = reattach(s, &attached, &peers, 1);
         assert!(selected.is_empty());
         assert!(rest.workspaces[0].terminals.is_empty());
     }
@@ -1067,14 +1150,42 @@ mod generation_tests {
         let mut s = session(vec![saved(4, None, None, None, "a"), saved(5, None, None, None, "b")], Some(0));
         s.daemon_pid = Some(30);
         let attached = [(11, owner("base", 4, 30, 1))];
-        let (rest, selected) = reattach(s.clone(), &attached, &[("base".into(), 30)], 1);
+        let (rest, selected, _) = reattach(s.clone(), &attached, &[("base".into(), 30)], 1);
         assert_eq!(selected, vec![(WorkspaceKey::of(None), 11)]);
         assert!(rest.workspaces[0].terminals.is_empty(), "a populated daemon is never refilled");
 
         // The daemon had no terminals at all: everything is recreated and the active tab is kept.
-        let (rest, selected) = reattach(s, &[], &[("base-new".into(), 40)], 0);
+        let (rest, selected, _) = reattach(s, &[], &[("base-new".into(), 40)], 0);
         assert!(selected.is_empty());
         assert_eq!(rest.workspaces[0].terminals.len(), 2);
         assert_eq!(rest.workspaces[0].active, Some(0));
     }
+    #[test]
+    fn mixed_layout_preserves_live_and_missing_identity_and_active_slot() {
+        use crate::terminal_layout::Axis;
+        let split = |axis, ratio, first, second| Layout::Split {
+            axis, ratio, first: Box::new(first), second: Box::new(second),
+        };
+        let mut s = session(vec![
+            saved(1, Some("live"), Some(30), Some(100), "live"),
+            saved(2, Some("live"), Some(30), Some(200), "closed"),
+            saved(3, Some("gone"), Some(40), Some(300), "missing"),
+        ], Some(2));
+        s.workspaces[0].layout = Some(split(Axis::Horizontal, 0.3,
+            Layout::Leaf(0), split(Axis::Vertical, 0.8, Layout::Leaf(1),
+                split(Axis::Vertical, 0.6, Layout::Leaf(2),
+                    split(Axis::Horizontal, 0.4, Layout::Leaf(2), Layout::Leaf(99))))));
+        let (rest, selected, layouts) = reattach(s, &[(0, owner("live", 1, 30, 100))], &[("live".into(), 30)], 1);
+        assert!(selected.is_empty());
+        assert_eq!(rest.workspaces[0].active, Some(0));
+        assert_eq!(rest.workspaces[0].terminals[0].cwd, Path::new("missing"));
+        assert_eq!(rest.workspaces[0].layout, None);
+        let expected = Layout::Split { axis: Axis::Horizontal, ratio: 0.3,
+            first: Box::new(Layout::Leaf(RestoreLeaf::Live(0))),
+            second: Box::new(Layout::Leaf(RestoreLeaf::Missing(0))) };
+        assert_eq!(layouts.get(&WorkspaceKey::Home), Some(&expected));
+        let plan = restore_plan_with(&rest, 0, &[], |_| true, None);
+        assert_eq!(plan[0].2, Some(0));
+    }
+
 }

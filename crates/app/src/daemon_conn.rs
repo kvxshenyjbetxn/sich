@@ -362,7 +362,10 @@ impl Conn {
     }
 
     fn restore_terminal(&self, info: TerminalInfo, data: RestoreData) -> Option<Vec<u8>> {
-        let session = self.new_session(&info);
+        let session = self.state.lock().terminals.iter()
+            .find(|entry| entry.info.id == info.id && entry.info.created_unix_ms == info.created_unix_ms)
+            .map(|entry| entry.session.clone())
+            .unwrap_or_else(|| self.new_session(&info));
         let history = data.scrollback.and_then(|name| {
             let dir = sich_daemon::scrollback::directory()?;
             let bytes = match sich_daemon::scrollback::load(&dir, &name) {
@@ -387,7 +390,10 @@ impl Conn {
                 tracing::warn!("could not remove restored scrollback: {err}");
             }
         }
-        self.state.lock().terminals.push(TermEntry { info, session });
+        let mut state = self.state.lock();
+        state.terminals.retain(|entry| entry.info.id != info.id);
+        state.terminals.push(TermEntry { info, session, restore_token: Some(data.token) });
+        drop(state);
         (self.wake)();
         data.resume.map(|cmd| format!("{cmd}\r").into_bytes())
     }
@@ -458,7 +464,7 @@ impl Conn {
                 if !st.terminals.iter().any(|t| t.info.id == info.id) {
                     out.push(ClientMsg::Subscribe { id: info.id, resume_from_seq: None });
                     let session = self.new_session(&info);
-                    st.terminals.push(TermEntry { info, session });
+                    st.terminals.push(TermEntry { info, session, restore_token: None });
                 }
             }
             ServerMsg::TerminalExited { id, code } => {
@@ -534,7 +540,7 @@ impl Conn {
         let mut old = std::mem::take(&mut st.terminals);
         let mut terminals = Vec::with_capacity(list.len());
         for info in list {
-            match old.iter().position(|t| t.info.id == info.id) {
+            match old.iter().position(|t| t.info.id == info.id && t.info.created_unix_ms == info.created_unix_ms) {
                 Some(i) => {
                     let mut entry = old.swap_remove(i);
                     let (cols, rows) = entry.session.size();
@@ -558,7 +564,7 @@ impl Conn {
                     session.set_quiet(true);
                     out.push(ClientMsg::Subscribe { id: info.id, resume_from_seq: None });
                     out.push(ClientMsg::GetDaemonInfo);
-                    terminals.push(TermEntry { info, session });
+                    terminals.push(TermEntry { info, session, restore_token: None });
                 }
             }
         }
@@ -819,7 +825,7 @@ mod tests {
         }
         cmd_tx.send(Cmd::Restore {
             worktree: None, cwd: None,
-            data: RestoreData { scrollback: None, separator: "restored", interruption: None, resume: Some("codex resume abcdef12".into()) },
+            data: RestoreData { token: 42, scrollback: None, separator: "restored", interruption: None, resume: Some("codex resume abcdef12".into()) },
         }).unwrap();
         let ClientMsg::RestoreTerminal { request_id, .. } = recv_client(&mut peer).await else { panic!("expected restore request") };
         let terminal = TerminalInfo {
@@ -836,6 +842,53 @@ mod tests {
             assert_eq!(recv_client(&mut peer).await, ClientMsg::Input { id: 15, bytes: b"\x1b[1;1R".to_vec() });
         }
         assert_eq!(recv_client(&mut peer).await, ClientMsg::Input { id: 15, bytes: b"codex resume abcdef12\r".to_vec() });
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn restore_tokens_follow_only_matching_responses_and_survive_inventory() {
+        let (conn, mut commands) = test_conn_with_rx(&Handle::current(), false);
+        let state = conn.state.clone();
+        let tx = conn.cmd_tx.clone();
+        let (local, peer) = tokio::io::duplex(8192);
+        let mut peer = Framed::new(peer, frame_codec());
+        let task = tokio::spawn(async move {
+            session_on(&conn, Framed::new(local, frame_codec()), &mut commands, &mut false, false).await
+        });
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Hello { .. }));
+        send_server(&mut peer, welcome(PROTO_VERSION)).await;
+        for _ in 0..3 { recv_client(&mut peer).await; }
+        for token in [101, 202] {
+            tx.send(Cmd::Restore { worktree: None, cwd: None, data: RestoreData {
+                token, scrollback: None, separator: "", interruption: None, resume: None,
+            }}).unwrap();
+        }
+        let ClientMsg::RestoreTerminal { request_id: first, .. } = recv_client(&mut peer).await else { panic!("restore") };
+        let ClientMsg::RestoreTerminal { request_id: second, .. } = recv_client(&mut peer).await else { panic!("restore") };
+        let info = |id, created_unix_ms| TerminalInfo {
+            id, title: String::new(), cwd: Default::default(), cols: 80, rows: 24,
+            exited: None, created_unix_ms, worktree: None, agent: None,
+        };
+        send_server(&mut peer, ServerMsg::TerminalCreated(info(9, 9))).await;
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Subscribe { id: 9, .. }));
+        send_server(&mut peer, ServerMsg::TerminalRestored { request_id: second + 1, terminal: Some(info(99, 99)) }).await;
+        send_server(&mut peer, ServerMsg::TerminalRestored { request_id: second, terminal: Some(info(2, 2)) }).await;
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Subscribe { id: 2, .. }));
+        send_server(&mut peer, ServerMsg::TerminalRestored { request_id: first, terminal: Some(info(1, 1)) }).await;
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Subscribe { id: 1, .. }));
+        {
+            let st = state.lock();
+            let token = |id| st.terminals.iter().find(|t| t.info.id == id).and_then(|t| t.restore_token);
+            assert_eq!((token(1), token(2), token(9), token(99)), (Some(101), Some(202), None, None));
+        }
+        send_server(&mut peer, ServerMsg::Terminals(vec![info(1, 1), info(2, 22), info(9, 9)])).await;
+        // The new incarnation of id 2 must not inherit its predecessor's token.
+        for _ in 0..4 { recv_client(&mut peer).await; }
+        {
+            let st = state.lock();
+            let token = |id| st.terminals.iter().find(|t| t.info.id == id).and_then(|t| t.restore_token);
+            assert_eq!((token(1), token(2), token(9)), (Some(101), None, None));
+        }
         task.abort();
     }
 
