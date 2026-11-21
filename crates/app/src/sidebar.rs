@@ -56,7 +56,7 @@ const ROW_GAP: f32 = 6.;
 /// Preview line indent: under the title (lead slot + gap).
 const PREVIEW_INDENT: f32 = LEAD_SLOT_W + ROW_GAP;
 const INDENT: f32 = 14.;
-/// Height of a subagent child row.
+/// Compact height when a subagent has no activity preview, including the overflow row.
 const SUB_ROW_H: f32 = 24.;
 /// At most this many subagent rows are listed under an agent (the rest collapse into "+N").
 const MAX_VISIBLE_SUBAGENTS: usize = 4;
@@ -77,6 +77,15 @@ pub fn worktree_label(w: &WorktreeInfo) -> String {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| w.path.display().to_string()),
     }
+}
+
+fn subagent_row_tooltip(lang: Language, sub: &SubagentStatus) -> String {
+    let mut tip = format!("{} — {}", tr(lang, Tr::ActivityOpen), subagent_tooltip(sub));
+    if let Some(model) = sub.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+        tip.push_str(" — ");
+        tip.push_str(model);
+    }
+    tip
 }
 
 /// Roll-up badge of the terminals in `key` (Home or a worktree).
@@ -864,7 +873,7 @@ impl AppView {
             .collect()
     }
 
-    /// One child row of an agent row: status badge, label, detail and elapsed time.
+    /// One child row of an agent row: status badge, label, detail, model and elapsed time.
     fn render_subagent_row(
         &self,
         key: WorkspaceKey,
@@ -880,7 +889,8 @@ impl AppView {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         std::hash::Hash::hash(&(term, &sub.id, sub.since_unix_ms), &mut hasher);
         let uid = std::hash::Hasher::finish(&hasher);
-        let tip = format!("{} — {}", tr(lang, Tr::ActivityOpen), subagent_tooltip(sub));
+        let tip = subagent_row_tooltip(lang, sub);
+        let model = sub.model.as_deref().map(shorten_model).filter(|m| !m.is_empty());
         let label = SharedString::from(subagent_label(sub));
         let row_label = label.clone();
         let activity = SubagentActivityKey {
@@ -890,14 +900,12 @@ impl AppView {
             since_unix_ms: sub.since_unix_ms,
         };
         let badge = badge_element(&subagent_badge(sub), false, lang, ("side-sub-badge", uid), cx);
-        row_base(("side-sub", uid), false, indent, &theme)
-            .h(px(SUB_ROW_H))
+        let preview = subagent_detail(sub).map(str::to_owned);
+        let height = if preview.is_some() { AGENT_ROW_H } else { SUB_ROW_H };
+        let header = h_flex()
+            .w_full()
+            .min_w_0()
             .gap(px(ROW_GAP))
-            .text_color(theme.sidebar_foreground)
-            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.open_subagent_activity(key.clone(), term, activity.clone(), label.clone(), window, cx)
-            }))
             .child(
                 h_flex()
                     .flex_shrink_0()
@@ -907,28 +915,46 @@ impl AppView {
                     .justify_center()
                     .child(badge),
             )
-            .child(
+            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(row_label))
+            .children(model.map(|model| {
                 div()
-                    .max_w(gpui_kit::relative(0.6))
+                    .flex_shrink_0()
+                    .max_w(gpui_kit::relative(0.4))
                     .truncate()
-                    .text_size(px(12.))
-                    .child(row_label),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(11.5))
+                    .font_family("Cascadia Mono")
+                    .text_size(px(11.))
                     .text_color(muted)
-                    .children(subagent_detail(sub)),
-            )
+                    .child(model)
+            }))
             .child(
                 div()
                     .flex_shrink_0()
                     .text_size(px(11.))
                     .text_color(muted)
                     .child(relative_time(lang, now_unix_ms(), sub.since_unix_ms)),
+            );
+        row_base(("side-sub", uid), false, indent, &theme)
+            .h(px(height))
+            .text_color(theme.sidebar_foreground)
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.open_subagent_activity(key.clone(), term, activity.clone(), label.clone(), window, cx)
+            }))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(2.))
+                    .child(header)
+                    .children(preview.map(|text| {
+                        div()
+                            .w_full()
+                            .pl(px(PREVIEW_INDENT))
+                            .truncate()
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child(text)
+                    })),
             )
             .into_any_element()
     }
@@ -1002,6 +1028,7 @@ mod tests {
                     description: None,
                     state: AgentState::Working,
                     detail: None,
+                    model: None,
                     since_unix_ms: 1,
                 })
                 .collect()
@@ -1019,6 +1046,23 @@ mod tests {
         assert_eq!(v[3].id, "a3");
         let (v, h) = visible_subagents(&list, 0);
         assert_eq!((v.len(), h), (0, 7));
+    }
+
+    #[test]
+    fn child_model_is_available_unabridged_in_its_tooltip() {
+        let mut sub = SubagentStatus {
+            id: "abcdef01234567".into(),
+            agent_type: None,
+            description: Some("Read the source".into()),
+            state: AgentState::Working,
+            detail: Some("Read: app.rs".into()),
+            model: Some("claude-sonnet-4-6".into()),
+            since_unix_ms: 1,
+        };
+        let with_model = subagent_row_tooltip(Language::En, &sub);
+        assert!(with_model.ends_with("Read the source — Read: app.rs — claude-sonnet-4-6"));
+        sub.model = None;
+        assert!(subagent_row_tooltip(Language::En, &sub).ends_with("Read the source — Read: app.rs"));
     }
 
     #[test]

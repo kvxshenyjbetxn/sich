@@ -103,9 +103,25 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
     const withScout = await next("done");
     assert.equal(withScout.subagents[0].description, "Scout");
     assert.equal(withScout.subagents[0].state, "working");
+    assert.equal(withScout.subagents[0].model, undefined, "never copies the parent's model");
     const since = withScout.subagents[0].since_unix_ms;
     const scoutEvent = (kind, fields = {}) => ({ id: "Scout", since_unix_ms: since, kind, ...fields });
     assert.deepEqual(withScout.activity, [scoutEvent("started", { title: "scout" })]);
+
+    native(bus, "Scout", {
+        type: "message_start", message: { role: "assistant", model: "scout-model", content: [] },
+    });
+    const withModel = await next("done");
+    assert.equal(withModel.model, "model-1");
+    assert.equal(withModel.subagents[0].model, "scout-model");
+    assert.equal(withModel.activity, undefined, "a model-only update is not an activity entry");
+    native(bus, "Scout", {
+        type: "message_end", message: { role: "assistant", model: "fallback-model", content: [] },
+    });
+    assert.equal((await next("done")).subagents[0].model, "fallback-model");
+    native(bus, "Scout", {
+        type: "message_end", message: { role: "assistant", model: "PRIVATE_FAILED_MODEL", stopReason: "error", content: [] },
+    });
 
     const toolProgress = { id: "Scout", description: "Check parser", currentTool: "read", currentToolArgs: "private" };
     progress(bus, { ...scout, progress: toolProgress });
@@ -114,7 +130,12 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
     assert.equal(withTool.subagents[0].detail, "read");
     assert.equal(withTool.subagents[0].description, "Check parser");
     assert.equal(withTool.subagents[0].since_unix_ms, withScout.subagents[0].since_unix_ms);
+    assert.equal(withTool.subagents[0].model, "fallback-model");
     assert.ok(!JSON.stringify(withTool).includes("private"));
+    progress(bus, { ...scout, progress: { id: "Scout", description: "Check parser output" } });
+    const betweenCalls = await next("done");
+    assert.equal(betweenCalls.subagents[0].description, "Check parser output");
+    assert.equal(betweenCalls.subagents[0].detail, "read", "the last action remains visible between calls");
 
     emitChild("tool_approval_requested", { toolCallId: "permission", toolName: "write" });
     const withWaiting = await next("done");
@@ -127,13 +148,13 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
         args: { credential: "PRIVATE_ARGUMENT" }, intent: "PRIVATE_INTENT",
     });
     native(bus, "Scout", {
-        type: "message_update", message: { role: "assistant", content: [{ type: "text", text: "PRIVATE_DELTA" }] },
+        type: "message_update", message: { role: "assistant", model: "PRIVATE_DELTA_MODEL", content: [{ type: "text", text: "PRIVATE_DELTA" }] },
     });
     native(bus, "Scout", {
         type: "tool_execution_update", partialResult: { content: [{ type: "text", text: "PRIVATE_PARTIAL" }] },
     });
     native(bus, "Scout", {
-        type: "message_end", message: { role: "user", content: [{ type: "text", text: "PRIVATE_PROMPT" }] },
+        type: "message_end", message: { role: "user", model: "PRIVATE_USER_MODEL", content: [{ type: "text", text: "PRIVATE_PROMPT" }] },
     });
     native(bus, "Scout", {
         type: "message_end", message: {
@@ -182,6 +203,7 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
         scoutEvent("waiting"),
     ]);
     assert.equal(toolResults.subagents[0].state, "waiting", "native events do not replace the roster's approval state");
+    assert.equal(toolResults.subagents[0].model, "fallback-model", "missing model fields preserve the last report");
     assert.ok(!JSON.stringify(await events()).includes("PRIVATE_"));
 
     const nested = { id: "Scout.Deep", status: "started", agent: "scout", parentToolCallId: "call-2" };
@@ -189,13 +211,17 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
     const withNested = await next("done");
     assert.deepEqual(withNested.subagents.map(({ id, state }) => [id, state]), [["Scout", "waiting"], ["Scout.Deep", "working"]]);
     const nestedSince = withNested.subagents[1].since_unix_ms;
-    native(bus, nested.id, { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "PRIVATE_WRONG_PARENT" }] } });
-    native(childExtension.bus, nested.id, {
-        type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "Nested result" }] },
+    native(bus, nested.id, {
+        type: "message_end", message: { role: "assistant", model: "PRIVATE_WRONG_MODEL", content: [{ type: "text", text: "PRIVATE_WRONG_PARENT" }] },
     });
-    assert.deepEqual((await next("done")).activity, [
+    native(childExtension.bus, nested.id, {
+        type: "message_end", message: { role: "assistant", model: "nested-model", content: [{ type: "text", text: "Nested result" }] },
+    });
+    const nestedResult = await next("done");
+    assert.deepEqual(nestedResult.activity, [
         { id: nested.id, since_unix_ms: nestedSince, kind: "message", text: "Nested result" },
     ]);
+    assert.deepEqual(nestedResult.subagents.map(({ model }) => model), ["fallback-model", "nested-model"]);
     emitChild("tool_approval_resolved", { toolCallId: "permission" });
     assert.equal((await next("done")).subagents[0].detail, "read");
     lifecycle(bus, { ...scout, status: "completed" });
@@ -206,11 +232,15 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
     const aborted = await next("done");
     assert.equal(aborted.subagents, undefined);
     assert.deepEqual(aborted.activity, [{ id: nested.id, since_unix_ms: nestedSince, kind: "aborted" }]);
+    native(bus, "Scout", {
+        type: "message_end", message: { role: "assistant", model: "PRIVATE_SETTLED_MODEL", content: [] },
+    });
     lifecycle(bus, { ...scout, status: "started", parentToolCallId: "follow-up" });
     const followup = await next("done");
     assert.equal(followup.subagents[0].id, "Scout");
     assert.ok(followup.subagents[0].since_unix_ms > since);
     assert.equal(followup.activity[0].since_unix_ms, followup.subagents[0].since_unix_ms);
+    assert.equal(followup.subagents[0].model, undefined, "a reused id starts with no confirmed model");
 
     emit("before_agent_start", { reason: "prompt", prompt: "Next" });
     await next("working");
@@ -239,8 +269,12 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
 
     const batch = Array.from({ length: 17 }, (_, index) => ({ id: `Worker${index}`, status: "started", agent: "scout" }));
     for (const item of batch) lifecycle(bus, item);
-    assert.deepEqual((await next("idle")).subagents.map(({ id }) => id), ["Worker0"]);
-    assert.deepEqual((await next("idle")).subagents.map(({ id }) => id), batch.slice(0, 16).map(({ id }) => id));
+    // The previous child-process write can still be in flight after its output is visible.
+    const firstRoster = await next("idle");
+    const roster = firstRoster.subagents.length === 1 ? await next("idle") : firstRoster;
+    assert.deepEqual(roster.subagents.map(({ id }) => id), batch.slice(0, 16).map(({ id }) => id));
+    const starts = firstRoster === roster ? roster.activity : [...firstRoster.activity, ...roster.activity];
+    assert.deepEqual(starts.filter(({ kind }) => kind === "started").map(({ id }) => id), batch.map(({ id }) => id));
     lifecycle(bus, { ...batch[0], status: "failed" });
     const failed = await next("idle");
     assert.deepEqual(failed.subagents.map(({ id }) => id), batch.slice(1).map(({ id }) => id));

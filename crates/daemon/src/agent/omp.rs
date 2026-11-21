@@ -52,6 +52,7 @@ struct Subagent {
     agent_type: Option<String>,
     description: Option<String>,
     detail: Option<String>,
+    model: Option<String>,
     since_unix_ms: Option<u64>,
 }
 
@@ -72,6 +73,7 @@ impl Subagent {
             description: self.description.as_deref().and_then(|text| normalize_text(text, false)),
             detail: super::non_empty(&self.detail),
             since_unix_ms: self.since_unix_ms.unwrap_or(now),
+            model: super::non_empty(&self.model),
         })
     }
 }

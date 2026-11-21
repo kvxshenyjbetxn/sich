@@ -60,13 +60,9 @@ pub fn subagent_label(s: &SubagentStatus) -> String {
     s.id.chars().skip(n.saturating_sub(8)).collect()
 }
 
-/// The muted detail of a subagent row: its current detail, else the agent type when the label
-/// is the description (so the type is not lost).
-pub fn subagent_detail(s: &SubagentStatus) -> Option<String> {
-    if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-        return Some(d.to_string());
-    }
-    if real(&s.description).is_some() { real(&s.agent_type).map(String::from) } else { None }
+/// The most recent tool or wait reported by this child, not its role or task name.
+pub fn subagent_detail(s: &SubagentStatus) -> Option<&str> {
+    s.detail.as_deref().map(str::trim).filter(|detail| !detail.is_empty())
 }
 
 /// Row tooltip: "<agent_type> \u{2014} <description> \u{2014} <detail>", missing parts skipped.
@@ -321,6 +317,7 @@ mod tests {
             state,
             detail: detail.map(String::from),
             since_unix_ms: 1,
+            model: None,
         }
     }
 
@@ -344,13 +341,13 @@ mod tests {
     #[test]
     fn subagent_detail_and_tooltip() {
         let mut s = sub("agent-1", AgentState::Working, Some(" Bash: ls "));
-        assert_eq!(subagent_detail(&s).as_deref(), Some("Bash: ls"));
+        assert_eq!(subagent_detail(&s), Some("Bash: ls"));
         assert_eq!(subagent_tooltip(&s), "Bash: ls");
         s.agent_type = Some("Explore".into());
         s.description = Some("Find parser".into());
         assert_eq!(subagent_tooltip(&s), "Explore \u{2014} Find parser \u{2014} Bash: ls");
-        s.detail = None;
-        assert_eq!(subagent_detail(&s).as_deref(), Some("Explore"));
+        s.detail = Some(" \t ".into());
+        assert_eq!(subagent_detail(&s), None, "a role is not a reported action");
         assert_eq!(subagent_tooltip(&s), "Explore \u{2014} Find parser");
         s.description = None;
         assert_eq!(subagent_detail(&s), None);

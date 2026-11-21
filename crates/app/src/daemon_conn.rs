@@ -9,7 +9,7 @@ use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
 use parking_lot::Mutex;
 use sich_proto::{
-    ClientMsg, PROTO_VERSION, ServerMsg, TermId, TerminalInfo, decode, encode, frame_codec,
+    AgentStatus, ClientMsg, PROTO_VERSION, ServerMsg, SubagentModel, TermId, TerminalInfo, decode, encode, frame_codec,
 };
 use sich_term::TermSession;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -21,6 +21,14 @@ use crate::daemon_client::{
     ClientState, Cmd, ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, RestartResult, RestoreData, TermEntry, Wake,
 };
 use crate::workspace::{PendingWorktree, match_pending_worktree};
+
+fn attach_subagent_models(status: &mut AgentStatus, models: Vec<SubagentModel>) {
+    for SubagentModel { id, model } in models {
+        if let Some(sub) = status.subagents.iter_mut().find(|sub| sub.id == id) {
+            sub.model = Some(model);
+        }
+    }
+}
 
 const BACKOFF_MIN: Duration = Duration::from_millis(250);
 const BACKOFF_MAX: Duration = Duration::from_secs(2);
@@ -213,7 +221,7 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
                         }
                     }
                     msg => {
-                        let listed = matches!(msg, ServerMsg::Terminals(_));
+                        let listed = matches!(msg, ServerMsg::Terminals(_) | ServerMsg::TerminalsWithSubagentModels { .. });
                         let removed = matches!(msg, ServerMsg::TerminalRemoved { .. });
                         let resume_id = match &msg {
                             ServerMsg::Output { id, bytes, .. } if !bytes.is_empty() => Some(*id),
@@ -437,6 +445,14 @@ impl Conn {
             // Requested only on a dedicated activity connection.
             ServerMsg::SubagentActivity { .. } => return Ok(out),
             ServerMsg::Terminals(list) => self.reconcile(list, &mut out),
+            ServerMsg::TerminalsWithSubagentModels { mut terminals, models } => {
+                for (id, models) in models {
+                    if let Some(status) = terminals.iter_mut().find(|t| t.id == id).and_then(|t| t.agent.as_mut()) {
+                        attach_subagent_models(status, models);
+                    }
+                }
+                self.reconcile(terminals, &mut out);
+            }
             ServerMsg::TerminalCreated(info) => {
                 let mut st = self.state.lock();
                 if !st.terminals.iter().any(|t| t.info.id == info.id) {
@@ -455,11 +471,10 @@ impl Conn {
             ServerMsg::TerminalRemoved { id } => {
                 self.state.lock().terminals.retain(|t| t.info.id != id);
             }
-            ServerMsg::AgentStatusChanged { id, status } => {
-                let mut st = self.state.lock();
-                if let Some(t) = st.terminals.iter_mut().find(|t| t.info.id == id) {
-                    t.info.agent = status;
-                }
+            ServerMsg::AgentStatusChanged { id, status } => self.set_agent_status(id, status),
+            ServerMsg::AgentStatusWithSubagentModels { id, mut status, models } => {
+                attach_subagent_models(&mut status, models);
+                self.set_agent_status(id, Some(status));
             }
             ServerMsg::TerminalTitle { id, title } => {
                 let mut st = self.state.lock();
@@ -501,6 +516,12 @@ impl Conn {
         }
         (self.wake)();
         Ok(out)
+    }
+
+    fn set_agent_status(&self, id: TermId, status: Option<AgentStatus>) {
+        if let Some(t) = self.state.lock().terminals.iter_mut().find(|t| t.info.id == id) {
+            t.info.agent = status;
+        }
     }
 
     fn session_of(&self, id: TermId) -> Option<TermSession> {
@@ -644,6 +665,38 @@ mod tests {
     #[test]
     fn other_messages_are_ignored() {
         assert_eq!(classify_incompatible(&ServerMsg::Terminals(Vec::new()), false), None);
+    }
+
+    #[test]
+    fn extended_inventory_feeds_model_to_sidebar_and_plain_updates_clear_it() {
+        use sich_proto::{AgentKind, AgentState, SubagentStatus};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let conn = test_conn(&rt, false);
+        let status = AgentStatus {
+            kind: AgentKind::Omp, state: AgentState::Working, unread: false, since_unix_ms: 10,
+            detail: None, model: Some("parent-model".into()), title: None, prompt: None, message: None,
+            session_id: Some("parent".into()), subagents: vec![SubagentStatus {
+                id: "child".into(), agent_type: None, description: None, state: AgentState::Working,
+                detail: None, since_unix_ms: 20, model: None,
+            }],
+        };
+        let info = TerminalInfo {
+            id: 1, title: "shell".into(), cwd: "/test".into(), cols: 80, rows: 24, exited: None,
+            created_unix_ms: 1, worktree: None, agent: Some(status.clone()),
+        };
+        conn.on_server(ServerMsg::TerminalsWithSubagentModels {
+            terminals: vec![info],
+            models: vec![(1, vec![
+                SubagentModel { id: "unrelated".into(), model: "other-model".into() },
+                SubagentModel { id: "child".into(), model: "child-model".into() },
+            ])],
+        }).unwrap();
+        let child_model = || conn.state.lock().terminals[0].info.agent.as_ref().unwrap().subagents[0].model.clone();
+        assert_eq!(child_model().as_deref(), Some("child-model"));
+        assert_eq!(conn.state.lock().first_list_count, Some(1));
+        conn.on_server(ServerMsg::AgentStatusChanged { id: 1, status: Some(status) }).unwrap();
+        assert_eq!(child_model(), None);
     }
 
     fn test_conn(rt: &tokio::runtime::Runtime, auto_create: bool) -> Conn {

@@ -148,6 +148,7 @@ struct Endpoint {
     socket: String,
     incompatible: bool,
     omp_status: bool,
+    subagent_models: bool,
 }
 
 fn legacy_endpoints(base: &str, primary: &str, entries: &[generation::Entry]) -> Vec<Endpoint> {
@@ -157,6 +158,7 @@ fn legacy_endpoints(base: &str, primary: &str, entries: &[generation::Entry]) ->
             socket: entry.socket.clone(),
             incompatible: entry.proto_version != PROTO_VERSION,
             omp_status: entry.omp_status,
+            subagent_models: entry.subagent_models,
         })
         .collect()
 }
@@ -172,6 +174,7 @@ async fn probe_legacy(base: &str) -> Option<Endpoint> {
                 socket: base.into(),
                 incompatible: daemon_conn::classify_incompatible(&msg, false).is_some(),
                 omp_status: false,
+                subagent_models: false,
             })
         } else {
             None
@@ -206,10 +209,11 @@ impl Peer {
             last_error: None,
         }));
         let name = if legacy { generation::RETIRE_CLIENT } else { "sich-app" };
+        let models = if endpoint.subagent_models { sich_proto::SUBAGENT_MODELS_CLIENT_SUFFIX } else { "" };
         let suffix = if endpoint.omp_status { sich_proto::OMP_CLIENT_SUFFIX } else { "" };
         let conn = daemon_conn::Conn {
             socket: endpoint.socket.clone(),
-            client_name: format!("{name}{suffix}"),
+            client_name: format!("{name}{models}{suffix}"),
             rt: rt.clone(),
             state: state.clone(),
             cmd_tx: cmd_tx.clone(),
@@ -262,7 +266,9 @@ impl DaemonPool {
 
     fn start_on(rt: &Handle, base: String, build: &str, wake: Wake, spawn_primary: bool) -> Self {
         let socket = generation::socket(&base, build);
-        let primary = Peer::start(rt, Endpoint { socket, incompatible: false, omp_status: true }, wake.clone(), false);
+        let primary = Peer::start(rt, Endpoint {
+            socket, incompatible: false, omp_status: true, subagent_models: true,
+        }, wake.clone(), false);
         let pool = Arc::new(Pool {
             base, primary, legacy: Mutex::new(Vec::new()), keys: Mutex::default(),
             discovered: false.into(), exiting: false.into(),
@@ -521,6 +527,7 @@ mod tests {
             started_ms: 0,
             omp_status: false,
             subagent_activity: false,
+            subagent_models: false,
         }
     }
 
@@ -556,8 +563,8 @@ mod tests {
         assert_eq!(
             legacy_endpoints("base", "base-new", &entries),
             vec![
-                Endpoint { socket: "base-old".into(), incompatible: false, omp_status: false },
-                Endpoint { socket: "base-future".into(), incompatible: true, omp_status: false },
+                Endpoint { socket: "base-old".into(), incompatible: false, omp_status: false, subagent_models: false },
+                Endpoint { socket: "base-future".into(), incompatible: true, omp_status: false, subagent_models: false },
             ],
         );
         assert!(legacy_endpoints("base", "base-new", &[]).is_empty());

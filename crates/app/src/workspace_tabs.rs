@@ -51,17 +51,29 @@ impl<K: Eq, T> WorkspaceTabs<K, T> {
     }
 
     pub fn close(&mut self, id: u64) {
-        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
-            return;
-        };
-        self.tabs.remove(index);
-        if self.active == Some(id) {
-            self.active = self
-                .tabs
-                .get(index)
-                .or_else(|| self.tabs.last())
-                .map(|tab| tab.id);
+        self.close_where(|tab| tab.id == id);
+    }
+
+    /// Close a batch in one pass, selecting the next surviving neighbor if the active tab closed.
+    pub fn close_where(&mut self, mut should_close: impl FnMut(&WorkspaceTab<K, T>) -> bool) -> bool {
+        let old_len = self.tabs.len();
+        let mut kept = 0;
+        let mut fallback = None;
+        self.tabs.retain(|tab| {
+            if should_close(tab) {
+                if self.active == Some(tab.id) {
+                    fallback = Some(kept);
+                }
+                false
+            } else {
+                kept += 1;
+                true
+            }
+        });
+        if let Some(index) = fallback {
+            self.active = self.tabs.get(index).or_else(|| self.tabs.last()).map(|tab| tab.id);
         }
+        self.tabs.len() != old_len
     }
 }
 

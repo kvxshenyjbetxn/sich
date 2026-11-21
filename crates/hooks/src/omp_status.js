@@ -77,7 +77,10 @@ export default function sichStatus(pi) {
             // Native events have only an id, no call or file; the spawning bus
             // and its ordering with lifecycle frames identify the active run.
             if (!run || run.parent !== sender?.id) return;
-            record(id, run, frame.activityKind, frame.title, frame.text);
+            const modelChanged = frame.model !== undefined && frame.model !== run.model;
+            if (modelChanged) run.model = frame.model;
+            if (!frame.activityKind && !modelChanged) return;
+            if (frame.activityKind) record(id, run, frame.activityKind, frame.title, frame.text);
             if (frame.activityKind === "tool_started" && frame.title === "wait") {
                 record(id, run, "waiting", frame.title);
             }
@@ -98,9 +101,11 @@ export default function sichStatus(pi) {
                 return; // Progress and settle frames cannot resurrect an old run.
             } else if (frame.kind === "progress") {
                 const description = frame.description ?? run.description;
-                if (description === run.description && frame.detail === run.tool) return;
+                // Progress clears currentTool between calls; the last action is still useful.
+                const tool = frame.detail ?? run.tool;
+                if (description === run.description && tool === run.tool) return;
                 run.description = description;
-                run.tool = frame.detail;
+                run.tool = tool;
             } else {
                 record(id, run, status);
                 roster.delete(id);
@@ -138,7 +143,7 @@ export default function sichStatus(pi) {
     pi.events.on("task:subagent:event", (payload) => {
         const { id, event } = payload ?? {};
         if (!context || typeof id !== "string" || !id) return;
-        let activityKind, title, text;
+        let activityKind, title, text, model;
         switch (event?.type) {
             case "tool_execution_start":
                 activityKind = "tool_started";
@@ -150,12 +155,16 @@ export default function sichStatus(pi) {
                 // Unlike ordinary widget output, ask's result can be direct user input.
                 if (event.toolName !== "ask") text = activityText(event.result?.content);
                 break;
-            case "message_end":
-                if (event.message?.role !== "assistant") return;
-                text = activityText(event.message.content);
-                if (!text) return;
-                activityKind = "message";
+            case "message_start":
+            case "message_end": {
+                const message = event.message;
+                if (message?.role !== "assistant") return;
+                if (message.stopReason !== "error" && message.stopReason !== "aborted") model = label(message.model);
+                if (event.type === "message_end") text = activityText(message.content);
+                if (text) activityKind = "message";
+                if (!activityKind && !model) return;
                 break;
+            }
             case "agent_pause":
                 if (event.awaiting !== true) return;
                 activityKind = "waiting";
@@ -164,7 +173,7 @@ export default function sichStatus(pi) {
                 // The task lifecycle status, not the model loop's end, settles a run.
                 return;
         }
-        observe({ kind: "activity", id, activityKind, title, text });
+        observe({ kind: "activity", id, activityKind, title, text, model });
     });
 
     function waitingOn() {
@@ -220,6 +229,7 @@ export default function sichStatus(pi) {
                 id, agent_type: run.type, description: run.description ?? id,
                 state: run.waiting ? "waiting" : "working", detail: run.waiting ?? run.tool,
                 since_unix_ms: run.since,
+                model: run.model,
             });
             if (subagents.length === MAX_SUBAGENTS) break;
         }

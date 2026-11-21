@@ -36,6 +36,7 @@ fn status() -> AgentStatus {
                 state: AgentState::Working,
                 detail: Some("Grep".into()),
                 since_unix_ms: 1_700_000_000_050,
+                model: None,
             },
             SubagentStatus {
                 id: "agent-def".into(),
@@ -44,6 +45,7 @@ fn status() -> AgentStatus {
                 state: AgentState::Waiting,
                 detail: None,
                 since_unix_ms: 1_700_000_000_060,
+                model: None,
             },
         ],
     }
@@ -185,6 +187,15 @@ fn server_msgs_round_trip() {
                 seq: 3 + i as u64, unix_ms: 100, kind, title: Some("read".into()), text: Some("result".into()),
             }).collect(),
         }) },
+        ServerMsg::TerminalsWithSubagentModels {
+            terminals: vec![info()],
+            models: vec![(7, vec![SubagentModel { id: "agent-abc123".into(), model: "child-model".into() }])],
+        },
+        ServerMsg::AgentStatusWithSubagentModels {
+            id: 7,
+            status: status(),
+            models: vec![SubagentModel { id: "agent-def".into(), model: "child-model".into() }],
+        },
     ];
     for m in msgs {
         let bytes = encode(&m).unwrap();
@@ -251,4 +262,21 @@ fn agent_status_with_and_without_subagents_round_trips() {
     assert_eq!(decode::<AgentStatus>(&encode(&st).unwrap()).unwrap(), st);
     let none = AgentStatus { subagents: Vec::new(), ..status() };
     assert_eq!(decode::<AgentStatus>(&encode(&none).unwrap()).unwrap(), none);
+}
+
+#[test]
+fn child_model_is_not_part_of_the_legacy_v7_layout() {
+    let mut child = SubagentStatus {
+        id: "c".into(),
+        agent_type: None,
+        description: None,
+        state: AgentState::Working,
+        detail: None,
+        since_unix_ms: 42,
+        model: Some("child-model".into()),
+    };
+    let legacy = &[1, b'c', 0, 0, 0, 0, 42];
+    assert_eq!(encode(&child).unwrap().as_ref(), legacy);
+    child.model = None;
+    assert_eq!(decode::<SubagentStatus>(legacy).unwrap(), child);
 }

@@ -12,6 +12,8 @@ use gpui_kit::{
     Styled as _, Window, div, list, px,
 };
 use sich_daemon::generation;
+use sich_orch::auto_close::{AUTO_CLOSE_DELAY_MS, AutoClose};
+use sich_orch::paths::now_ms;
 use sich_proto::{
     ClientMsg, PROTO_VERSION, SUBAGENT_ACTIVITY_CLIENT, ServerMsg, SubagentActivity,
     SubagentActivityEntry, SubagentActivityKey, SubagentActivityKind, decode, encode, frame_codec,
@@ -22,7 +24,7 @@ use tokio_util::codec::Framed;
 
 use crate::daemon_client::TerminalOwner;
 use crate::i18n::{Language, Tr, tr};
-use crate::settings;
+use crate::{orch_banner, settings};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(300);
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(1);
@@ -83,11 +85,14 @@ struct ActivityLog {
     after_seq: u64,
     gap: bool,
     rows: Vec<ActivityRow>,
+    ended_ms: Option<i64>,
+    keep_open: bool,
+    auto_close_allowed_ms: Option<i64>,
 }
 
 impl ActivityLog {
     /// Keep rows already read if the run completes, expires or briefly loses its connection.
-    fn update(&mut self, update: Update) -> bool {
+    fn update(&mut self, update: Update, now_ms: i64) -> bool {
         let old_status = self.status;
         let old_count = self.rows.len();
         let old_gap = self.gap;
@@ -95,6 +100,14 @@ impl ActivityLog {
             Update::Status(status) => self.status = status,
             Update::Delta(activity) => {
                 self.status = if activity.running { Status::Live } else { Status::Finished };
+                if !activity.running && self.ended_ms.is_none() {
+                    self.ended_ms = Some(activity.entries.last()
+                        .filter(|entry| matches!(entry.kind, SubagentActivityKind::Completed
+                            | SubagentActivityKind::Failed | SubagentActivityKind::Aborted
+                            | SubagentActivityKind::Ended))
+                        .and_then(|entry| i64::try_from(entry.unix_ms).ok())
+                        .unwrap_or(now_ms));
+                }
                 self.gap |= activity.first_seq > self.after_seq.saturating_add(1);
                 for entry in activity.entries {
                     if entry.seq > self.after_seq {
@@ -105,6 +118,26 @@ impl ActivityLog {
             }
         }
         self.status != old_status || self.rows.len() != old_count || self.gap != old_gap
+    }
+
+    fn auto_close_state(&self, enabled: bool) -> Option<AutoClose> {
+        if self.keep_open {
+            return Some(AutoClose::Kept);
+        }
+        if !enabled {
+            return None;
+        }
+        if let Some(ended) = self.ended_ms {
+            let from = ended.max(self.auto_close_allowed_ms.unwrap_or(ended));
+            Some(AutoClose::ClosesAt(from.saturating_add(AUTO_CLOSE_DELAY_MS)))
+        } else {
+            (self.status == Status::Live).then_some(AutoClose::Running)
+        }
+    }
+
+    fn toggle_keep_open(&mut self, now_ms: i64) {
+        self.keep_open = !self.keep_open;
+        self.auto_close_allowed_ms = (!self.keep_open).then_some(now_ms);
     }
 }
 
@@ -157,6 +190,10 @@ impl ActivityView {
         self.focus.focus(window, cx);
     }
 
+    pub(crate) fn auto_close_state(&self, enabled: bool) -> Option<AutoClose> {
+        self.log.auto_close_state(enabled)
+    }
+
     fn set_layout(&mut self, layout: Layout, cx: &mut Context<Self>) {
         if self.layout != layout {
             self.layout = layout;
@@ -168,7 +205,7 @@ impl ActivityView {
 
     fn update(&mut self, update: Update, cx: &mut Context<Self>) {
         let before = self.log.rows.len();
-        if self.log.update(update) {
+        if self.log.update(update, now_ms()) {
             let added = self.log.rows.len() - before;
             if added != 0 {
                 self.list.splice(before..before, added);
@@ -189,6 +226,17 @@ impl Render for ActivityView {
         let theme = cx.theme().clone();
         let lang = settings::language(cx);
         let owner = cx.weak_entity();
+        let banner = self.auto_close_state(settings::get(cx).orch_auto_close_workers).map(|state| {
+            let toggle = cx.listener(|view, _, window, cx| {
+                view.log.toggle_keep_open(now_ms());
+                view.focus(window, cx);
+                cx.notify();
+            });
+            orch_banner::lifetime_banner(
+                state, now_ms(), lang, (Tr::ActivityAutoCloseRunning, Tr::ActivityAutoCloseFinished),
+                cx, toggle,
+            ).w_full().flex_shrink_0()
+        });
         let content = if self.log.rows.is_empty() {
             let empty = matches!(self.log.status, Status::Live | Status::Finished);
             div().px_4().py_3().text_sm().text_color(theme.muted_foreground)
@@ -213,6 +261,7 @@ impl Render for ActivityView {
             .aria_label(self.label.clone())
             .track_focus(&self.focus)
             .bg(theme.background)
+            .children(banner)
             .child(
                 v_flex().w_full().flex_shrink_0().min_w_0().px_4().py_3().gap_2()
                     .border_b_1().border_color(theme.border)
@@ -428,22 +477,61 @@ mod tests {
     #[test]
     fn reconnect_and_completion_keep_existing_rows_without_replaying_entries() {
         let mut log = ActivityLog::default();
-        assert!(log.update(delta(true, 1, &[1, 2])));
-        assert!(!log.update(delta(true, 1, &[])));
-        assert!(log.update(Update::Status(Status::Reconnecting)));
+        assert!(log.update(delta(true, 1, &[1, 2]), 10));
+        assert!(!log.update(delta(true, 1, &[]), 20));
+        assert!(log.update(Update::Status(Status::Reconnecting), 30));
         assert_eq!((log.after_seq, log.rows.len()), (2, 2));
-        assert!(log.update(delta(true, 1, &[2, 3])));
-        assert!(log.update(delta(false, 1, &[])));
+        assert!(log.update(delta(true, 1, &[2, 3]), 40));
+        assert!(log.update(delta(false, 1, &[]), 50));
         assert_eq!((log.status, log.after_seq, log.rows.len(), log.gap), (Status::Finished, 3, 3, false));
     }
 
     #[test]
     fn a_retention_gap_or_unavailable_journal_does_not_erase_collected_history() {
         let mut log = ActivityLog::default();
-        log.update(delta(true, 1, &[1]));
-        assert!(log.update(delta(true, 4, &[4, 5])));
-        assert!(log.update(Update::Status(Status::Unavailable)));
+        log.update(delta(true, 1, &[1]), 10);
+        assert!(log.update(delta(true, 4, &[4, 5]), 20));
+        assert!(log.update(Update::Status(Status::Unavailable), 30));
         assert_eq!((log.status, log.after_seq, log.rows.len(), log.gap), (Status::Unavailable, 5, 3, true));
+    }
+
+    #[test]
+    fn only_confirmed_completion_arms_auto_close_and_it_uses_the_lifecycle_time() {
+        use sich_orch::auto_close::due_for_close;
+        let mut log = ActivityLog::default();
+        assert_eq!(log.auto_close_state(true), None);
+        log.update(delta(true, 1, &[1]), 50);
+        assert_eq!(log.auto_close_state(true), Some(AutoClose::Running));
+        for status in [Status::Reconnecting, Status::Unavailable] {
+            log.update(Update::Status(status), 900_000);
+            assert!(!due_for_close(log.auto_close_state(true), 900_000));
+        }
+        for kind in [SubagentActivityKind::Completed, SubagentActivityKind::Failed,
+            SubagentActivityKind::Aborted, SubagentActivityKind::Ended]
+        {
+            let mut log = ActivityLog::default();
+            log.update(Update::Delta(SubagentActivity {
+                running: false,
+                first_seq: 1,
+                entries: vec![SubagentActivityEntry { seq: 1, unix_ms: 1_000, kind, title: None, text: None }],
+            }), 4_000);
+            assert!(!due_for_close(log.auto_close_state(true), 120_999));
+            assert!(due_for_close(log.auto_close_state(true), 121_000));
+            assert_eq!(log.auto_close_state(false), None);
+        }
+    }
+
+    #[test]
+    fn keeping_open_survives_completion_and_allowing_close_restarts_the_countdown() {
+        let mut log = ActivityLog::default();
+        log.update(delta(true, 1, &[1]), 50);
+        log.toggle_keep_open(60);
+        log.update(delta(false, 1, &[]), 100);
+        assert_eq!(log.auto_close_state(true), Some(AutoClose::Kept));
+        assert_eq!(log.auto_close_state(false), Some(AutoClose::Kept));
+        log.toggle_keep_open(500_000);
+        assert_eq!(log.auto_close_state(true), Some(AutoClose::ClosesAt(620_000)));
+        assert_eq!(log.auto_close_state(false), None);
     }
 
     #[test]
@@ -451,7 +539,7 @@ mod tests {
         let owner = TerminalOwner { socket: "test-a".into(), id: 1, pid: 7, created_ms: 2 };
         let mut generation = generation::Entry {
             pid: 7, socket: "test-a".into(), daemon_build_id: "a".into(), proto_version: PROTO_VERSION,
-            started_ms: 1, omp_status: true, subagent_activity: false,
+            started_ms: 1, omp_status: true, subagent_activity: false, subagent_models: false,
         };
         assert!(!supports_activity(&owner, &[]));
         assert!(!supports_activity(&owner, std::slice::from_ref(&generation)));
@@ -509,8 +597,8 @@ mod tests {
         assert_eq!(result.unwrap(), None);
         assert_eq!(cursor, 3);
         let mut log = ActivityLog::default();
-        log.update(rx.try_recv().unwrap());
-        log.update(rx.try_recv().unwrap());
+        log.update(rx.try_recv().unwrap(), 10);
+        log.update(rx.try_recv().unwrap(), 20);
         assert_eq!((log.status, log.rows.len()), (Status::Finished, 3));
     }
 

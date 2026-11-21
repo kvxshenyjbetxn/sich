@@ -131,6 +131,8 @@ pub enum Tr {
     OrchTemporary,
     OrchAutoCloseRunning,
     OrchAutoCloseFinished,
+    ActivityAutoCloseRunning,
+    ActivityAutoCloseFinished,
     OrchKeepOpen,
     OrchAllowAutoClose,
     NewGroup,
@@ -330,6 +332,8 @@ impl Tr {
         Tr::OrchTemporary,
         Tr::OrchAutoCloseRunning,
         Tr::OrchAutoCloseFinished,
+        Tr::ActivityAutoCloseRunning,
+        Tr::ActivityAutoCloseFinished,
         Tr::OrchKeepOpen,
         Tr::OrchAllowAutoClose,
         Tr::NewGroup,
@@ -1201,9 +1205,9 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             En => "worker",
         },
         Tr::OrchAutoCloseWorkers => match lang {
-            Uk => "Автоматично закривати завершених воркерів (через 2 хв, якщо не натиснути «Залишити відкритим»)",
-            Ru => "Автоматически закрывать завершённых воркеров (через 2 мин, если не нажать «Оставить открытым»)",
-            En => "Auto-close finished workers (after 2 minutes unless you choose Keep open)",
+            Uk => "Автоматично закривати воркери й вкладки активності (через 2 хв після завершення, якщо не натиснути «Залишити відкритим»)",
+            Ru => "Автоматически закрывать воркеры и вкладки активности (через 2 мин после завершения, если не нажать «Оставить открытым»)",
+            En => "Auto-close workers and activity tabs (2 minutes after completion unless you choose Keep open)",
         },
         Tr::OrchCleanupWorktrees => match lang {
             Uk => "Видаляти worktree воркерів після злиття їхньої гілки",
@@ -1224,6 +1228,16 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Uk => "Воркер завершив роботу · закриється через",
             Ru => "Воркер завершил работу · закроется через",
             En => "Orchestration worker finished · Closes in",
+        },
+        Tr::ActivityAutoCloseRunning => match lang {
+            Uk => "Вкладка активності · закриється через 2 хв після завершення",
+            Ru => "Вкладка активности · закроется через 2 мин после завершения",
+            En => "Activity tab · Closes 2 minutes after the subagent finishes",
+        },
+        Tr::ActivityAutoCloseFinished => match lang {
+            Uk => "Субагент завершив роботу · вкладка закриється через",
+            Ru => "Субагент завершил работу · вкладка закроется через",
+            En => "Subagent finished · Tab closes in",
         },
         Tr::OrchKeepOpen => match lang {
             Uk => "Залишити відкритим",

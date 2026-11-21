@@ -345,6 +345,8 @@ pub fn parse_codex_payload(json: &str) -> Option<CodexHook> {
         input.and_then(|i| i.get("description")).and_then(|x| x.as_str()).and_then(|s| normalize_text(s, false));
     let event = get("hook_event_name")?;
     let agent_id = nonempty("agent_id").map(|s| s.chars().take(MAX_AGENT_ID_CHARS).collect::<String>());
+    let model = obj.get("model").and_then(|x| x.as_str()).map(str::trim).filter(|s| !s.is_empty())
+        .map(|s| if agent_id.is_some() { clip(s) } else { s.to_owned() });
     let activity = activity::hook_note(&event, agent_id.as_deref(), tool_name.as_deref(), obj);
     Some(CodexHook {
         session_id: get("session_id").filter(|id| !id.is_empty()),
@@ -352,7 +354,7 @@ pub fn parse_codex_payload(json: &str) -> Option<CodexHook> {
         tool_name,
         tool_label,
         description,
-        model: get("model").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        model,
         prompt: get("prompt").and_then(|s| normalize_text(&s, true)),
         last_assistant_message: get("last_assistant_message").and_then(|s| normalize_text(&s, false)),
         agent_id,
@@ -464,6 +466,7 @@ fn upsert_sub<'a>(list: &'a mut Vec<SubagentStatus>, id: &str, now: u64) -> Opti
         state: AgentState::Working,
         detail: None,
         since_unix_ms: now,
+        model: None,
     });
     list.last_mut()
 }
@@ -488,6 +491,7 @@ fn reconcile(list: &mut Vec<SubagentStatus>, bg: &Option<Vec<BgAgentTask>>, now:
                 state: AgentState::Working,
                 detail: None,
                 since_unix_ms: now,
+                model: None,
             });
         }
     }
@@ -532,6 +536,16 @@ fn apply_claude(
         };
         match h.event.as_str() {
             "SubagentStart" | "SubagentStop" => {}
+            "SessionStart" | "PostModelSwitch" => {
+                let mut p = prev?;
+                if let Some(sub) = p.kind.eq(&kind).then(|| p.subagents.iter_mut().find(|s| s.id == id)).flatten() {
+                    let model = if h.event == "SessionStart" { &h.model } else { &h.to_model };
+                    if let Some(model) = non_empty(model) {
+                        sub.model = Some(model);
+                    }
+                }
+                return Some(p);
+            }
             "Notification" if h.notification_type.as_deref() == Some("idle_prompt") => return prev,
             "StopFailure" => {
                 let mut p = prev?;
@@ -566,11 +580,13 @@ fn apply_claude(
         // Only record the model / the subagent's final message; the state does not change.
         "PostModelSwitch" | "SubagentStop" => {
             let mut p = prev?;
-            if h.event == "PostModelSwitch" && h.agent_id.is_none() && h.session_id.is_some() && p.kind == kind {
-                p.session_id.clone_from(&h.session_id);
-            }
-            if let Some(m) = &h.to_model {
-                p.model = Some(m.clone());
+            if h.event == "PostModelSwitch" {
+                if h.session_id.is_some() && p.kind == kind {
+                    p.session_id.clone_from(&h.session_id);
+                }
+                if let Some(m) = &h.to_model {
+                    p.model = Some(m.clone());
+                }
             }
             if h.event == "SubagentStop" {
                 if h.last_assistant_message.is_some() {
@@ -648,8 +664,11 @@ fn apply_claude(
             }
         }
     }
-    if let Some(m) = &h.model {
-        s.model = Some(m.clone());
+    // SubagentStart has no documented model; a child SessionStart is handled above.
+    if h.event == "SessionStart" {
+        if let Some(m) = &h.model {
+            s.model = Some(m.clone());
+        }
     }
     if let Some(t) = &h.session_title {
         s.title = Some(t.clone());
@@ -676,12 +695,20 @@ fn apply_codex(prev: Option<AgentStatus>, h: &CodexHook, now: u64) -> Option<Age
     let tool = h.tool_label.as_ref().or(h.tool_name.as_ref()).map(|t| clip(t)).filter(|t| !t.is_empty());
     if let Some(id) = h.agent_id.as_deref() {
         // Events from inside a subagent never change the main status.
+        if prev.as_ref().is_some_and(|s| s.kind != kind) {
+            return prev;
+        }
         match h.event.as_str() {
             "SubagentStart" | "PreToolUse" | "PostToolUse" | "PermissionRequest" => {
                 let mut p = prev?;
                 if let Some(sub) = upsert_sub(&mut p.subagents, id, now) {
                     if let Some(a) = real_label(&h.agent_type) {
                         sub.agent_type = Some(a);
+                    }
+                    if let Some(model) = &h.model
+                        && sub.model.as_ref() != Some(model)
+                    {
+                        sub.model = Some(model.clone());
                     }
                     match h.event.as_str() {
                         "SubagentStart" => {
@@ -1137,6 +1164,27 @@ mod tests {
         assert_eq!(run(None, "PostModelSwitch", r#","to_model":"m""#, T0), None);
         let same = run(Some(sw.clone()), "PostModelSwitch", "", T0 + 3);
         assert_eq!(same, Some(sw));
+    }
+
+    #[test]
+    fn claude_child_models_require_a_live_id_and_a_documented_model_event() {
+        let parent = run(None, "SessionStart", r#","model":"parent""#, T0);
+        let unknown = run(parent.clone(), "SessionStart", r#","agent_id":"c","model":"child""#, T0 + 1);
+        assert_eq!(unknown, parent);
+
+        let started = run(parent, "SubagentStart", r#","agent_id":"c","model":"not-documented""#, T0 + 2).unwrap();
+        assert_eq!(started.model.as_deref(), Some("parent"));
+        assert_eq!(started.subagents[0].model, None);
+        let live = run(Some(started), "SessionStart", r#","agent_id":"c","model":" child ""#, T0 + 3).unwrap();
+        assert_eq!(live.model.as_deref(), Some("parent"));
+        assert_eq!(live.subagents[0].model.as_deref(), Some("child"));
+        let switched = run(Some(live), "PostModelSwitch", r#","agent_id":"c","to_model":"next""#, T0 + 4).unwrap();
+        assert_eq!(switched.model.as_deref(), Some("parent"));
+        assert_eq!(switched.subagents[0].model.as_deref(), Some("next"));
+
+        let stopped = run(Some(switched), "SubagentStop", r#","agent_id":"c""#, T0 + 5);
+        let reused = run(stopped, "SubagentStart", r#","agent_id":"c""#, T0 + 6).unwrap();
+        assert_eq!(reused.subagents[0].model, None);
     }
 
     #[test]
@@ -1786,6 +1834,22 @@ mod tests {
         let sub = &s.subagents[0];
         assert_eq!((sub.id.as_str(), sub.state, sub.agent_type.as_deref()), ("a1", AgentState::Working, Some("explorer")));
         assert_eq!((sub.detail.clone(), sub.description.clone(), sub.since_unix_ms), (None, None, T0 + 5));
+    }
+
+    #[test]
+    fn codex_child_model_is_clipped_and_sticky_until_the_child_stops() {
+        let long = "é".repeat(MAX_DETAIL_CHARS + 5);
+        let reported = format!(r#","model":" {long} ""#);
+        let s = crun_h(working_main(), &cchild("SubagentStart", "a1", &reported), T0 + 2).unwrap();
+        assert_eq!(s.subagents[0].model, Some("é".repeat(MAX_DETAIL_CHARS)));
+        let s = crun_h(Some(s), &cchild("PreToolUse", "a1", r#","tool_name":"Bash","model":"  ""#), T0 + 3).unwrap();
+        assert_eq!(s.subagents[0].model, Some("é".repeat(MAX_DETAIL_CHARS)));
+        let s = crun_h(Some(s), &cchild("PermissionRequest", "a1", r#","model":" new-child-model ""#), T0 + 4).unwrap();
+        assert_eq!(s.subagents[0].model.as_deref(), Some("new-child-model"));
+        assert_eq!(s.model.as_deref(), Some("m1"));
+        let s = crun_h(Some(s), &cchild("SubagentStop", "a1", ""), T0 + 5);
+        let reused = crun_h(s, &cchild("SubagentStart", "a1", ""), T0 + 6).unwrap();
+        assert_eq!(reused.subagents[0].model, None);
     }
 
     #[test]

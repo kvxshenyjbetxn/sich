@@ -85,6 +85,10 @@ pub enum ServerMsg {
     TerminalRestored { request_id: u64, terminal: Option<TerminalInfo> },
     /// A private reply to `GetSubagentActivity`; never broadcast to existing clients.
     SubagentActivity { activity: Option<SubagentActivity> },
+    /// Atomic `ListTerminals` reply for clients that opted in to child models.
+    TerminalsWithSubagentModels { terminals: Vec<TerminalInfo>, models: Vec<(TermId, Vec<SubagentModel>)> },
+    /// Atomic status update for clients that opted in to child models.
+    AgentStatusWithSubagentModels { id: TermId, status: AgentStatus, models: Vec<SubagentModel> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,12 +130,12 @@ pub struct AgentStatus {
     pub prompt: Option<String>,
     /// Last assistant message, or the failure text for `Failed` (normalized, <= 400 chars).
     pub message: Option<String>,
-    /// Live Claude Code subagents of this terminal, in start order.
+    /// Live subagents of this terminal, in start order.
     pub subagents: Vec<SubagentStatus>,
     pub session_id: Option<String>,
 }
 
-/// One running Claude Code subagent (attributed by the hook payload's `agent_id`).
+/// One running subagent, attributed to a child ID by the agent integration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubagentStatus {
     pub id: String,
@@ -143,6 +147,16 @@ pub struct SubagentStatus {
     pub detail: Option<String>,
     /// When the subagent started.
     pub since_unix_ms: u64,
+    /// Reported by the child when available. Legacy v7 messages omit this field.
+    #[serde(skip)]
+    pub model: Option<String>,
+}
+
+/// A reported model keyed by child ID within the accompanying status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentModel {
+    pub id: String,
+    pub model: String,
 }
 
 /// An individual run within a terminal, not just an agent name which may be reused.

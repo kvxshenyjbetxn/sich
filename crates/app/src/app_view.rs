@@ -20,7 +20,7 @@ use gpui_kit::{
 };
 use sich_git::Repo;
 use sich_git::compare::CompareKey;
-use sich_orch::auto_close::{AutoClose, countdown_seconds};
+use sich_orch::auto_close::{AutoClose, countdown_seconds, due_for_close};
 use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, SubagentActivityKey, TermId, TerminalInfo};
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
@@ -59,6 +59,12 @@ const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// How long a session restore may take before it stops blocking session saves.
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn countdown_changed(state: Option<AutoClose>, previous_ms: i64, now_ms: i64) -> bool {
+    matches!(state, Some(AutoClose::ClosesAt(deadline))
+        if countdown_seconds(deadline.saturating_sub(previous_ms))
+            != countdown_seconds(deadline.saturating_sub(now_ms)))
+}
 
 /// Terminals of one workspace being recreated from the saved session.
 struct RestoreTarget {
@@ -337,24 +343,22 @@ impl AppView {
     /// (a bracketed paste, then Enter a moment later).
     fn apply_orch(&mut self, out: sich_orch::watch::TickOutput, cx: &mut Context<Self>) {
         let now_ms = sich_orch::paths::now_ms();
-        let countdown_changed = !self.hidden_to_tray
-            && self.active_tab().is_none()
-            && self.focused
+        let enabled = settings::get(cx).orch_auto_close_workers;
+        self.tick_activity_tabs(enabled, now_ms, cx);
+        let worker_state = if !self.hidden_to_tray && self.active_tab().is_none() {
+            self.focused
                 .and_then(|id| self.orch.workers.get(&id))
-                .and_then(|worker| worker.auto_close_state(settings::get(cx).orch_auto_close_workers))
-                .is_some_and(|state| match state {
-                    AutoClose::ClosesAt(deadline) => {
-                        countdown_seconds(deadline.saturating_sub(self.orch_now_ms))
-                            != countdown_seconds(deadline.saturating_sub(now_ms))
-                    }
-                    _ => false,
-                });
+                .and_then(|worker| worker.auto_close_state(enabled))
+        } else {
+            None
+        };
+        let worker_countdown_changed = countdown_changed(worker_state, self.orch_now_ms, now_ms);
         self.orch_now_ms = now_ms;
         let snapshot_changed = out.snapshot.is_some();
         if let Some(snapshot) = out.snapshot {
             self.orch = snapshot;
         }
-        if snapshot_changed || countdown_changed {
+        if snapshot_changed || worker_countdown_changed {
             cx.notify();
         }
         for pointer in out.pointers {
@@ -365,6 +369,37 @@ impl AppView {
                 client.send_input(term, b"\r".to_vec());
             })
             .detach();
+        }
+    }
+
+    fn tick_activity_tabs(&mut self, enabled: bool, now_ms: i64, cx: &mut Context<Self>) {
+        if !enabled {
+            return;
+        }
+        let mut selected_changed = false;
+        let mut active_changed = false;
+        for (workspace, tabs) in &mut self.workspace_tabs {
+            let previous = tabs.active;
+            let removed = tabs.close_where(|tab| match &tab.view {
+                TabView::Activity(view) => due_for_close(view.read(cx).auto_close_state(enabled), now_ms),
+                TabView::Diff(_) => false,
+            });
+            if removed && workspace == &self.ws.selected {
+                selected_changed = true;
+                active_changed = tabs.active != previous;
+            }
+        }
+        if active_changed {
+            self.sync_diff_highlight(cx);
+        }
+        if selected_changed {
+            cx.notify();
+        }
+        if !self.hidden_to_tray
+            && let Some(TabView::Activity(view)) = self.active_tab().map(|tab| &tab.view)
+            && countdown_changed(view.read(cx).auto_close_state(enabled), self.orch_now_ms, now_ms)
+        {
+            view.update(cx, |_, cx| cx.notify());
         }
     }
 

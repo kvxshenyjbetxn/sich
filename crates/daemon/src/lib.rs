@@ -95,6 +95,7 @@ async fn serve(socket_name: &str, build_id: &str, registered: bool) -> anyhow::R
         started_ms: mgr.started_unix_ms,
         omp_status: true,
         subagent_activity: true,
+        subagent_models: true,
     };
     let _registration = if registered {
         let dir = generation::directory().context("no local data dir for daemon registry")?;

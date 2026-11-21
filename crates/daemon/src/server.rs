@@ -5,8 +5,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
 use sich_proto::{
-    AgentKind, AgentStatus, ClientMsg, OMP_CLIENT_SUFFIX, PROTO_VERSION, SUBAGENT_ACTIVITY_CLIENT, ServerMsg,
-    decode, encode, frame_codec,
+    AgentKind, AgentStatus, ClientMsg, OMP_CLIENT_SUFFIX, PROTO_VERSION, SUBAGENT_ACTIVITY_CLIENT,
+    SUBAGENT_MODELS_CLIENT_SUFFIX, ServerMsg, SubagentModel, decode, encode, frame_codec,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
@@ -100,6 +100,10 @@ where
         Some(name) => (name, true),
         None => (client_name.as_str(), false),
     };
+    let (client_name, subagent_models) = match client_name.strip_suffix(SUBAGENT_MODELS_CLIENT_SUFFIX) {
+        Some(name) => (name, true),
+        None => (client_name, false),
+    };
     let writer_cancel = cancel.clone();
     let writer = tokio::spawn(async move {
         loop {
@@ -109,6 +113,9 @@ where
                     let Some(mut msg) = msg else { break };
                     if !omp_status {
                         downgrade_omp(&mut msg);
+                    }
+                    if subagent_models {
+                        msg = with_subagent_models(msg);
                     }
                     let Ok(frame) = encode(&msg) else { continue };
                     if sink.send(frame).await.is_err() {
@@ -144,6 +151,32 @@ fn downgrade_omp(msg: &mut ServerMsg) {
             }
         }
         _ => {}
+    }
+}
+
+/// Add sidecars only for opted-in clients without changing the legacy v7 status layout.
+fn with_subagent_models(msg: ServerMsg) -> ServerMsg {
+    fn models(status: &AgentStatus) -> Vec<SubagentModel> {
+        status.subagents.iter().filter_map(|sub| Some(SubagentModel {
+            id: sub.id.clone(),
+            model: sub.model.clone()?,
+        })).collect()
+    }
+    match msg {
+        ServerMsg::Terminals(terminals) => {
+            let models: Vec<_> = terminals.iter().filter_map(|info| {
+                let models = models(info.agent.as_ref()?);
+                (!models.is_empty()).then_some((info.id, models))
+            }).collect();
+            if models.is_empty() { ServerMsg::Terminals(terminals) }
+            else { ServerMsg::TerminalsWithSubagentModels { terminals, models } }
+        }
+        ServerMsg::AgentStatusChanged { id, status: Some(status) } => {
+            let models = models(&status);
+            if models.is_empty() { ServerMsg::AgentStatusChanged { id, status: Some(status) } }
+            else { ServerMsg::AgentStatusWithSubagentModels { id, status, models } }
+        }
+        other => other,
     }
 }
 

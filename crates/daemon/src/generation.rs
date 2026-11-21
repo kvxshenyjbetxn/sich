@@ -21,6 +21,8 @@ pub struct Entry {
     pub omp_status: bool,
     #[serde(default)]
     pub subagent_activity: bool,
+    #[serde(default)]
+    pub subagent_models: bool,
 }
 
 pub fn socket(base: &str, build_id: &str) -> String {
@@ -171,7 +173,7 @@ mod tests {
     use super::*;
 
     fn generation(base: &str, build: &str, pid: u32, started_ms: u64) -> Entry {
-        Entry { pid, socket: socket(base, build), daemon_build_id: build.into(), proto_version: 7, started_ms, omp_status: true, subagent_activity: true }
+        Entry { pid, socket: socket(base, build), daemon_build_id: build.into(), proto_version: 7, started_ms, omp_status: true, subagent_activity: true, subagent_models: true }
     }
 
     #[test]
@@ -216,16 +218,17 @@ mod selection_tests {
     use super::*;
 
     fn generation(base: &str, build: &str, started_ms: u64, proto_version: u32) -> Entry {
-        Entry { pid: 1, socket: socket(base, build), daemon_build_id: build.into(), proto_version, started_ms, omp_status: true, subagent_activity: true }
+        Entry { pid: 1, socket: socket(base, build), daemon_build_id: build.into(), proto_version, started_ms, omp_status: true, subagent_activity: true, subagent_models: true }
     }
 
     #[test]
-    fn old_v7_registry_entries_do_not_advertise_activity() {
+    fn old_v7_registry_entries_do_not_advertise_new_capabilities() {
         let entry: Entry = serde_json::from_str(
             r#"{"pid":1,"socket":"sich-before","daemon_build_id":"before","proto_version":7,"started_ms":1,"omp_status":true}"#,
         ).unwrap();
         assert!(entry.omp_status);
         assert!(!entry.subagent_activity);
+        assert!(!entry.subagent_models);
     }
 
     #[test]

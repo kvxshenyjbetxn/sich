@@ -356,6 +356,81 @@ fn codex_hook(id: TermId, json: &str) -> ClientMsg {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_child_models_are_atomic_opt_in_and_do_not_leak_into_reused_ids() {
+    use sich_proto::{OMP_CLIENT_SUFFIX, SUBAGENT_MODELS_CLIENT_SUFFIX, SubagentModel};
+
+    let d = start_daemon("codex-child-models");
+    let mut viewer = named_client(&d.name, &format!("viewer{SUBAGENT_MODELS_CLIENT_SUFFIX}{OMP_CLIENT_SUFFIX}")).await;
+    let mut old = named_client(&d.name, &format!("old{OMP_CLIENT_SUFFIX}")).await;
+    let (shell, args) = idle_shell();
+    let id = create(&mut viewer, shell, &args).await;
+
+    send(&mut viewer, codex_hook(id, &event("SessionStart", r#","model":"parent-model""#))).await;
+    assert_eq!(next_status(&mut viewer, id).await.unwrap().model.as_deref(), Some("parent-model"));
+
+    let start = event("SubagentStart", r#","agent_id":"child","model":" child-model ""#);
+    send(&mut viewer, codex_hook(id, &start)).await;
+    let expected = vec![SubagentModel { id: "child".into(), model: "child-model".into() }];
+    let live = loop {
+        match recv(&mut viewer).await {
+            ServerMsg::AgentStatusWithSubagentModels { id: sid, status, models } if sid == id => {
+                assert_eq!(models, expected);
+                break status;
+            }
+            ServerMsg::AgentStatusChanged { id: sid, .. } if sid == id => panic!("model missing from live update"),
+            _ => {}
+        }
+    };
+    assert_eq!(live.model.as_deref(), Some("parent-model"));
+    assert_eq!(live.subagents[0].id, "child");
+    assert_eq!(live.subagents[0].model, None, "models travel only in the sidecar");
+
+    let legacy_live = loop {
+        match recv(&mut old).await {
+            ServerMsg::AgentStatusChanged { id: sid, status: Some(s) } if sid == id && !s.subagents.is_empty() => break s,
+            ServerMsg::AgentStatusWithSubagentModels { .. } => panic!("legacy client received an opt-in update"),
+            _ => {}
+        }
+    };
+    assert_eq!(legacy_live, live);
+
+    let mut late = named_client(&d.name, &format!("late{SUBAGENT_MODELS_CLIENT_SUFFIX}")).await;
+    send(&mut late, ClientMsg::ListTerminals).await;
+    let ServerMsg::TerminalsWithSubagentModels { terminals, models } = recv(&mut late).await else {
+        panic!("missing extended terminal inventory");
+    };
+    assert_eq!(models, vec![(id, expected)]);
+    assert_eq!(terminals[0].agent.as_ref(), Some(&live));
+
+    send(&mut old, ClientMsg::ListTerminals).await;
+    loop {
+        match recv(&mut old).await {
+            ServerMsg::Terminals(terms) => {
+                assert_eq!(terms, terminals);
+                break;
+            }
+            ServerMsg::TerminalsWithSubagentModels { .. } => panic!("legacy client received an opt-in list"),
+            _ => {}
+        }
+    }
+
+    send(&mut viewer, codex_hook(id, &event("SubagentStop", r#","agent_id":"child""#))).await;
+    assert!(next_status(&mut viewer, id).await.unwrap().subagents.is_empty());
+    send(&mut viewer, codex_hook(id, &event("SubagentStart", r#","agent_id":"child""#))).await;
+    let reused = next_status(&mut viewer, id).await.unwrap();
+    assert_eq!(reused.subagents[0].id, "child");
+    assert_eq!(reused.subagents[0].model, None);
+
+    let mut after_reuse = named_client(&d.name, &format!("late{SUBAGENT_MODELS_CLIENT_SUFFIX}")).await;
+    send(&mut after_reuse, ClientMsg::ListTerminals).await;
+    let ServerMsg::Terminals(terms) = recv(&mut after_reuse).await else {
+        panic!("expected a normal list now that no child model is present");
+    };
+    assert_eq!(terms[0].agent.as_ref(), Some(&reused));
+    stop(viewer, d).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_subagent_label_comes_from_rollout_first_line() {
     let d = start_daemon("codex-subagents");
     let mut a = client(&d.name).await;
