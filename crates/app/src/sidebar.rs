@@ -43,6 +43,7 @@ pub fn clamp_sidebar_w(w: f32, window_w: f32) -> f32 {
     w.clamp(MIN_SIDEBAR_W, max)
 }
 const ROW_H: f32 = 28.;
+const ROW_PAD_LEFT: f32 = 8.;
 /// Height of a terminal row that shows an agent (title line + preview line).
 const AGENT_ROW_H: f32 = 44.;
 /// Leading slot of an agent row: always the agent glyph (the status badge sits to its left).
@@ -50,6 +51,9 @@ const LEAD_SLOT_W: f32 = 14.;
 /// Status badge box of an agent row and its gap to the glyph slot.
 const BADGE_W: f32 = 14.;
 const BADGE_GAP: f32 = 4.;
+// Both markers fit in the Home row's 22 px leading padding without reserving inline space.
+const RESTART_GUTTER_OFFSET: f32 = 20.;
+const RESTART_GUTTER_WIDTH: f32 = 9.;
 
 /// Top offset of the absolutely positioned badge so it is centered on line 1 of the row.
 const ROW_GAP: f32 = 6.;
@@ -330,7 +334,7 @@ fn row_base(
         .w_full()
         .h(px(ROW_H))
         .flex_shrink_0()
-        .pl(px(8. + indent))
+        .pl(px(ROW_PAD_LEFT + indent))
         .pr_2()
         .gap_1p5()
         .items_center()
@@ -837,6 +841,7 @@ impl AppView {
                 let key = key.clone();
                 let row = row_base(("side-term", id), selected, indent, &theme)
                     .group(group.clone())
+                    .relative()
                     .text_color(if exited { muted } else { theme.sidebar_foreground })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.activate_terminal_in(key.clone(), id, window, cx)
@@ -848,48 +853,44 @@ impl AppView {
                             cx.stop_propagation();
                         }),
                     );
-                let restart = self.legacy_restart_button(entry, lang, cx);
+                let restart = self.legacy_restart_button(entry, lang, cx).map(|button| {
+                    button.absolute().w(px(RESTART_GUTTER_WIDTH)).h(px(LEAD_SLOT_W))
+                });
                 let Some(status) = entry.info.agent.as_ref() else {
                     return Some(
-                        row.children(restart)
-                            .child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
+                        row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
                             .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
                             .children(coord_chip(self.orch.is_coordinator(id), lang, &theme))
                             .children(badge)
                             .child(close)
+                            .children(restart.map(|button| button
+                                .left(px(ROW_PAD_LEFT + indent - RESTART_GUTTER_OFFSET))
+                                .top(px((ROW_H - LEAD_SLOT_W) / 2.))))
                             .into_any_element(),
                     );
                 };
                 let icon = agent_icon_element(status.kind, LEAD_SLOT_W, theme.foreground, muted);
                 let title = status.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or(label);
                 let model = status.model.as_deref().map(shorten_model).filter(|m| !m.is_empty());
-                // Keep the activity badge in the gutter unless the restart button
-                // needs to come first; then put the badge between it and the agent icon.
-                let mut preview_indent = PREVIEW_INDENT;
-                let (inline_badge, gutter_badge) = if restart.is_some() {
-                    preview_indent += crate::tab_bar::LEGACY_RESTART_BUTTON_W + ROW_GAP;
-                    if badge.is_some() {
-                        preview_indent += BADGE_W + BADGE_GAP;
-                    }
-                    (badge, None)
+                let badge_offset = if restart.is_some() {
+                    RESTART_GUTTER_OFFSET - RESTART_GUTTER_WIDTH
                 } else {
-                    (None, badge)
+                    BADGE_W + BADGE_GAP
                 };
                 let line1 = h_flex()
                     .w_full()
                     .items_center()
                     .gap(px(ROW_GAP))
                     .child(
-                        h_flex()
+                        div()
                             .relative()
                             .flex_shrink_0()
-                            .items_center()
-                            .children(restart.map(|button| button.mr(px(ROW_GAP))))
-                            .children(inline_badge.map(|badge| div().w(px(BADGE_W)).mr(px(BADGE_GAP)).child(badge)))
-                            .child(div().size(px(LEAD_SLOT_W)).child(icon))
-                            .children(gutter_badge.map(|badge| {
-                                div().absolute().top(px((LEAD_SLOT_W - BADGE_W) / 2.)).left(px(-(BADGE_W + BADGE_GAP))).child(badge)
-                            })),
+                            .size(px(LEAD_SLOT_W))
+                            .child(icon)
+                            .children(badge.map(|badge| {
+                                div().absolute().top(px((LEAD_SLOT_W - BADGE_W) / 2.)).left(px(-badge_offset)).child(badge)
+                            }))
+                            .children(restart.map(|button| button.top_0().left(px(-RESTART_GUTTER_OFFSET)))),
                     )
                     .child(
                         div()
@@ -922,7 +923,7 @@ impl AppView {
                 let line2 = preview.map(|text| {
                     div()
                         .w_full()
-                        .pl(px(preview_indent))
+                        .pl(px(PREVIEW_INDENT))
                         .min_w_0()
                         .truncate()
                         .text_size(px(11.5))

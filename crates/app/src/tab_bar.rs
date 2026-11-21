@@ -54,17 +54,9 @@ pub(crate) fn entry_title(entry: &TermEntry) -> String {
     tab_title(&entry.info.title, &entry.session.title(), &entry.info.cwd)
 }
 
-pub(crate) const LEGACY_RESTART_BUTTON_W: f32 = 16.;
-
 impl AppView {
     pub(crate) fn legacy_restart_button(
         &self, entry: &TermEntry, lang: Language, cx: &Context<Self>,
-    ) -> Option<Stateful<Div>> {
-        self.legacy_restart_control(entry, lang, cx, 11.)
-    }
-
-    fn legacy_restart_control(
-        &self, entry: &TermEntry, lang: Language, cx: &Context<Self>, icon_size: f32,
     ) -> Option<Stateful<Div>> {
         if !entry.legacy {
             return None;
@@ -75,9 +67,9 @@ impl AppView {
         let color = cx.theme().warning;
         let button = h_flex()
             .id(("restart-legacy-terminal", id))
-            .size(px(LEGACY_RESTART_BUTTON_W)).flex_shrink_0().items_center().justify_center()
+            .flex_shrink_0().items_center().justify_center()
             .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
-            .child(Icon::new(Ic::CircleAlert).size(px(icon_size)).text_color(color.opacity(if busy { 0.45 } else { 0.9 })))
+            .child(Icon::new(Ic::CircleAlert).size(px(8.)).text_color(color.opacity(if busy { 0.45 } else { 0.9 })))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 cx.stop_propagation();
                 this.restart_legacy_terminal(id, window, cx);
@@ -176,7 +168,7 @@ impl AppView {
                     .child(close_wrap)
                     // Overlay the existing left padding; a flex child widens the tab
                     // and shifts its title, close button, and all following tabs.
-                    .children(self.legacy_restart_control(entry, lang, cx, 8.).map(|button| {
+                    .children(self.legacy_restart_button(entry, lang, cx).map(|button| {
                         button.absolute().left_0().top_0().w_3().h_full()
                     }))
                     .context_menu(move |menu, _, cx| {
