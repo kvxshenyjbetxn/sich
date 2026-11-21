@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
 
 use parking_lot::Mutex;
@@ -22,6 +23,7 @@ use tokio_util::codec::Framed;
 use crate::{daemon_conn, daemon_restart};
 use crate::session::Session;
 use crate::workspace::PendingWorktree;
+use crate::terminal_migration::{self, Migration};
 
 /// Wakes the UI thread (must be cheap and non-blocking).
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
@@ -44,6 +46,7 @@ pub struct TermEntry {
     pub info: TerminalInfo,
     pub session: TermSession,
     pub restore_token: Option<u64>,
+    pub(crate) legacy: bool,
 }
 
 pub(crate) struct ClientState {
@@ -100,11 +103,12 @@ pub(crate) struct RestoreData {
     /// Quick commands must still run if the user types while the shell is starting.
     pub protect_resume: bool,
     pub split: bool,
+    pub(crate) migration: Option<Migration>,
 }
 
 impl RestoreData {
     pub(crate) fn fresh_split(token: u64) -> Self {
-        Self { token, scrollback: None, separator: "", interruption: None, resume: None, protect_resume: false, split: true }
+        Self { token, scrollback: None, separator: "", interruption: None, resume: None, protect_resume: false, split: true, migration: None }
     }
 }
 
@@ -333,20 +337,25 @@ impl DaemonPool {
         let mut keys = self.0.keys.lock();
         let mut present = HashSet::new();
         let mut legacy_terminals = false;
-        for peer in std::iter::once(&self.0.primary).chain(legacy.iter()) {
-            if peer.task.is_finished() {
-                continue;
-            }
-            let st = peer.state.lock();
-            let Some(pid) = st.daemon_pid else { continue };
-            legacy_terminals |= peer.endpoint.socket != self.0.primary.endpoint.socket && !st.terminals.is_empty();
+        // A migration publishes the replacement before closing the old terminal. Keep the
+        // primary state locked while reading the legacy peers so we never miss both.
+        let primary = self.0.primary.state.lock();
+        let mut collect = |peer: &Peer, st: &ClientState, legacy: bool| {
+            if peer.task.is_finished() { return; }
+            let Some(pid) = st.daemon_pid else { return };
+            legacy_terminals |= legacy && !st.terminals.is_empty();
             for entry in &st.terminals {
                 let owner = TerminalOwner { socket: peer.endpoint.socket.clone(), id: entry.info.id, pid, created_ms: entry.info.created_unix_ms };
                 let mut entry = entry.clone();
                 entry.info.id = keys.key(owner.clone());
+                entry.legacy = legacy;
                 present.insert(owner);
                 terminals.push(entry);
             }
+        };
+        collect(&self.0.primary, &primary, false);
+        for peer in legacy.iter() {
+            collect(peer, &peer.state.lock(), true);
         }
         keys.by_owner.retain(|owner, _| present.contains(owner));
         Snapshot { status, terminals, legacy_terminals }
@@ -411,8 +420,33 @@ impl DaemonPool {
         });
     }
 
+    pub(crate) async fn migrate_terminal(
+        &self, key: TermId, token: u64, resume_agents: bool, separator: &'static str, interruption: &'static str,
+    ) -> anyhow::Result<()> {
+        let entry = self.snapshot().terminals.into_iter().find(|entry| entry.info.id == key && entry.legacy)
+            .context("terminal is no longer on an older daemon")?;
+        let owner = self.owner(key).context("terminal owner changed")?;
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let (migration, info) = Migration::capture(&owner, entry.session.last_seq(), done).await?;
+        let cwd = [Some(info.cwd), info.worktree.clone()].into_iter().flatten().find(|path| path.is_dir());
+        let agent = info.agent.as_ref();
+        let data = RestoreData {
+            token, separator, scrollback: None, split: false, protect_resume: false, migration: Some(migration),
+            interruption: agent.is_some_and(|a| a.state == sich_proto::AgentState::Working).then_some(interruption),
+            resume: agent.filter(|_| resume_agents)
+                .and_then(|a| crate::session::resume_command(a.kind, a.session_id.as_deref()?)),
+        };
+        anyhow::ensure!(
+            self.send_restore(info.worktree, cwd, entry.session.size(), data),
+            "could not request replacement from the current daemon",
+        );
+        tokio::time::timeout(terminal_migration::RESTORE_TIMEOUT, finished).await
+            .context("timed out waiting for the replacement terminal")?
+            .context("current daemon disconnected during terminal migration")?
+    }
+
     pub(crate) fn open_split(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, size: (u16, u16), token: u64) -> bool {
-        self.open_split_data(worktree, cwd, size, RestoreData::fresh_split(token))
+        self.send_restore(worktree, cwd, size, RestoreData::fresh_split(token))
     }
 
     pub(crate) fn open_quick_split(
@@ -424,10 +458,10 @@ impl DaemonPool {
         command: String,
     ) -> bool {
         let data = RestoreData { resume: Some(command), protect_resume: true, ..RestoreData::fresh_split(token) };
-        self.open_split_data(worktree, cwd, size, data)
+        self.send_restore(worktree, cwd, size, data)
     }
 
-    fn open_split_data(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, size: (u16, u16), data: RestoreData) -> bool {
+    fn send_restore(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, size: (u16, u16), data: RestoreData) -> bool {
         let state = self.0.primary.state.lock();
         matches!(state.status, ConnStatus::Connected { .. })
             && self.0.primary.cmd_tx.send(Cmd::Restore { worktree, cwd, cols: size.0, rows: size.1, data }).is_ok()
@@ -631,15 +665,16 @@ mod tests {
         });
     }
 
-    async fn raw_create(socket: &str) {
+    async fn raw_create(socket: &str, cwd: &std::path::Path) {
         let mut conn = Framed::new(sich_daemon::connect(socket).await.unwrap(), frame_codec());
         let hello = ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: "pool-test".into() };
         conn.send(encode(&hello).unwrap()).await.unwrap();
         let _ = conn.next().await;
         let (shell, args): (&str, &[&str]) =
-            if cfg!(windows) { ("cmd.exe", &["/d", "/k"]) } else { ("/bin/sh", &["-i"]) };
+            if cfg!(windows) { ("cmd.exe", &["/d", "/k", "echo migration-history"]) }
+            else { ("/bin/sh", &["-c", "printf 'migration-history\\n'; exec /bin/sh -i"]) };
         let create = ClientMsg::CreateTerminal {
-            cwd: None,
+            cwd: Some(cwd.to_owned()),
             shell: Some(shell.into()),
             args: args.iter().map(|a| (*a).into()).collect(),
             cols: 80,
@@ -652,6 +687,17 @@ mod tests {
                 return;
             }
         }
+    }
+
+    fn screen_contains(entry: &TermEntry, text: &str) -> bool {
+        use alacritty_terminal::grid::Dimensions as _;
+        use alacritty_terminal::index::{Column, Line, Point};
+        let term = entry.session.lock_term();
+        let grid = term.grid();
+        (term.topmost_line().0..term.screen_lines() as i32).any(|line| {
+            (0..term.columns()).map(|col| grid[Point::new(Line(line), Column(col))].c)
+                .collect::<String>().contains(text)
+        })
     }
 
     async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
@@ -698,6 +744,7 @@ mod tests {
     #[test]
     fn pool_creates_on_the_primary_and_drives_legacy_terminals_on_their_owner() {
         isolate();
+        let cwd = tempfile::tempdir().unwrap();
         let base = unique_base();
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
         rt.block_on(async {
@@ -706,24 +753,18 @@ mod tests {
                 let base = base.clone();
                 async move { sich_daemon::run_with_build(&base, "legacy-build").await }
             });
-            let primary = tokio::spawn({
-                let base = base.clone();
-                async move { sich_daemon::run_generation(&base, "primary-build").await }
-            });
-            let primary_socket = generation::socket(&base, "primary-build");
-            for socket in [&base, &primary_socket] {
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while !reachable(socket).await {
-                    assert!(Instant::now() < deadline, "daemon did not start");
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !reachable(&base).await {
+                assert!(Instant::now() < deadline, "legacy daemon did not start");
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            raw_create(&base).await;
+            raw_create(&base, cwd.path()).await;
 
             let pool = DaemonPool::start_on(rt.handle(), base.clone(), "primary-build", Arc::new(|| {}), false);
+            let primary_socket = generation::socket(&base, "primary-build");
             assert_eq!(pool.primary_socket(), primary_socket);
             eventually("legacy terminal in the pool", || {
-                pool.terminals_synced() && pool.snapshot().terminals.len() == 1
+                pool.snapshot().terminals.iter().any(|entry| entry.legacy && screen_contains(entry, "migration-history"))
             })
             .await;
             let snap = pool.snapshot();
@@ -731,31 +772,59 @@ mod tests {
             let legacy_key = snap.terminals[0].info.id;
             let legacy_owner = pool.owner(legacy_key).unwrap();
             assert_eq!(legacy_owner.socket, base);
+            assert!(pool.migrate_terminal(legacy_key, 41, false, "restored", "interrupted").await.is_err());
+            assert!(pool.snapshot().terminals.iter().any(|t| t.info.id == legacy_key && t.legacy));
+
+            raw_create(&base, cwd.path()).await;
+            eventually("second legacy terminal", || pool.snapshot().terminals.len() == 2).await;
+            let other_legacy_key = pool.snapshot().terminals.iter().find(|t| t.info.id != legacy_key).unwrap().info.id;
+            let primary = tokio::spawn({
+                let base = base.clone();
+                async move { sich_daemon::run_generation(&base, "primary-build").await }
+            });
+            eventually("primary daemon", || pool.terminals_synced()).await;
 
             // New terminals go to the primary even though both daemons number from 1.
             pool.create_terminal_in(80, 24, None);
-            eventually("new terminal", || pool.snapshot().terminals.len() == 2).await;
-            let new_key = pool.snapshot().terminals.iter().map(|t| t.info.id).find(|k| *k != legacy_key).unwrap();
+            eventually("new terminal", || pool.snapshot().terminals.len() == 3).await;
+            let new_key = pool.snapshot().terminals.iter().find(|t| !t.legacy).unwrap().info.id;
             let new_owner = pool.owner(new_key).unwrap();
             assert_eq!(new_owner.socket, primary_socket);
             assert_eq!(new_owner.id, legacy_owner.id, "wire ids collide across daemons");
 
-            // Killing the legacy terminal reaches only its daemon, which then retires itself.
-            pool.kill_terminal(legacy_key);
+            pool.migrate_terminal(legacy_key, 42, false, "restored", "interrupted").await.unwrap();
+            eventually("replacement and both unaffected terminals", || {
+                let snap = pool.snapshot();
+                snap.terminals.len() == 3
+                    && snap.terminals.iter().all(|t| t.info.id != legacy_key)
+                    && snap.terminals.iter().any(|t| t.info.id == other_legacy_key && t.legacy)
+                    && snap.terminals.iter().any(|t| t.info.id == new_key && !t.legacy)
+                    && snap.terminals.iter().any(|t| {
+                        t.restore_token == Some(42) && !t.legacy
+                            && crate::workspace::same_path(&t.info.cwd, cwd.path())
+                            && screen_contains(t, "migration-history") && screen_contains(t, "restored")
+                    })
+            }).await;
+            let restored = pool.snapshot().terminals.into_iter().find(|t| t.restore_token == Some(42)).unwrap();
+            assert_eq!(pool.owner(restored.info.id).unwrap().socket, primary_socket);
+
+            // The last legacy terminal still closes on its owner and retires that daemon.
+            pool.kill_terminal(other_legacy_key);
             let deadline = Instant::now() + Duration::from_secs(15);
             while reachable(&base).await {
                 assert!(Instant::now() < deadline, "legacy daemon did not retire");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             tokio::time::timeout(Duration::from_secs(5), legacy).await.expect("legacy task ends").unwrap().unwrap();
-            eventually("only the primary terminal remains", || {
-                pool.snapshot().terminals.iter().map(|t| t.info.id).collect::<Vec<_>>() == vec![new_key]
+            eventually("only the primary terminals remain", || {
+                pool.snapshot().terminals.iter().all(|t| !t.legacy)
             })
             .await;
             assert!(!pool.snapshot().legacy_terminals);
             assert!(!primary.is_finished(), "the primary keeps running");
 
             pool.kill_terminal(new_key);
+            pool.kill_terminal(restored.info.id);
             eventually("primary terminal closed", || pool.snapshot().terminals.is_empty()).await;
             primary.abort();
         });

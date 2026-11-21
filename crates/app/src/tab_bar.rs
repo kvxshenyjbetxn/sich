@@ -8,8 +8,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
 use gpui_kit::{
-    AppContext as _, ClickEvent, Context, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, div, px,
+    AppContext as _, ClickEvent, Context, Div, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div, px,
 };
 use sich_proto::TermId;
 
@@ -55,6 +55,31 @@ pub(crate) fn entry_title(entry: &TermEntry) -> String {
 }
 
 impl AppView {
+    /// Use the tab's existing left gutter or the sidebar row's existing right gutter.
+    pub(crate) fn legacy_restart_button(
+        &self, entry: &TermEntry, sidebar: bool, lang: Language, cx: &Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        if !entry.legacy {
+            return None;
+        }
+        let id = entry.info.id;
+        let busy = self.terminal_restarting(id);
+        let tip = tr(lang, if busy { Tr::TerminalRestarting } else { Tr::RestartLegacyTerminal });
+        let color = cx.theme().warning;
+        let (slot, icon) = if sidebar { (8., 8.) } else { (12., 10.) };
+        let button = h_flex()
+            .id((if sidebar { "sidebar-restart-terminal" } else { "tab-restart-terminal" }, id))
+            .absolute().top_0().h_full().w(px(slot)).items_center().justify_center()
+            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            .child(Icon::new(Ic::CircleAlert).size(px(icon)).text_color(color.opacity(if busy { 0.45 } else { 0.9 })))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                this.restart_legacy_terminal(id, window, cx);
+            }));
+        let button = if sidebar { button.right_0() } else { button.left_0() };
+        Some(if busy { button } else { button.cursor_pointer() })
+    }
+
     pub(crate) fn render_tab_bar(
         &self,
         snap: &Snapshot,
@@ -106,6 +131,7 @@ impl AppView {
                 h_flex()
                     .id(("tab", id))
                     .group(group)
+                    .relative()
                     .h_full()
                     .flex_shrink_0()
                     .max_w(px(220.))
@@ -143,6 +169,7 @@ impl AppView {
                             .child(label),
                     )
                     .child(close_wrap)
+                    .children(self.legacy_restart_button(entry, false, lang, cx))
                     .context_menu(move |menu, _, cx| {
                         let split = menu_app.read(cx).terminal_is_split(id);
                         terminal_menu(menu, &menu_app, &menu_drag, split, lang)

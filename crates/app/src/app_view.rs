@@ -122,6 +122,7 @@ pub struct AppView {
     /// Workspaces this window asked a terminal for; the matching new terminal gets activated.
     pending_creates: VecDeque<WorkspaceKey>,
     pending_splits: Vec<PendingSplit>,
+    pending_terminal_restarts: HashMap<TermId, u64>,
     pub(crate) quick_terminals: HashMap<TermId, TemporaryCommand>,
     seen_projects_rev: u64,
     shown_error: Option<Instant>,
@@ -311,6 +312,7 @@ impl AppView {
             collapsed: HashSet::new(),
             pending_creates: VecDeque::new(),
             pending_splits: Vec::new(),
+            pending_terminal_restarts: HashMap::new(),
             quick_terminals: HashMap::new(),
             seen_projects_rev: 0,
             shown_error: None,
@@ -937,6 +939,7 @@ impl AppView {
                     resume,
                     protect_resume: false,
                     split: false,
+                    migration: None,
                 };
                 let cwd = (!term.cwd.as_os_str().is_empty()).then_some(term.cwd);
                 self.client.restore_terminal(worktree.clone(), cwd, data);
@@ -1221,6 +1224,53 @@ impl AppView {
 
     // ---- commands --------------------------------------------------------------------------
 
+    pub(crate) fn terminal_restarting(&self, id: TermId) -> bool {
+        self.pending_terminal_restarts.contains_key(&id)
+    }
+
+    pub(crate) fn restart_legacy_terminal(&mut self, id: TermId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.terminal_restarting(id) {
+            return;
+        }
+        self.next_restore_token += 1;
+        let token = self.next_restore_token;
+        self.pending_terminal_restarts.insert(id, token);
+        let client = self.client.clone();
+        let lang = settings::language(cx);
+        let resume = settings::get(cx).resume_agents_on_restore;
+        let job = self.activity_rt.spawn(async move {
+            client.migrate_terminal(id, token, resume, tr(lang, Tr::RestoredScrollback), tr(lang, Tr::AgentInterrupted)).await
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = job.await.map_err(anyhow::Error::from).and_then(|result| result);
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.map_restarted_terminals(&this.client.snapshot());
+                this.pending_terminal_restarts.remove(&id);
+                if let Err(err) = result {
+                    tracing::warn!("could not complete terminal migration: {err:#}");
+                    notifications::show_error(tr(settings::language(cx), Tr::TerminalRestartFailed).into(), window, cx);
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
+
+    /// Adopt only the replacement returned for this request, not a concurrent new terminal.
+    fn map_restarted_terminals(&mut self, snap: &Snapshot) {
+        for (&old, &token) in &self.pending_terminal_restarts {
+            let Some(entry) = snap.terminals.iter().find(|entry| !entry.legacy && entry.restore_token == Some(token)) else {
+                continue;
+            };
+            let key = WorkspaceKey::of(entry.info.worktree.as_deref());
+            let new = entry.info.id;
+            if let Some(layout) = self.terminal_layouts.get_mut(&key) {
+                layout.replace(old, new);
+            }
+            self.ws.replace_active(&key, old, new);
+        }
+    }
+
     pub(crate) fn new_terminal_in(&mut self, key: WorkspaceKey, cx: &mut Context<Self>) {
         let snap = self.client.snapshot();
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
@@ -1289,6 +1339,7 @@ impl AppView {
     /// Makes views, selection and pending actions match the daemon state.
     fn sync(&mut self, snap: &Snapshot, infos: &[TerminalInfo], window: &mut Window, cx: &mut Context<Self>) {
         if !cx.has_active_drag() { self.dragged_terminal = None; }
+        self.map_restarted_terminals(snap);
         for entry in &snap.terminals {
             let id = entry.info.id;
             if let Some(view) = self.views.get(&id) {

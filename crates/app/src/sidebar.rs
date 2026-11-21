@@ -837,6 +837,7 @@ impl AppView {
                 let key = key.clone();
                 let row = row_base(("side-term", id), selected, indent, &theme)
                     .group(group.clone())
+                    .relative()
                     .text_color(if exited { muted } else { theme.sidebar_foreground })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.activate_terminal_in(key.clone(), id, window, cx)
@@ -848,6 +849,7 @@ impl AppView {
                             cx.stop_propagation();
                         }),
                     );
+                let row = row.children(self.legacy_restart_button(entry, true, lang, cx));
                 let Some(status) = entry.info.agent.as_ref() else {
                     return Some(
                         row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))

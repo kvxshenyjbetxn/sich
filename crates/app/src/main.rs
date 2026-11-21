@@ -39,6 +39,7 @@ mod split_drag;
 mod subagent_activity;
 mod tab_bar;
 mod terminal_layout;
+mod terminal_migration;
 mod term_images;
 mod term_settings;
 mod theme;

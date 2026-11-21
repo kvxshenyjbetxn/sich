@@ -207,17 +207,29 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
                 }
                 match msg {
                     ServerMsg::TerminalRestored { request_id, terminal } => {
-                        if let Some(data) = restores.remove(&request_id) {
+                        if let Some(mut data) = restores.remove(&request_id) {
+                            let mut migration = data.migration.take();
                             if let Some(info) = terminal {
                                 let id = info.id;
                                 let exited = info.exited.is_some();
                                 let protect_resume = data.protect_resume;
-                                if let Some(command) = conn.restore_terminal(info, data).filter(|_| !exited) {
+                                let history = migration.as_mut().map(|m| &*m.history.make_contiguous());
+                                let command = conn.restore_terminal(info, data, history);
+                                // The replacement is visible now. Don't resume an agent while
+                                // its old shell is still open.
+                                let can_resume = match migration {
+                                    Some(migration) if !migration.done.is_closed() => migration.close_source().await,
+                                    Some(_) => false,
+                                    None => true,
+                                };
+                                if let Some(command) = command.filter(|_| !exited && can_resume) {
                                     resumes.insert(id, (tokio::time::Instant::now() + RESUME_DELAY, command, protect_resume));
                                 }
                                 let sub = ClientMsg::Subscribe { id, resume_from_seq: None };
                                 markers.on_sent(&sub);
                                 send(&mut stream, &sub).await?;
+                            } else if let Some(migration) = migration {
+                                let _ = migration.done.send(Err(anyhow::anyhow!("current daemon could not create the replacement terminal")));
                             } else if data.split {
                                 conn.state.lock().failed_splits.push(data.token);
                                 (conn.wake)();
@@ -274,6 +286,9 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
                 let msg = match cmd {
                     Cmd::Restart(request) => return Ok(End::Restart(request)),
                     Cmd::Restore { worktree, cwd, cols, rows, data } => {
+                        if data.migration.as_ref().is_some_and(|migration| migration.done.is_closed()) {
+                            continue;
+                        }
                         let request_id = next_restore;
                         next_restore += 1;
                         restores.insert(request_id, data);
@@ -367,7 +382,7 @@ impl Conn {
         true
     }
 
-    fn restore_terminal(&self, info: TerminalInfo, data: RestoreData) -> Option<Vec<u8>> {
+    fn restore_terminal(&self, info: TerminalInfo, data: RestoreData, captured: Option<&[u8]>) -> Option<Vec<u8>> {
         let session = self.state.lock().terminals.iter()
             .find(|entry| entry.info.id == info.id && entry.info.created_unix_ms == info.created_unix_ms)
             .map(|entry| entry.session.clone())
@@ -384,12 +399,13 @@ impl Conn {
             Some((dir, name, bytes))
         });
         let mut lines = Vec::new();
-        if history.is_some() {
+        let bytes = captured.or_else(|| history.as_ref().map(|(_, _, bytes)| bytes.as_slice()));
+        if bytes.is_some() {
             lines.push(data.separator);
         }
         lines.extend(data.interruption);
         if !lines.is_empty() {
-            session.replay_history(history.as_ref().map_or(&[], |(_, _, bytes)| bytes.as_slice()), &lines);
+            session.replay_history(bytes.unwrap_or_default(), &lines);
         }
         if let Some((dir, name, _)) = history {
             if let Err(err) = sich_daemon::scrollback::remove(&dir, &name) {
@@ -398,7 +414,7 @@ impl Conn {
         }
         let mut state = self.state.lock();
         state.terminals.retain(|entry| entry.info.id != info.id);
-        state.terminals.push(TermEntry { info, session, restore_token: Some(data.token) });
+        state.terminals.push(TermEntry { info, session, restore_token: Some(data.token), legacy: false });
         drop(state);
         (self.wake)();
         data.resume.map(|cmd| format!("{cmd}\r").into_bytes())
@@ -470,7 +486,7 @@ impl Conn {
                 if !st.terminals.iter().any(|t| t.info.id == info.id) {
                     out.push(ClientMsg::Subscribe { id: info.id, resume_from_seq: None });
                     let session = self.new_session(&info);
-                    st.terminals.push(TermEntry { info, session, restore_token: None });
+                    st.terminals.push(TermEntry { info, session, restore_token: None, legacy: false });
                 }
             }
             ServerMsg::TerminalExited { id, code } => {
@@ -570,7 +586,7 @@ impl Conn {
                     session.set_quiet(true);
                     out.push(ClientMsg::Subscribe { id: info.id, resume_from_seq: None });
                     out.push(ClientMsg::GetDaemonInfo);
-                    terminals.push(TermEntry { info, session, restore_token: None });
+                    terminals.push(TermEntry { info, session, restore_token: None, legacy: false });
                 }
             }
         }
@@ -832,7 +848,7 @@ mod tests {
         }
         cmd_tx.send(Cmd::Restore {
             worktree: None, cwd: None, cols: DEFAULT_COLS, rows: DEFAULT_ROWS,
-            data: RestoreData { token: 42, scrollback: None, separator: "restored", interruption: None, resume: Some("codex resume abcdef12".into()), protect_resume: protected, split: false },
+            data: RestoreData { token: 42, scrollback: None, separator: "restored", interruption: None, resume: Some("codex resume abcdef12".into()), protect_resume: protected, split: false, migration: None },
         }).unwrap();
         let ClientMsg::RestoreTerminal { request_id, .. } = recv_client(&mut peer).await else { panic!("expected restore request") };
         let terminal = TerminalInfo {
@@ -915,6 +931,7 @@ mod tests {
         for token in [101, 202] {
             tx.send(Cmd::Restore { worktree: None, cwd: None, cols: 80, rows: 24, data: RestoreData {
                 token, scrollback: None, separator: "", interruption: None, resume: None, protect_resume: false, split: false,
+                migration: None,
             }}).unwrap();
         }
         let ClientMsg::RestoreTerminal { request_id: first, .. } = recv_client(&mut peer).await else { panic!("restore") };

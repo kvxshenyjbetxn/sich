@@ -144,6 +144,12 @@ impl Workspaces {
         self.active.insert(key.clone(), id);
     }
 
+    pub(crate) fn replace_active(&mut self, key: &WorkspaceKey, old: TermId, new: TermId) {
+        if let Some(active) = self.active.get_mut(key).filter(|active| **active == old) {
+            *active = new;
+        }
+    }
+
     /// Active terminal of `key` among `ids` (its terminals): the remembered one if it still
     /// exists, otherwise the first.
     pub fn active_in(&self, key: &WorkspaceKey, ids: &[TermId]) -> Option<TermId> {
@@ -272,6 +278,18 @@ mod tests {
         assert_eq!(ws.active_in(&a, &[]), None);
         ws.prune(&[1]);
         assert_eq!(ws.active_in(&a, &[5, 6]), Some(5));
+    }
+
+    #[test]
+    fn restart_only_replaces_the_active_terminal_if_it_was_the_source() {
+        let mut ws = Workspaces::default();
+        let key = WorkspaceKey::Home;
+        ws.set_active(&key, 2);
+        ws.replace_active(&key, 1, 3);
+        assert_eq!(ws.active_in(&key, &[3, 2]), Some(2));
+        ws.replace_active(&key, 2, 4);
+        ws.prune(&[3, 4]);
+        assert_eq!(ws.active_in(&key, &[3, 4]), Some(4));
     }
 
     #[test]
