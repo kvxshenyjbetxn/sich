@@ -837,7 +837,6 @@ impl AppView {
                 let key = key.clone();
                 let row = row_base(("side-term", id), selected, indent, &theme)
                     .group(group.clone())
-                    .relative()
                     .text_color(if exited { muted } else { theme.sidebar_foreground })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.activate_terminal_in(key.clone(), id, window, cx)
@@ -849,7 +848,7 @@ impl AppView {
                             cx.stop_propagation();
                         }),
                     );
-                let row = row.children(self.legacy_restart_button(entry, true, lang, cx));
+                let restart = self.legacy_restart_button(entry, lang, cx);
                 let Some(status) = entry.info.agent.as_ref() else {
                     return Some(
                         row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
@@ -857,6 +856,7 @@ impl AppView {
                             .children(coord_chip(self.orch.is_coordinator(id), lang, &theme))
                             .children(badge)
                             .child(close)
+                            .children(restart)
                             .into_any_element(),
                     );
                 };
@@ -906,7 +906,8 @@ impl AppView {
                             .text_color(muted)
                             .child(relative_time(lang, now_unix_ms(), status.since_unix_ms)),
                     )
-                    .child(close);
+                    .child(close)
+                    .children(restart);
                 // No preview -> keep the plain single-line height.
                 let preview = crate::orch_watch::worker_preview(&self.orch, id, lang, agent_preview(status));
                 let line2 = preview.map(|text| {

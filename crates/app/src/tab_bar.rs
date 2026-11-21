@@ -55,9 +55,8 @@ pub(crate) fn entry_title(entry: &TermEntry) -> String {
 }
 
 impl AppView {
-    /// Use the tab's existing left gutter or the sidebar row's existing right gutter.
     pub(crate) fn legacy_restart_button(
-        &self, entry: &TermEntry, sidebar: bool, lang: Language, cx: &Context<Self>,
+        &self, entry: &TermEntry, lang: Language, cx: &Context<Self>,
     ) -> Option<Stateful<Div>> {
         if !entry.legacy {
             return None;
@@ -66,17 +65,15 @@ impl AppView {
         let busy = self.terminal_restarting(id);
         let tip = tr(lang, if busy { Tr::TerminalRestarting } else { Tr::RestartLegacyTerminal });
         let color = cx.theme().warning;
-        let (slot, icon) = if sidebar { (8., 8.) } else { (12., 10.) };
         let button = h_flex()
-            .id((if sidebar { "sidebar-restart-terminal" } else { "tab-restart-terminal" }, id))
-            .absolute().top_0().h_full().w(px(slot)).items_center().justify_center()
+            .id(("restart-legacy-terminal", id))
+            .size(px(16.)).flex_shrink_0().items_center().justify_center()
             .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
-            .child(Icon::new(Ic::CircleAlert).size(px(icon)).text_color(color.opacity(if busy { 0.45 } else { 0.9 })))
+            .child(Icon::new(Ic::CircleAlert).size(px(11.)).text_color(color.opacity(if busy { 0.45 } else { 0.9 })))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 cx.stop_propagation();
                 this.restart_legacy_terminal(id, window, cx);
             }));
-        let button = if sidebar { button.right_0() } else { button.left_0() };
         Some(if busy { button } else { button.cursor_pointer() })
     }
 
@@ -131,7 +128,6 @@ impl AppView {
                 h_flex()
                     .id(("tab", id))
                     .group(group)
-                    .relative()
                     .h_full()
                     .flex_shrink_0()
                     .max_w(px(220.))
@@ -159,6 +155,7 @@ impl AppView {
                             cx.stop_propagation();
                         }),
                     )
+                    .children(self.legacy_restart_button(entry, lang, cx))
                     .children(badge)
                     .children(agent_icon)
                     .child(
@@ -169,7 +166,6 @@ impl AppView {
                             .child(label),
                     )
                     .child(close_wrap)
-                    .children(self.legacy_restart_button(entry, false, lang, cx))
                     .context_menu(move |menu, _, cx| {
                         let split = menu_app.read(cx).terminal_is_split(id);
                         terminal_menu(menu, &menu_app, &menu_drag, split, lang)
