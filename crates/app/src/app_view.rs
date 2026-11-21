@@ -77,6 +77,13 @@ struct RestoreTarget {
     attached_active: Option<TermId>,
 }
 
+struct PendingSplit {
+    token: u64,
+    target: TerminalDrag,
+    edge: Edge,
+    started: Instant,
+}
+
 #[derive(PartialEq, Eq)]
 pub(crate) enum TabKey {
     Diff(CompareKey),
@@ -112,6 +119,7 @@ pub struct AppView {
     pub(crate) collapsed: HashSet<ProjectId>,
     /// Workspaces this window asked a terminal for; the matching new terminal gets activated.
     pending_creates: VecDeque<WorkspaceKey>,
+    pending_splits: Vec<PendingSplit>,
     seen_projects_rev: u64,
     shown_error: Option<Instant>,
     /// Terminal that last received keyboard focus.
@@ -299,6 +307,7 @@ impl AppView {
             collapsed_groups: HashSet::new(),
             collapsed: HashSet::new(),
             pending_creates: VecDeque::new(),
+            pending_splits: Vec::new(),
             seen_projects_rev: 0,
             shown_error: None,
             focused: None,
@@ -775,6 +784,7 @@ impl AppView {
             self.restore_targets.clear();
             self.restore_started = None;
             self.pending_creates.clear();
+            self.pending_splits.clear();
             self.views.clear();
             self.terminal_layouts.clear();
             self.ws.prune(&[]);
@@ -893,6 +903,7 @@ impl AppView {
                     separator: tr(lang, Tr::RestoredScrollback),
                     interruption: term.interrupted.then(|| tr(lang, Tr::AgentInterrupted)),
                     resume,
+                    split: false,
                 };
                 let cwd = (!term.cwd.as_os_str().is_empty()).then_some(term.cwd);
                 self.client.restore_terminal(worktree.clone(), cwd, data);
@@ -1283,6 +1294,7 @@ impl AppView {
         self.terminal_layouts.retain(|key, layout| {
             layout.retain_where(|id| infos.iter().any(|info| info.id == id && key.contains(info.worktree.as_deref())))
         });
+        self.finish_pending_splits(snap, window, cx);
         let key = self.ws.selected.clone();
         let ids = self.workspace_ids(infos);
         if let Some(active) = self.ws.active_in(&key, &ids) {
@@ -1346,6 +1358,73 @@ impl AppView {
 
     // ---- rendering -------------------------------------------------------------------------
 
+    pub(crate) fn terminal_is_split(&self, id: TermId) -> bool {
+        self.terminal_layouts.get(&self.ws.selected)
+            .is_some_and(|layout| matches!(layout, Layout::Split { .. }) && layout.contains(id))
+    }
+
+    pub(crate) fn dragging_split_pane(&self) -> bool {
+        self.dragged_terminal.is_some_and(|id| self.terminal_is_split(id))
+    }
+
+    pub(crate) fn request_terminal_split(&mut self, target: &TerminalDrag, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
+        if target.workspace != self.ws.selected { return; }
+        let snap = self.client.snapshot();
+        let Some(entry) = snap.terminals.iter().find(|entry| {
+            entry.info.id == target.id && target.workspace.contains(entry.info.worktree.as_deref())
+        }) else { return };
+        let cwd = entry.info.cwd.is_dir().then(|| entry.info.cwd.clone());
+        let size = entry.session.size();
+        self.next_restore_token += 1;
+        let token = self.next_restore_token;
+        if !self.client.open_split(target.workspace.path().map(PathBuf::from), cwd, size, token) {
+            let message = tr(settings::language(cx), Tr::TerminalSplitDisconnected);
+            notifications::show_error(message.to_owned(), window, cx);
+            return;
+        }
+        self.activate_terminal(target.id, window, cx);
+        self.pending_splits.push(PendingSplit { token, target: target.clone(), edge, started: Instant::now() });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RESTORE_TIMEOUT + Duration::from_millis(1)).await;
+            let _ = this.update(cx, |this, cx| {
+                this.pending_splits.retain(|pending| pending.started.elapsed() <= RESTORE_TIMEOUT);
+                cx.notify();
+            });
+        }).detach();
+    }
+
+    fn finish_pending_splits(&mut self, snap: &Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+        let failures = self.client.take_failed_splits();
+        if !failures.is_empty() {
+            let message = tr(settings::language(cx), Tr::TerminalSplitFailed);
+            cx.defer_in(window, move |_, window, cx| {
+                notifications::show_error(message.to_owned(), window, cx);
+            });
+        }
+        self.pending_splits.retain(|request| {
+            let key = &request.target.workspace;
+            request.started.elapsed() <= RESTORE_TIMEOUT && !failures.contains(&request.token)
+                && self.terminal_layouts.get(key).is_some_and(|layout| layout.contains(request.target.id))
+        });
+        let mut index = 0;
+        while let Some(request) = self.pending_splits.get(index) {
+            let Some(entry) = snap.terminals.iter().find(|entry| entry.restore_token == Some(request.token)) else {
+                index += 1;
+                continue;
+            };
+            let request = self.pending_splits.remove(index);
+            let key = &request.target.workspace;
+            if !key.contains(entry.info.worktree.as_deref()) {
+                continue;
+            }
+            let layout = self.terminal_layouts.remove(key).unwrap();
+            self.terminal_layouts.insert(key.clone(), layout.split(entry.info.id, request.target.id, request.edge));
+            if self.ws.selected == *key && self.active_tab().is_none() {
+                self.activate_terminal(entry.info.id, window, cx);
+            }
+        }
+    }
+
     pub(crate) fn begin_terminal_drag(&mut self, drag: &TerminalDrag, cx: &mut Context<Self>) {
         self.dragged_terminal = Some(drag.id);
         cx.notify();
@@ -1383,15 +1462,18 @@ impl AppView {
         self.activate_terminal(drag.id, window, cx);
     }
 
-    fn render_split_node(&self, node: &Layout<TermId>, path: Vec<bool>, infos: &[TerminalInfo],
-        lang: i18n::Language, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn render_split_node(&self, node: &Layout<TermId>, path: Vec<bool>, snap: &Snapshot,
+        show_header: bool, lang: i18n::Language, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         use gpui_kit::{relative, SharedString};
         match node {
             Layout::Leaf(id) => {
                 let id = *id;
                 let Some(view) = self.views.get(&id) else { return div().size_full().into_any_element() };
-                let banner = infos.iter().find(|t| t.id == id)
-                    .and_then(|t| orch_watch::worker_for_terminal(&self.orch, t))
+                let Some(entry) = snap.terminals.iter().find(|entry| entry.info.id == id) else {
+                    return div().size_full().into_any_element();
+                };
+                let header = show_header.then(|| self.render_pane_header(entry, self.focused == Some(id), lang, cx));
+                let banner = orch_watch::worker_for_terminal(&self.orch, &entry.info)
                     .and_then(|worker| crate::orch_banner::render(worker, self.orch_now_ms, lang, cx));
                 let tint = self.dragged_terminal.filter(|&source| source != id && cx.has_active_drag())
                     .map(|_| cx.theme().primary.opacity(0.25));
@@ -1410,7 +1492,7 @@ impl AppView {
                         }
                     },
                 ).absolute().left_0().top_0().size_full());
-                div().id(("split-leaf", id)).relative().size_full().min_w_0().min_h_0().overflow_hidden()
+                let body = div().id(("split-body", id)).relative().flex_1().min_h_0().w_full().overflow_hidden()
                     .capture_any_mouse_down(cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         if matches!(event.button, MouseButton::Left | MouseButton::Middle | MouseButton::Right)
                             && this.focused != Some(id)
@@ -1427,30 +1509,38 @@ impl AppView {
                             this.split_terminal(drag, id, edge, window, cx);
                         }
                     }))
-                    .child(view.clone()).children(banner).children(feedback).into_any_element()
+                    .child(view.clone()).children(banner).children(feedback);
+                v_flex().size_full().min_w_0().min_h_0().overflow_hidden()
+                    .children(header).child(body).into_any_element()
             }
             Layout::Split { axis, ratio, first, second } => {
                 let axis = *axis;
                 let ratio = terminal_layout::clamp_ratio(*ratio);
                 let mut first_path = path.clone(); first_path.push(false);
                 let mut second_path = path.clone(); second_path.push(true);
-                let first = self.render_split_node(first, first_path, infos, lang, cx);
-                let second = self.render_split_node(second, second_path, infos, lang, cx);
+                let first = self.render_split_node(first, first_path, snap, true, lang, cx);
+                let second = self.render_split_node(second, second_path, snap, true, lang, cx);
                 let drag = SeparatorDrag { workspace: self.ws.selected.clone(), path: path.clone() };
-                const DIVIDER: f32 = 4.;
+                const DIVIDER: f32 = 6.;
                 let handle = div().id(SharedString::from(format!("split-handle-{path:?}")))
-                    .flex_shrink_0().occlude().bg(cx.theme().border)
+                    .group("split-handle").flex().items_center().justify_center()
+                    .flex_shrink_0().occlude()
                     .on_drag(drag, |_, _, _, cx| cx.new(|_| DragGhost));
+                let line = div().bg(cx.theme().muted_foreground.opacity(0.55))
+                    .group_hover("split-handle", |style| style.bg(cx.theme().primary.opacity(0.7)))
+                    .group_drag_over::<SeparatorDrag>("split-handle", |style| style.bg(cx.theme().primary.opacity(0.7)));
                 let (one, two, handle) = match axis {
                     Axis::Horizontal => (
                         div().w(relative(ratio)).h_full().min_w_0().child(first),
                         div().w(relative(1. - ratio)).h_full().min_w_0().child(second),
-                        handle.w(px(DIVIDER)).h_full().cursor(CursorStyle::ResizeLeftRight),
+                        handle.w(px(DIVIDER)).h_full().cursor(CursorStyle::ResizeLeftRight)
+                            .child(line.w(px(1.)).h_full()),
                     ),
                     Axis::Vertical => (
                         div().h(relative(ratio)).w_full().min_h_0().child(first),
                         div().h(relative(1. - ratio)).w_full().min_h_0().child(second),
-                        handle.h(px(DIVIDER)).w_full().cursor(CursorStyle::ResizeUpDown),
+                        handle.h(px(DIVIDER)).w_full().cursor(CursorStyle::ResizeUpDown)
+                            .child(line.h(px(1.)).w_full()),
                     ),
                 };
                 let container = div().id(SharedString::from(format!("split-node-{path:?}")))
@@ -1491,7 +1581,7 @@ impl AppView {
             (Some(TabView::Activity(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
             (None, Some(layout)) => {
                 div().relative().flex_1().min_h_0().w_full()
-                    .child(self.render_split_node(layout, Vec::new(), infos, lang, cx))
+                    .child(self.render_split_node(layout, Vec::new(), snap, false, lang, cx))
             }
             (None, None) => div()
                 .flex_1()

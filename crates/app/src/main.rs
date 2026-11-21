@@ -27,6 +27,7 @@ mod orch_cli;
 mod orch_skill;
 mod orch_watch;
 mod os;
+mod pane_chrome;
 mod settings;
 mod session;
 mod settings_dialog;

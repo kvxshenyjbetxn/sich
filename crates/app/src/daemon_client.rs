@@ -67,12 +67,13 @@ pub(crate) struct ClientState {
     pub created_worktrees: Vec<(PathBuf, PathBuf)>,
     /// Last `OpFailed` from the daemon: (op, message, when).
     pub last_error: Option<(String, String, Instant)>,
+    pub failed_splits: Vec<u64>,
 }
 
 /// Commands from the UI to the connection task.
 pub(crate) enum Cmd {
     Restart(daemon_restart::Request),
-    Restore { worktree: Option<PathBuf>, cwd: Option<PathBuf>, data: RestoreData },
+    Restore { worktree: Option<PathBuf>, cwd: Option<PathBuf>, cols: u16, rows: u16, data: RestoreData },
     Create { cols: u16, rows: u16, worktree: Option<PathBuf>, cwd: Option<PathBuf> },
     RefreshProjects,
     AddProject { path: PathBuf, group: Option<GroupId> },
@@ -96,6 +97,13 @@ pub(crate) struct RestoreData {
     pub separator: &'static str,
     pub interruption: Option<&'static str>,
     pub resume: Option<String>,
+    pub split: bool,
+}
+
+impl RestoreData {
+    pub(crate) fn fresh_split(token: u64) -> Self {
+        Self { token, scrollback: None, separator: "", interruption: None, resume: None, split: true }
+    }
 }
 
 pub(crate) enum RestartResult {
@@ -209,6 +217,7 @@ impl Peer {
             pending_worktrees: VecDeque::new(),
             created_worktrees: Vec::new(),
             last_error: None,
+            failed_splits: Vec::new(),
         }));
         let name = if legacy { generation::RETIRE_CLIENT } else { "sich-app" };
         let models = if endpoint.subagent_models { sich_proto::SUBAGENT_MODELS_CLIENT_SUFFIX } else { "" };
@@ -395,7 +404,20 @@ impl DaemonPool {
     }
 
     pub fn restore_terminal(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, data: RestoreData) {
-        let _ = self.0.primary.cmd_tx.send(Cmd::Restore { worktree, cwd, data });
+        let _ = self.0.primary.cmd_tx.send(Cmd::Restore {
+            worktree, cwd, cols: DEFAULT_COLS, rows: DEFAULT_ROWS, data,
+        });
+    }
+
+    pub(crate) fn open_split(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, size: (u16, u16), token: u64) -> bool {
+        let state = self.0.primary.state.lock();
+        let data = RestoreData::fresh_split(token);
+        matches!(state.status, ConnStatus::Connected { .. })
+            && self.0.primary.cmd_tx.send(Cmd::Restore { worktree, cwd, cols: size.0, rows: size.1, data }).is_ok()
+    }
+
+    pub(crate) fn take_failed_splits(&self) -> Vec<u64> {
+        std::mem::take(&mut self.0.primary.state.lock().failed_splits)
     }
 
     pub fn daemon_pid(&self) -> Option<u32> {

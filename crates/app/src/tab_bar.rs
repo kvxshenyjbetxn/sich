@@ -5,6 +5,7 @@ use std::path::Path;
 use gpui_kit::assets::IconName as Ic;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Selectable as _, Sizable as _, h_flex};
 use gpui_kit::{
     AppContext as _, ClickEvent, Context, InteractiveElement as _, IntoElement, MouseButton, ParentElement as _,
@@ -17,6 +18,7 @@ use crate::app_view::{AppView, TabKey, TabView};
 use crate::daemon_client::{Snapshot, TermEntry};
 use crate::diff_view::{source_label, split_file_label};
 use crate::i18n::{self, Language, Tr, tr};
+use crate::pane_chrome::terminal_menu;
 use crate::split_drag::{DragGhost, TerminalDrag};
 
 pub const TAB_BAR_H: f32 = 34.;
@@ -69,6 +71,8 @@ impl AppView {
             let group = SharedString::from(format!("tab-{id}"));
             let label = tab_label(lang, entry_title(entry), exited);
             let drag = TerminalDrag { workspace: self.ws.selected.clone(), id };
+            let menu_drag = drag.clone();
+            let menu_app = cx.entity();
             let app = cx.entity().downgrade();
             let badge = entry
                 .info
@@ -138,7 +142,11 @@ impl AppView {
                             .text_size(px(13.))
                             .child(label),
                     )
-                    .child(close_wrap),
+                    .child(close_wrap)
+                    .context_menu(move |menu, _, cx| {
+                        let split = menu_app.read(cx).terminal_is_split(id);
+                        terminal_menu(menu, &menu_app, &menu_drag, split, lang)
+                    }),
             )
         });
 
@@ -194,15 +202,24 @@ impl AppView {
                     .child(close)
             })
         });
-        let path_text = self.ws.selected.path().map(|p| p.display().to_string()).unwrap_or_default();
+        let detaching = self.dragging_split_pane();
+        let caption: SharedString = if detaching {
+            tr(lang, Tr::DropPaneHere).into()
+        } else {
+            self.ws.selected.path().map(|p| p.display().to_string()).unwrap_or_default().into()
+        };
         h_flex()
+            .id("workspace-tab-bar")
             .w_full()
             .h(px(TAB_BAR_H))
             .flex_shrink_0()
             .items_center()
-            .bg(theme.tab_bar)
+            .bg(if detaching { theme.primary.opacity(0.25) } else { theme.tab_bar })
             .border_b_1()
             .border_color(theme.border)
+            .on_drop(cx.listener(|this, drag: &TerminalDrag, window, cx| {
+                this.detach_terminal(drag, window, cx);
+            }))
             .child(
                 h_flex()
                     .id("tabs")
@@ -210,9 +227,6 @@ impl AppView {
                     .min_w_0()
                     .overflow_x_scroll()
                     .track_scroll(&self.tab_scroll)
-                    .on_drop(cx.listener(|this, drag: &TerminalDrag, window, cx| {
-                        this.detach_terminal(drag, window, cx);
-                    }))
                     .children(tabs)
                     .children(workspace_tabs),
             )
@@ -236,8 +250,8 @@ impl AppView {
                     .truncate()
                     .text_right()
                     .text_size(px(11.))
-                    .text_color(theme.muted_foreground)
-                    .child(path_text),
+                    .text_color(if detaching { theme.foreground } else { theme.muted_foreground })
+                    .child(caption),
             )
             .child(
                 div().px_1().flex_shrink_0().child(

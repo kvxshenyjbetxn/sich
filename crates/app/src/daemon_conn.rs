@@ -217,6 +217,9 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
                                 let sub = ClientMsg::Subscribe { id, resume_from_seq: None };
                                 markers.on_sent(&sub);
                                 send(&mut stream, &sub).await?;
+                            } else if data.split {
+                                conn.state.lock().failed_splits.push(data.token);
+                                (conn.wake)();
                             }
                         }
                     }
@@ -269,11 +272,11 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
                 let Some(cmd) = cmd else { return Ok(End::Closed) };
                 let msg = match cmd {
                     Cmd::Restart(request) => return Ok(End::Restart(request)),
-                    Cmd::Restore { worktree, cwd, data } => {
+                    Cmd::Restore { worktree, cwd, cols, rows, data } => {
                         let request_id = next_restore;
                         next_restore += 1;
                         restores.insert(request_id, data);
-                        ClientMsg::RestoreTerminal { request_id, worktree, cwd, cols: DEFAULT_COLS, rows: DEFAULT_ROWS }
+                        ClientMsg::RestoreTerminal { request_id, worktree, cwd, cols, rows }
                     }
                     Cmd::Create { cols, rows, worktree, cwd } => ClientMsg::CreateTerminal {
                         cwd,
@@ -730,6 +733,7 @@ mod tests {
                 pending_worktrees: Default::default(),
                 created_worktrees: Vec::new(),
                 last_error: None,
+                failed_splits: Vec::new(),
             })),
             cmd_tx,
             wake: Arc::new(|| {}),
@@ -824,8 +828,8 @@ mod tests {
             assert_eq!(recv_client(&mut peer).await, expected);
         }
         cmd_tx.send(Cmd::Restore {
-            worktree: None, cwd: None,
-            data: RestoreData { token: 42, scrollback: None, separator: "restored", interruption: None, resume: Some("codex resume abcdef12".into()) },
+            worktree: None, cwd: None, cols: DEFAULT_COLS, rows: DEFAULT_ROWS,
+            data: RestoreData { token: 42, scrollback: None, separator: "restored", interruption: None, resume: Some("codex resume abcdef12".into()), split: false },
         }).unwrap();
         let ClientMsg::RestoreTerminal { request_id, .. } = recv_client(&mut peer).await else { panic!("expected restore request") };
         let terminal = TerminalInfo {
@@ -846,6 +850,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_split_requests_are_correlated_and_fail_without_replay() {
+        let (conn, mut commands) = test_conn_with_rx(&Handle::current(), false);
+        let state = conn.state.clone();
+        let tx = conn.cmd_tx.clone();
+        let (local, peer) = tokio::io::duplex(8192);
+        let mut peer = Framed::new(peer, frame_codec());
+        let task = tokio::spawn(async move {
+            session_on(&conn, Framed::new(local, frame_codec()), &mut commands, &mut false, false).await
+        });
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Hello { .. }));
+        send_server(&mut peer, welcome(PROTO_VERSION)).await;
+        for _ in 0..3 { recv_client(&mut peer).await; }
+        for token in [101, 202] {
+            tx.send(Cmd::Restore {
+                worktree: Some("/worktree".into()), cwd: Some("/worktree/sub".into()), cols: 91, rows: 27,
+                data: RestoreData::fresh_split(token),
+            }).unwrap();
+        }
+        let first = recv_client(&mut peer).await;
+        let ClientMsg::RestoreTerminal { request_id: first_id, ref worktree, ref cwd, cols, rows } = first else { panic!("restore") };
+        assert_eq!((worktree.as_ref().unwrap(), cwd.as_ref().unwrap(), cols, rows),
+            (&std::path::PathBuf::from("/worktree"), &std::path::PathBuf::from("/worktree/sub"), 91, 27));
+        let ClientMsg::RestoreTerminal { request_id: second_id, .. } = recv_client(&mut peer).await else { panic!("restore") };
+        let info = |id| TerminalInfo {
+            id, title: String::new(), cwd: "/worktree/sub".into(), cols: 91, rows: 27,
+            exited: None, created_unix_ms: id, worktree: Some("/worktree".into()), agent: None,
+        };
+        send_server(&mut peer, ServerMsg::TerminalCreated(info(9))).await;
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Subscribe { id: 9, .. }));
+        send_server(&mut peer, ServerMsg::TerminalRestored { request_id: first_id, terminal: None }).await;
+        send_server(&mut peer, ServerMsg::TerminalRestored { request_id: second_id, terminal: Some(info(2)) }).await;
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Subscribe { id: 2, .. }));
+        {
+            let state = state.lock();
+            assert_eq!(state.failed_splits, vec![101]);
+            assert_eq!(state.terminals.iter().find(|t| t.info.id == 9).unwrap().restore_token, None);
+            assert_eq!(state.terminals.iter().find(|t| t.info.id == 2).unwrap().restore_token, Some(202));
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(100), recv_client(&mut peer)).await.is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn restore_tokens_follow_only_matching_responses_and_survive_inventory() {
         let (conn, mut commands) = test_conn_with_rx(&Handle::current(), false);
         let state = conn.state.clone();
@@ -859,8 +906,8 @@ mod tests {
         send_server(&mut peer, welcome(PROTO_VERSION)).await;
         for _ in 0..3 { recv_client(&mut peer).await; }
         for token in [101, 202] {
-            tx.send(Cmd::Restore { worktree: None, cwd: None, data: RestoreData {
-                token, scrollback: None, separator: "", interruption: None, resume: None,
+            tx.send(Cmd::Restore { worktree: None, cwd: None, cols: 80, rows: 24, data: RestoreData {
+                token, scrollback: None, separator: "", interruption: None, resume: None, split: false,
             }}).unwrap();
         }
         let ClientMsg::RestoreTerminal { request_id: first, .. } = recv_client(&mut peer).await else { panic!("restore") };
