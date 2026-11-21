@@ -851,35 +851,45 @@ impl AppView {
                 let restart = self.legacy_restart_button(entry, lang, cx);
                 let Some(status) = entry.info.agent.as_ref() else {
                     return Some(
-                        row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
+                        row.children(restart)
+                            .child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
                             .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
                             .children(coord_chip(self.orch.is_coordinator(id), lang, &theme))
                             .children(badge)
                             .child(close)
-                            .children(restart)
                             .into_any_element(),
                     );
                 };
                 let icon = agent_icon_element(status.kind, LEAD_SLOT_W, theme.foreground, muted);
                 let title = status.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or(label);
                 let model = status.model.as_deref().map(shorten_model).filter(|m| !m.is_empty());
-                // The status badge hangs left of the agent icon, inside the row's left padding.
-                // Anchored to the icon slot so both share the same vertical center.
-                let badge = badge.map(|b| {
-                    div().absolute().top(px((LEAD_SLOT_W - BADGE_W) / 2.)).left(px(-(BADGE_W + BADGE_GAP))).child(b)
-                });
+                // Keep the activity badge in the gutter unless the restart button
+                // needs to come first; then put the badge between it and the agent icon.
+                let mut preview_indent = PREVIEW_INDENT;
+                let (inline_badge, gutter_badge) = if restart.is_some() {
+                    preview_indent += crate::tab_bar::LEGACY_RESTART_BUTTON_W + ROW_GAP;
+                    if badge.is_some() {
+                        preview_indent += BADGE_W + BADGE_GAP;
+                    }
+                    (badge, None)
+                } else {
+                    (None, badge)
+                };
                 let line1 = h_flex()
                     .w_full()
                     .items_center()
                     .gap(px(ROW_GAP))
                     .child(
-                        div()
+                        h_flex()
                             .relative()
                             .flex_shrink_0()
-                            .w(px(LEAD_SLOT_W))
-                            .h(px(LEAD_SLOT_W))
-                            .child(icon)
-                            .children(badge),
+                            .items_center()
+                            .children(restart.map(|button| button.mr(px(ROW_GAP))))
+                            .children(inline_badge.map(|badge| div().w(px(BADGE_W)).mr(px(BADGE_GAP)).child(badge)))
+                            .child(div().size(px(LEAD_SLOT_W)).child(icon))
+                            .children(gutter_badge.map(|badge| {
+                                div().absolute().top(px((LEAD_SLOT_W - BADGE_W) / 2.)).left(px(-(BADGE_W + BADGE_GAP))).child(badge)
+                            })),
                     )
                     .child(
                         div()
@@ -906,14 +916,13 @@ impl AppView {
                             .text_color(muted)
                             .child(relative_time(lang, now_unix_ms(), status.since_unix_ms)),
                     )
-                    .child(close)
-                    .children(restart);
+                    .child(close);
                 // No preview -> keep the plain single-line height.
                 let preview = crate::orch_watch::worker_preview(&self.orch, id, lang, agent_preview(status));
                 let line2 = preview.map(|text| {
                     div()
                         .w_full()
-                        .pl(px(PREVIEW_INDENT))
+                        .pl(px(preview_indent))
                         .min_w_0()
                         .truncate()
                         .text_size(px(11.5))

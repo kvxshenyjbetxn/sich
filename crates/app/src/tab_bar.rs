@@ -54,6 +54,8 @@ pub(crate) fn entry_title(entry: &TermEntry) -> String {
     tab_title(&entry.info.title, &entry.session.title(), &entry.info.cwd)
 }
 
+pub(crate) const LEGACY_RESTART_BUTTON_W: f32 = 16.;
+
 impl AppView {
     pub(crate) fn legacy_restart_button(
         &self, entry: &TermEntry, lang: Language, cx: &Context<Self>,
@@ -67,7 +69,7 @@ impl AppView {
         let color = cx.theme().warning;
         let button = h_flex()
             .id(("restart-legacy-terminal", id))
-            .size(px(16.)).flex_shrink_0().items_center().justify_center()
+            .size(px(LEGACY_RESTART_BUTTON_W)).flex_shrink_0().items_center().justify_center()
             .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
             .child(Icon::new(Ic::CircleAlert).size(px(11.)).text_color(color.opacity(if busy { 0.45 } else { 0.9 })))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
