@@ -1,6 +1,7 @@
 //! Blocking Git operations and worktree observation, independent of the UI.
 mod branches;
 pub mod compare;
+pub mod forge;
 mod diff;
 mod history;
 mod mutation;
