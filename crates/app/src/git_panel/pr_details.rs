@@ -366,11 +366,12 @@ impl GitPanel {
         let description = if details.body.trim().is_empty() {
             muted(tr(lang, Tr::DetNoDescription).to_owned()).into_any_element()
         } else {
+            let text = super::pr_comments::strip_html_comments(&details.body);
             div()
                 .min_w_0()
                 .text_size(px(12.))
-                .when(!expanded, |node| node.line_clamp(CLAMP_LINES))
-                .child(details.body.trim().to_owned())
+                .when(!expanded, |node| node.max_h(px(CLAMP_LINES as f32 * 18.)).overflow_hidden())
+                .child(gpui_kit::component::text::TextView::markdown(("pr-desc", pr.number as usize), text).selectable(true))
                 .into_any_element()
         };
         let reviewers = h_flex().flex_wrap().gap_1().children(

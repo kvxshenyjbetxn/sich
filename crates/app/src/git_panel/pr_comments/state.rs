@@ -195,7 +195,7 @@ pub(super) fn thread_location(path: &str, line: Option<u32>, start_line: Option<
 
 /// Removes `<!-- ... -->` blocks (bots put machine data there) and trims the result. An unclosed
 /// comment hides the rest of the text.
-pub(super) fn strip_html_comments(text: &str) -> String {
+pub(in crate::git_panel) fn strip_html_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<!--") {

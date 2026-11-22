@@ -404,6 +404,9 @@ impl GitPanel {
                 (pr::merge_status_text(lang, status, &pr.base), pr::merge_status_tone(status)),
             );
         }
+        // The status chip may repeat the review chip ("Review required"): show each text once.
+        let mut seen = std::collections::HashSet::new();
+        chip_list.retain(|(text, _)| seen.insert(text.clone()));
         let chips_row = h_flex().flex_wrap().gap_1().children(
             chip_list
                 .into_iter()

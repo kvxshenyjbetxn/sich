@@ -36,6 +36,12 @@ gpui_kit::assets::icon_assets!(ExtraIcons, [
     GitPullRequestDraft,
     GitPullRequestClosed,
     GitMerge,
+    Clock,
+    ListTree,
+    MessageSquarePlus,
+    Pencil,
+    Reply,
+    Send,
 ]);
 
 /// Agent icons (single-color SVGs, tinted at render time): `(asset path, bytes)`.
@@ -82,7 +88,10 @@ mod tests {
 
     #[test]
     fn pull_request_glyph_icons_are_registered() {
-        for name in ["git-pull-request", "git-pull-request-draft", "git-pull-request-closed", "git-merge"] {
+        for name in [
+            "git-pull-request", "git-pull-request-draft", "git-pull-request-closed", "git-merge",
+            "clock", "list-tree", "message-square-plus", "pencil", "reply", "send",
+        ] {
             let svg = AppAssets.load(&format!("icons/{name}.svg")).unwrap().unwrap_or_else(|| panic!("{name}"));
             assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"), "{name}");
         }

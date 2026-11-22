@@ -6,6 +6,8 @@
 
 mod render;
 mod state;
+
+pub(super) use state::strip_html_comments;
 mod view;
 
 use gpui_kit::{AnyElement, Context, IntoElement as _};
