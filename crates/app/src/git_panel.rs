@@ -80,6 +80,11 @@ pub(crate) enum GitPanelEvent {
         original: Option<String>,
     },
     Refreshed(PathBuf),
+    /// Text for the user's agent terminal in `worktree`: pasted without Enter.
+    SendToAgent {
+        worktree: PathBuf,
+        text: String,
+    },
     Mutated {
         worktree: PathBuf,
         diff_tab: Option<u64>,

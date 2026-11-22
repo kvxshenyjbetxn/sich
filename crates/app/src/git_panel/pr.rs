@@ -8,8 +8,9 @@
 use std::time::{Duration, Instant};
 
 use sich_git::forge::{
-    CheckState, ForgeError, GhExec, GitHub, MergeMethod, MergeState, Mergeable, PrState,
-    PullRequest, RemoteRepo, ReviewDecision,
+    CheckState, FailedJob, ForgeError, GhExec, GitHub, LOG_TAIL_BYTES, LOG_TAIL_LINES, MergeMethod,
+    MergeState, Mergeable, PrState, PullRequest, RemoteRepo, ReviewDecision, agent_prompt, agent_prompt_line, log_tail,
+    write_report,
 };
 
 use super::*;
@@ -544,6 +545,48 @@ fn run_action(repo: &Repo, target: &PrTarget, pr: &PullRequest, action: PrAction
     }
 }
 
+/// Builds the agent prompt for `jobs`, fetching each job's failed-step log through `gh`.
+/// A log that cannot be fetched (no job id, gh error, empty output) becomes "(log not available)".
+pub(super) fn build_agent_prompt<E: GhExec>(
+    gh: &GitHub<E>,
+    pr: &PullRequest,
+    jobs: Vec<FailedJob>,
+) -> String {
+    let failures: Vec<(FailedJob, Option<String>)> = jobs
+        .into_iter()
+        .map(|job| {
+            let tail = job
+                .job_id
+                .and_then(|id| gh.failed_job_log(id).ok())
+                .map(|raw| log_tail(&raw, LOG_TAIL_LINES, LOG_TAIL_BYTES))
+                .filter(|tail| !tail.is_empty());
+            (job, tail)
+        })
+        .collect();
+    agent_prompt(pr, &failures)
+}
+
+/// Builds the full report, writes it to `<reports_dir>/pr-<number>-<unix_ms>.md` and returns the
+/// single line to paste into the agent terminal. Never contains a line break.
+pub(super) fn prepare_agent_line<E: GhExec>(
+    gh: &GitHub<E>,
+    pr: &PullRequest,
+    jobs: Vec<FailedJob>,
+    reports_dir: &Path,
+    unix_ms: u128,
+) -> Result<String, String> {
+    let names: Vec<String> = jobs.iter().map(|job| job.name.clone()).collect();
+    let report = build_agent_prompt(gh, pr, jobs);
+    let path = write_report(reports_dir, pr.number, unix_ms, &report)
+        .map_err(|err| format!("Could not write the report to {}: {err}", reports_dir.display()))?;
+    Ok(agent_prompt_line(pr, &names, &path))
+}
+
+/// `<sich data dir>/sich/agent-prompts`, honoring `SICH_DATA_DIR`.
+fn agent_prompts_dir() -> Option<PathBuf> {
+    sich_daemon::data_local_dir().map(|dir| dir.join("sich").join("agent-prompts"))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Panel state and driver
 // ---------------------------------------------------------------------------------------------
@@ -832,6 +875,53 @@ impl GitPanel {
         cx.notify();
     }
 
+    /// Fetches the failed-step logs of `jobs` in the background, builds the prompt and emits
+    /// `GitPanelEvent::SendToAgent`. The app pastes it into an agent terminal without Enter.
+    pub(super) fn pr_send_to_agent(&mut self, jobs: Vec<FailedJob>, cx: &mut Context<Self>) {
+        let (Some(path), Some(repo)) = (self.worktree.clone(), self.repo.clone()) else {
+            return;
+        };
+        let Some(state) = self.pr.get_mut(&path) else { return };
+        let (Some(target), Some(pr)) = (state.target.clone(), state.view.pr().cloned()) else {
+            return;
+        };
+        if state.busy || jobs.is_empty() {
+            return;
+        }
+        state.busy = true;
+        state.action_error = None;
+        let generation = self.generation;
+        let job = cx.background_spawn(async move {
+            let gh = GitHub::new(repo.root().to_path_buf(), target.repo.clone());
+            let dir = agent_prompts_dir().ok_or_else(|| "No local data directory for the report".to_owned())?;
+            let unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis());
+            prepare_agent_line(&gh, &pr, jobs, &dir, unix_ms)
+        });
+        cx.spawn(async move |panel, cx| {
+            let result = job.await;
+            let _ = panel.update(cx, |panel, cx| {
+                if let Some(state) = panel.pr.get_mut(&path) {
+                    state.busy = false;
+                }
+                panel.generation.apply(generation, || match result {
+                    Ok(text) => cx.emit(GitPanelEvent::SendToAgent { worktree: path, text }),
+                    Err(message) => panel.pr_report_error(&path, message, cx),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Shows an error in the PR section of `path` (used when the app cannot deliver a prompt).
+    pub(crate) fn pr_report_error(&mut self, path: &Path, message: String, cx: &mut Context<Self>) {
+        self.pr.entry(path.to_path_buf()).or_default().action_error = Some(message);
+        cx.notify();
+    }
+
     /// A pull request was created from the dialog (or already existed).
     pub(super) fn pr_created(&mut self, path: &Path, created: sich_git::forge::CreatedPr, cx: &mut Context<Self>) {
         if let Some(state) = self.pr.get_mut(path) {
@@ -993,6 +1083,69 @@ mod tests {
         assert!(matches!(run(0, "not json", ""), PrView::Error(_)));
     }
 
+    fn gh_with(code: i32, stdout: &str) -> GitHub<Scripted> {
+        let output = GhOutput { code: Some(code), stdout: stdout.into(), stderr: "no logs".into() };
+        let remote = RemoteRepo { host: "github.com".into(), owner: "o".into(), name: "r".into() };
+        GitHub::with_exec(Scripted(output), ".".into(), remote)
+    }
+
+    fn job(name: &str, job_id: Option<u64>) -> FailedJob {
+        FailedJob { name: name.into(), url: None, job_id }
+    }
+
+    #[test]
+    fn agent_prompt_includes_the_cleaned_log_tail() {
+        let gh = gh_with(0, "build\tstep\t2026-11-22T10:00:00Z error: boom\n");
+        let text = build_agent_prompt(&gh, &pr(PrState::Open), vec![job("CI / test", Some(5))]);
+        assert!(text.contains("PR #7"), "{text}");
+        assert!(text.contains("Failed check: CI / test"), "{text}");
+        assert!(text.contains("```\nerror: boom\n```"), "{text}");
+        assert!(!text.contains("(log not available)"));
+    }
+
+    #[test]
+    fn agent_prompt_falls_back_when_the_log_cannot_be_fetched() {
+        let failing = build_agent_prompt(&gh_with(1, ""), &pr(PrState::Open), vec![job("a", Some(5))]);
+        assert!(failing.contains("(log not available)"), "{failing}");
+        let no_id = build_agent_prompt(&gh_with(0, "x"), &pr(PrState::Open), vec![job("a", None)]);
+        assert!(no_id.contains("(log not available)"), "{no_id}");
+        let empty = build_agent_prompt(&gh_with(0, "\n\n"), &pr(PrState::Open), vec![job("a", Some(1))]);
+        assert!(empty.contains("(log not available)"), "{empty}");
+        let several = build_agent_prompt(
+            &gh_with(0, "j\ts\t2026-11-22T10:00:00Z line"),
+            &pr(PrState::Open),
+            vec![job("a", Some(1)), job("b", None)],
+        );
+        assert_eq!(several.matches("Failed check: ").count(), 2);
+        assert_eq!(several.matches("(log not available)").count(), 1);
+        assert!(!several.ends_with('\n'), "never ends with a newline");
+    }
+
+    #[test]
+    fn prepared_agent_line_is_single_line_and_report_goes_to_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let reports = dir.path().join("agent-prompts");
+        let gh = gh_with(0, "j\ts\t2026-11-22T10:00:00Z rm -rf /\nj\ts\t2026-11-22T10:00:00Z second\r\n");
+        let jobs = vec![job("CI / test", Some(5)), job("lint\nx", None)];
+        let line = prepare_agent_line(&gh, &pr(PrState::Open), jobs, &reports, 42).unwrap();
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        assert!(line.contains("pr-7-42.md"), "{line}");
+        let report = std::fs::read_to_string(reports.join("pr-7-42.md")).unwrap();
+        assert!(report.contains("rm -rf /\nsecond"), "{report}");
+        assert!(report.contains("Failed check: CI / test"));
+    }
+
+    #[test]
+    fn prepared_agent_line_reports_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("file");
+        std::fs::write(&blocker, "x").unwrap();
+        let gh = gh_with(0, "x");
+        let err = prepare_agent_line(&gh, &pr(PrState::Open), vec![job("a", None)], &blocker.join("sub"), 1)
+            .unwrap_err();
+        assert!(err.contains("Could not write the report"), "{err}");
+    }
+
     #[test]
     fn decide_applies_cooldown_to_everything_but_actions() {
         let now = Instant::now();
@@ -1124,7 +1277,7 @@ mod tests {
     fn unstable_chip_is_a_warning_with_its_own_text() {
         let chip = Chip::Merge(MergeChip::ReadyChecksFailing);
         assert_eq!(chip.tone(), Tone::Warning);
-        assert_eq!(chip_text(Language::En, &chip), "Mergeable, checks failing");
+        assert_eq!(chip_text(Language::En, &chip), "Mergeable with warnings");
         assert_eq!(Chip::Merge(MergeChip::Ready).tone(), Tone::Success);
     }
 

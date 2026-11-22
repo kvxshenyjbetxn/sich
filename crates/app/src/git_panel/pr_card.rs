@@ -14,7 +14,6 @@ use gpui_kit::{
     px, rgb,
 };
 use sich_git::forge::{Check, CheckState, PrState, PullRequest};
-
 use super::pr::{
     self, Chip, CreateBlock, MergeBlock, PrAction, PrEntry, PrView, Tone, chip_text, chips,
 };
@@ -344,19 +343,35 @@ impl GitPanel {
     ) -> AnyElement {
         let theme = cx.theme().clone();
         let failed = pr.failed_run_ids();
+        let failed_jobs = pr.failed_jobs();
+        let busy = state.busy;
         v_flex()
             .gap_1()
-            .children((!failed.is_empty()).then(|| {
-                h_flex().child(
-                    Button::new("pr-rerun")
-                        .ghost()
-                        .xsmall()
-                        .label(tr(lang, Tr::PrRerunFailed))
-                        .disabled(state.busy)
-                        .on_click(cx.listener(move |panel, _, _, cx| {
-                            panel.pr_run_action(PrAction::Rerun(failed.clone()), cx)
-                        })),
-                )
+            .children((!failed.is_empty() || !failed_jobs.is_empty()).then(|| {
+                let all_jobs = failed_jobs.clone();
+                h_flex()
+                    .gap_1()
+                    .children((!failed.is_empty()).then(|| {
+                        Button::new("pr-rerun")
+                            .ghost()
+                            .xsmall()
+                            .label(tr(lang, Tr::PrRerunFailed))
+                            .disabled(busy)
+                            .on_click(cx.listener(move |panel, _, _, cx| {
+                                panel.pr_run_action(PrAction::Rerun(failed.clone()), cx)
+                            }))
+                    }))
+                    .children((!all_jobs.is_empty()).then(|| {
+                        Button::new("pr-send-all")
+                            .ghost()
+                            .xsmall()
+                            .label(tr(lang, Tr::PrSendFailuresToAgent))
+                            .disabled(busy)
+                            .loading(busy)
+                            .on_click(cx.listener(move |panel, _, _, cx| {
+                                panel.pr_send_to_agent(all_jobs.clone(), cx)
+                            }))
+                    }))
             }))
             .child(
                 v_flex()
@@ -367,6 +382,8 @@ impl GitPanel {
                         let label: SharedString = check_label(check).into();
                         let tooltip = label.clone();
                         let url = check.url.clone();
+                        let send_job = (check.state == CheckState::Failure)
+                            .then(|| check.to_failed_job());
                         h_flex()
                             .id(("pr-check", index))
                             .h(px(20.))
@@ -391,6 +408,18 @@ impl GitPanel {
                                     .text_size(px(11.))
                                     .child(label),
                             )
+                            .children(send_job.map(|job| {
+                                tool_button(
+                                    ("pr-send", index),
+                                    Ic::Bot,
+                                    tr(lang, Tr::PrSendToAgent),
+                                )
+                                .disabled(busy)
+                                .on_click(cx.listener(move |panel, _, _, cx| {
+                                    cx.stop_propagation();
+                                    panel.pr_send_to_agent(vec![job.clone()], cx)
+                                }))
+                            }))
                     })),
             )
             .into_any_element()

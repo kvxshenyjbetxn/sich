@@ -116,6 +116,21 @@ pub fn workspace_exists(key: &WorkspaceKey, projects: &[ProjectInfo]) -> bool {
     }
 }
 
+/// Terminal that receives text sent to "the agent" of a worktree. `terms` are the worktree's
+/// live terminals as `(id, has_agent)` in creation order. Prefers the focused terminal, then the
+/// workspace's active one, then the first agent terminal.
+pub fn pick_agent_terminal(
+    terms: &[(TermId, bool)],
+    focused: Option<TermId>,
+    active: Option<TermId>,
+) -> Option<TermId> {
+    let is_agent = |id: TermId| terms.iter().any(|&(t, agent)| t == id && agent);
+    focused
+        .filter(|&id| is_agent(id))
+        .or_else(|| active.filter(|&id| is_agent(id)))
+        .or_else(|| terms.iter().find(|&&(_, agent)| agent).map(|&(id, _)| id))
+}
+
 /// Next/previous id in `ids` (wraps around). Unknown `current` starts from the first.
 pub fn cycle_id(ids: &[TermId], current: Option<TermId>, delta: isize) -> Option<TermId> {
     if ids.is_empty() {
@@ -217,6 +232,24 @@ mod tests {
 
     fn project(id: u64, worktrees: Vec<WorktreeInfo>) -> ProjectInfo {
         ProjectInfo { id, name: "p".into(), path: PathBuf::new(), is_git: true, worktrees, error: None, group: None }
+    }
+
+    #[test]
+    fn agent_terminal_choice_prefers_focused_then_active_then_first() {
+        let terms = [(1, false), (2, true), (3, true), (4, true)];
+        assert_eq!(pick_agent_terminal(&terms, Some(3), Some(4)), Some(3));
+        // A focused plain shell is not an agent: fall back to the active agent terminal.
+        assert_eq!(pick_agent_terminal(&terms, Some(1), Some(4)), Some(4));
+        // Focused/active ids from another worktree (not in `terms`) are ignored.
+        assert_eq!(pick_agent_terminal(&terms, Some(99), Some(98)), Some(2));
+        assert_eq!(pick_agent_terminal(&terms, None, None), Some(2));
+        assert_eq!(pick_agent_terminal(&terms, None, Some(1)), Some(2));
+    }
+
+    #[test]
+    fn agent_terminal_choice_is_none_without_agents() {
+        assert_eq!(pick_agent_terminal(&[], Some(1), Some(1)), None);
+        assert_eq!(pick_agent_terminal(&[(1, false), (2, false)], Some(1), Some(2)), None);
     }
 
     #[test]

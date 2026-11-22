@@ -11,6 +11,7 @@ const PR_FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStat
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const VIEW_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(90);
+const LOG_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeMethod {
@@ -231,6 +232,20 @@ impl<E: GhExec> GitHub<E> {
             self.run_ok(&argv, VIEW_TIMEOUT)?;
         }
         Ok(())
+    }
+
+    /// Output of the failed steps of one job (`gh run view --job <id> --log-failed`).
+    pub fn failed_job_log(&self, job_id: u64) -> Result<String, ForgeError> {
+        let argv = args(&[
+            "run",
+            "view",
+            "--job",
+            &job_id.to_string(),
+            "--log-failed",
+            "--repo",
+            &self.repo.gh_repo_arg(),
+        ]);
+        self.run_ok(&argv, LOG_TIMEOUT).map(|output| output.stdout)
     }
 }
 
@@ -520,6 +535,22 @@ mod tests {
         assert_eq!(calls[0], v(&["run", "rerun", "10", "--failed", "--repo", "o/r"]));
         assert_eq!(calls[1][2], "20");
         assert_eq!(gh.rerun_failed(&[]), Ok(()));
+    }
+
+    #[test]
+    fn failed_job_log_argv_and_errors() {
+        let exec = FakeExec::with(vec![ok("log text"), fail(1, "log not found"), Err(ForgeError::TimedOut)]);
+        let gh = github(&exec);
+        assert_eq!(gh.failed_job_log(77), Ok("log text".to_owned()));
+        assert_eq!(
+            gh.failed_job_log(78),
+            Err(ForgeError::Failed("log not found".into()))
+        );
+        assert_eq!(gh.failed_job_log(79), Err(ForgeError::TimedOut));
+        assert_eq!(
+            exec.calls()[0],
+            v(&["run", "view", "--job", "77", "--log-failed", "--repo", "o/r"])
+        );
     }
 
     #[test]

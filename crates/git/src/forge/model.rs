@@ -53,6 +53,20 @@ pub struct Check {
     pub url: Option<String>,
 }
 
+impl Check {
+    /// This check as a job description ("workflow / name"), whatever its state.
+    pub fn to_failed_job(&self) -> FailedJob {
+        FailedJob {
+            name: match &self.workflow {
+                Some(workflow) => format!("{workflow} / {}", self.name),
+                None => self.name.clone(),
+            },
+            url: self.url.clone(),
+            job_id: self.url.as_deref().and_then(job_id_from_url),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChecksSummary {
     pub total: u32,
@@ -123,9 +137,33 @@ impl PullRequest {
         ids
     }
 
+    /// Failed checks as jobs, in check order. `job_id` is parsed from `/actions/runs/<run>/job/<job>`.
+    pub fn failed_jobs(&self) -> Vec<FailedJob> {
+        self.checks
+            .iter()
+            .filter(|check| check.state == CheckState::Failure)
+            .map(Check::to_failed_job)
+            .collect()
+    }
+
     pub fn is_open(&self) -> bool {
         matches!(self.state, PrState::Open | PrState::Draft)
     }
+}
+
+/// A failed check, ready to be described to an agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedJob {
+    pub name: String,
+    pub url: Option<String>,
+    pub job_id: Option<u64>,
+}
+
+fn job_id_from_url(url: &str) -> Option<u64> {
+    let (_, rest) = url.split_once("/actions/runs/")?;
+    let (_, rest) = rest.split_once("/job/")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 fn run_id_from_url(url: &str) -> Option<u64> {
@@ -384,6 +422,26 @@ mod tests {
         assert_eq!(summary.overall(), Some(CheckState::Failure));
         // 222 appears twice and is deduplicated; 555 has no job suffix.
         assert_eq!(pr.failed_run_ids(), vec![222, 555]);
+    }
+
+    #[test]
+    fn failed_jobs_names_urls_and_job_ids() {
+        let pr = parse_pr_json(FULL).unwrap();
+        let jobs = pr.failed_jobs();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].name, "CI / test");
+        assert_eq!(jobs[0].job_id, Some(2));
+        assert_eq!(
+            jobs[0].url.as_deref(),
+            Some("https://github.com/o/r/actions/runs/222/job/2")
+        );
+        assert_eq!(jobs[1].name, "CI / lint");
+        assert_eq!(jobs[1].job_id, Some(3));
+        // Status context without workflow and without a job suffix.
+        assert_eq!(jobs[2].name, "ci/bad");
+        assert_eq!(jobs[2].job_id, None);
+        assert!(jobs[2].url.is_some());
+        assert!(parse_pr_json("{}").unwrap().failed_jobs().is_empty());
     }
 
     #[test]

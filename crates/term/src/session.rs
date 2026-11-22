@@ -307,6 +307,11 @@ impl TermSession {
         self.write(paste_bytes(text, mode));
     }
 
+    /// Whether the application in the terminal enabled bracketed paste.
+    pub fn bracketed_paste_mode(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Pastes with bracketed paste forced on (used for file paths handed to agent CLIs).
     pub fn paste_bracketed(&self, text: &str) {
         let mode = *self.term.lock().mode() | TermMode::BRACKETED_PASTE;

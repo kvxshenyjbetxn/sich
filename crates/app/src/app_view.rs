@@ -45,7 +45,8 @@ use crate::view::TerminalView;
 use crate::terminal_layout::{self, Axis, Edge, Layout, Rect};
 use crate::split_drag::{DragGhost, SeparatorDrag, TerminalDrag};
 use crate::workspace::{
-    WorkspaceKey, Workspaces, cycle_id, restore_selection, terminals_in, workspace_exists,
+    WorkspaceKey, Workspaces, cycle_id, pick_agent_terminal, restore_selection, terminals_in,
+    workspace_exists,
 };
 use crate::workspace_tabs::{WorkspaceTab, WorkspaceTabs};
 use crate::win_flash;
@@ -1176,6 +1177,9 @@ impl AppView {
                     self.open_diff(worktree.clone(), repo.clone(), key.clone(), original.clone(), window, cx);
                 }
             }
+            GitPanelEvent::SendToAgent { worktree, text } => {
+                self.send_to_agent(worktree, text, window, cx);
+            }
             GitPanelEvent::Refreshed(worktree) | GitPanelEvent::Mutated { worktree, .. } => {
                 if let GitPanelEvent::Mutated { branch_switched: true, .. } = event {
                     self.client.refresh_projects();
@@ -1194,6 +1198,35 @@ impl AppView {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Pastes `text` (without Enter) into an agent terminal of `worktree`, then shows and focuses
+    /// it so the user can review and submit. Without an agent terminal the git panel shows an error.
+    fn send_to_agent(&mut self, worktree: &std::path::Path, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let key = WorkspaceKey::of(Some(worktree));
+        let snapshot = self.client.snapshot();
+        let mut entries: Vec<_> = snapshot
+            .terminals
+            .iter()
+            .filter(|entry| key.contains(entry.info.worktree.as_deref()) && entry.info.exited.is_none())
+            .collect();
+        entries.sort_by_key(|entry| (entry.info.created_unix_ms, entry.info.id));
+        let terms: Vec<(TermId, bool)> =
+            entries.iter().map(|entry| (entry.info.id, entry.info.agent.is_some())).collect();
+        let live: Vec<TermId> = terms.iter().map(|(id, _)| *id).collect();
+        let focused = self.focused;
+        let active = self.ws.active_in(&key, &live);
+        let target = pick_agent_terminal(&terms, focused, active);
+        let pasted = target.is_some_and(|id| {
+            self.views.get(&id).is_some_and(|view| view.update(cx, |view, cx| view.paste_text(text, cx)))
+        });
+        match target.filter(|_| pasted) {
+            Some(id) => self.activate_terminal_in(key, id, window, cx),
+            None => {
+                let message = tr(settings::language(cx), Tr::PrNoAgentTerminal).to_owned();
+                self.git_panel.update(cx, |panel, cx| panel.pr_report_error(worktree, message, cx));
             }
         }
     }

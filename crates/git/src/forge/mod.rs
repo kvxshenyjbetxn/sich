@@ -1,6 +1,7 @@
 //! GitHub pull request support through the user's installed official `gh` CLI.
 //!
 //! Sich never reads gh credentials or tokens: every call is a plain `gh` invocation.
+mod agent_prompt;
 mod gh;
 mod github;
 mod model;
@@ -10,10 +11,14 @@ mod repo_ext;
 
 use std::fmt;
 
+pub use agent_prompt::{
+    KEEP_REPORTS, LOG_TAIL_BYTES, LOG_TAIL_LINES, agent_prompt, agent_prompt_line, log_tail, prune_reports,
+    write_report,
+};
 pub use gh::{GhCli, GhExec, GhOutput};
 pub use github::{CreatePr, CreatedPr, GitHub, MergeMethod};
 pub use model::{
-    Check, CheckState, ChecksSummary, MergeState, Mergeable, PrState, PullRequest, ReviewDecision,
+    Check, CheckState, ChecksSummary, FailedJob, MergeState, Mergeable, PrState, PullRequest, ReviewDecision,
     parse_pr_json,
 };
 pub use prefill::{PrDraft, pr_prefill};

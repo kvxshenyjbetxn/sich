@@ -205,6 +205,25 @@ impl TerminalView {
         }
     }
 
+    /// Inserts `text` into the input line like a user paste. Never sends Enter: the text must
+    /// not end with a newline, and agent CLIs get it as one bracketed block so inner newlines
+    /// do not submit either.
+    pub(crate) fn paste_text(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if self.session.exited().is_some() {
+            return false;
+        }
+        crate::orch_watch::note_user_input(self.term_id);
+        self.session.clear_selection();
+        self.session.scroll_to_bottom();
+        if paste_image::force_bracketed(self.agent) || self.session.bracketed_paste_mode() {
+            self.session.paste_bracketed(&prompt_paste_text(text, true));
+        } else {
+            self.session.paste(&prompt_paste_text(text, false));
+        }
+        cx.notify();
+        true
+    }
+
     /// Inserts paths into this PTY without submitting a command or prompt.
     pub(crate) fn paste_dropped_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> bool {
         if self.session.exited().is_some() {
@@ -761,9 +780,27 @@ fn dropped_path_text(paths: &[PathBuf], agent: Option<AgentKind>, windows: bool)
     Some((result, false))
 }
 
+/// Text for a prompt paste that must never submit: no trailing line break, and without
+/// bracketed paste every line break would act as Enter, so the lines are joined with spaces.
+fn prompt_paste_text(text: &str, bracketed: bool) -> String {
+    let text = text.trim_end_matches(['\r', '\n']);
+    if bracketed {
+        text.to_owned()
+    } else {
+        text.split(['\r', '\n']).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_paste_never_carries_a_line_break_without_bracketed_paste() {
+        assert_eq!(prompt_paste_text("a\nb\r\n\nc\n", true), "a\nb\r\n\nc");
+        assert_eq!(prompt_paste_text("a\nb\r\n\nc\n", false), "a b c");
+        assert_eq!(prompt_paste_text("\n", false), "");
+    }
 
     #[test]
     fn dropped_paths_are_separate_literal_arguments() {
