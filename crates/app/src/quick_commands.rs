@@ -123,10 +123,8 @@ pub(crate) fn banner(
                 }
             }),
         )
-        .absolute()
-        .top_0()
-        .right_0()
-        .left_0(),
+        .w_full()
+        .flex_shrink_0(),
     )
 }
 

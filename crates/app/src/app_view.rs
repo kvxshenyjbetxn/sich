@@ -1811,9 +1811,10 @@ impl AppView {
                             this.activate_terminal(id, window, cx);
                         }
                     }))
-                    .child(view.clone()).children(banner).children(feedback);
+                    .child(view.clone()).children(feedback);
+                // The lifetime banner sits above the body (not over it): the terminal gets the rest.
                 v_flex().size_full().min_w_0().min_h_0().overflow_hidden()
-                    .children(header).child(body).into_any_element()
+                    .children(header).children(banner).child(body).into_any_element()
             }
             Layout::Split { axis, ratio, first, second } => {
                 let axis = *axis;

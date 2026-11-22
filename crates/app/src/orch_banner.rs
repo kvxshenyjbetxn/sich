@@ -47,10 +47,9 @@ pub fn render(
                 .detach();
             }),
         )
-        .absolute()
-        .top_0()
-        .right_0()
-        .when(!kept, |banner| banner.left_0()),
+        // In the pane's flow above the terminal, so it never covers terminal rows.
+        .w_full()
+        .flex_shrink_0(),
     )
 }
 
