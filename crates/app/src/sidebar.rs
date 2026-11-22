@@ -833,6 +833,8 @@ impl AppView {
                         cx.stop_propagation();
                     }));
                 let close = div().invisible().group_hover(group.clone(), |s| s.visible()).child(close);
+                let restart = self.legacy_restart_button(entry, lang, cx, 11.)
+                    .map(|button| button.size(px(16.)));
                 let key_for_sub = key.clone();
                 let key = key.clone();
                 let row = row_base(("side-term", id), selected, indent, &theme)
@@ -855,6 +857,7 @@ impl AppView {
                             .children(coord_chip(self.orch.is_coordinator(id), lang, &theme))
                             .children(badge)
                             .child(close)
+                            .children(restart)
                             .into_any_element(),
                     );
                 };
@@ -904,7 +907,8 @@ impl AppView {
                             .text_color(muted)
                             .child(relative_time(lang, now_unix_ms(), status.since_unix_ms)),
                     )
-                    .child(close);
+                    .child(close)
+                    .children(restart);
                 // No preview -> keep the plain single-line height.
                 let preview = crate::orch_watch::worker_preview(&self.orch, id, lang, agent_preview(status));
                 let line2 = preview.map(|text| {
