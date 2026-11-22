@@ -40,7 +40,11 @@ impl Render for GitPanel {
             None
         };
         let content = if let (Some(status), Some(input)) = (&self.status, input) {
-            self.git_tab(status, input, lang, cx).into_any_element()
+            if self.pane == RightTab::Pr && self.pr_section_visible(status, cx) {
+                self.pr_tab(status, self.active_operation(), lang, cx)
+            } else {
+                self.git_tab(status, input, lang, cx).into_any_element()
+            }
         } else {
             let message = match (&self.worktree, &self.unavailable) {
                 (None, _) => Tr::GitSelectProject,
@@ -97,7 +101,7 @@ impl GitPanel {
         let theme = cx.theme().clone();
         let busy = self.active_operation();
         let banner = self.in_progress_banner(status, busy, lang, cx);
-        let pr_section = self.pr_section(status, busy, lang, cx);
+        let pr_row = self.pr_git_row(status, busy, lang, cx);
         let commit_button = self.commit_split_button(status, busy, lang, cx);
         let stashes = self.stash_section(busy, lang, cx);
         v_flex()
@@ -106,7 +110,7 @@ impl GitPanel {
             .child(self.branch_header(status, busy, lang, cx))
             .child(self.error_notice(lang, cx))
             .children(banner)
-            .children(pr_section)
+            .children(pr_row)
             .child(
                 v_flex()
                     .flex_shrink_0()
@@ -209,7 +213,7 @@ impl GitPanel {
             }))
             .child(
                 tool_button("git-refresh", Ic::RefreshCw, tr(lang, Tr::Refresh))
-                    .loading(self.refreshing || self.pr_fetching())
+                    .loading(self.refreshing || self.pr_fetching(cx))
                     .on_click(cx.listener(|panel, _, _, cx| {
                         panel.refresh(cx);
                         panel.pr_manual(cx);

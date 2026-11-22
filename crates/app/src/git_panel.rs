@@ -30,6 +30,8 @@ use sich_git::{
 };
 
 use crate::i18n::{Language, Tr, tr};
+use crate::pr_store::{PrStore, PrStoreEvent};
+use crate::session::RightTab;
 use crate::worktree_dialogs;
 
 pub(crate) const DEFAULT_RIGHT_W: f32 = 340.;
@@ -85,6 +87,8 @@ pub(crate) enum GitPanelEvent {
         worktree: PathBuf,
         text: String,
     },
+    /// The compact pull request row was clicked: show the "Pull request" tab.
+    OpenPrTab,
     Mutated {
         worktree: PathBuf,
         diff_tab: Option<u64>,
@@ -373,14 +377,25 @@ pub(crate) struct GitPanel {
     stashes: Vec<Stash>,
     stash_open: HashMap<String, Expansion<Vec<FileChange>>>,
     stashes_collapsed: bool,
-    pr: HashMap<PathBuf, pr::PrEntry>,
-    pr_task: Option<Task<()>>,
+    store: Entity<PrStore>,
+    /// Which of the two right-panel tabs this panel renders (set by the app).
+    pane: RightTab,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
 
 impl GitPanel {
-    pub(crate) fn new(history_collapsed: bool, history_height: Option<f32>) -> Self {
+    pub(crate) fn new(
+        store: Entity<PrStore>,
+        history_collapsed: bool,
+        history_height: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let subscriptions = vec![
+            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.subscribe(&store, |panel, _, event, cx| panel.on_store_event(event, cx)),
+        ];
         Self {
             worktree: None,
             generation: Generation::default(),
@@ -407,8 +422,30 @@ impl GitPanel {
             stashes: Vec::new(),
             stash_open: HashMap::new(),
             stashes_collapsed: false,
-            pr: HashMap::new(),
-            pr_task: None,
+            store,
+            pane: RightTab::Git,
+            _subscriptions: subscriptions,
+        }
+    }
+
+    pub(crate) fn set_pane(&mut self, pane: RightTab, cx: &mut Context<Self>) {
+        if self.pane != pane {
+            self.pane = pane;
+            cx.notify();
+        }
+    }
+
+    fn on_store_event(&mut self, event: &PrStoreEvent, cx: &mut Context<Self>) {
+        match event {
+            PrStoreEvent::SendToAgent { worktree, text } => cx.emit(GitPanelEvent::SendToAgent {
+                worktree: worktree.clone(),
+                text: text.clone(),
+            }),
+            PrStoreEvent::ActionFinished { worktree, merged } => {
+                if *merged && self.worktree.as_ref() == Some(worktree) {
+                    self.request_refresh(true);
+                }
+            }
         }
     }
 
@@ -424,11 +461,12 @@ impl GitPanel {
         if self.worktree.as_deref() == worktree {
             return;
         }
+        if let Some(old) = self.worktree.clone() {
+            self.store.update(cx, |store, cx| store.clear_status(&old, cx));
+        }
         self.generation.advance();
         self.watch_task = None;
-        self.pr_task = None;
         self.wake = None;
-        self.pr_reset_in_flight();
         self.stashes.clear();
         self.stash_open.clear();
         self.stashes_collapsed = false;
@@ -453,7 +491,6 @@ impl GitPanel {
             self.watch_task = Some(cx.spawn(async move |panel, cx| {
                 refresh_loop(panel, cx, generation, path, rx, tx).await;
             }));
-            self.start_pr_timer(cx);
         }
         cx.notify();
     }
@@ -523,7 +560,7 @@ impl GitPanel {
                 if let Some(worktree) = &self.worktree {
                     cx.emit(GitPanelEvent::Refreshed(worktree.clone()));
                 }
-                self.pr_sync(true, cx);
+                self.pr_sync_status(cx);
             }
             Err(error @ (GitError::NotRepository | GitError::GitMissing)) => {
                 self.repo = None;
@@ -735,7 +772,7 @@ impl GitPanel {
                 if panel.worktree.as_ref() == Some(&path) {
                     panel.request_refresh(operation.changes_history());
                     if operation.affects_pr() && succeeded {
-                        panel.pr_request(pr::PrTrigger::Action, cx);
+                        panel.pr_request_action(cx);
                     }
                 }
                 cx.notify();

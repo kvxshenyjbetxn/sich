@@ -1,0 +1,47 @@
+//! Shared fixtures for the unit tests of the PR store modules.
+
+use std::path::Path;
+use std::time::Duration;
+
+use sich_git::forge::{
+    Check, CheckState, ForgeError, GhExec, GhOutput, GitHub, MergeState, Mergeable, PrState,
+    PullRequest, RemoteRepo,
+};
+
+pub(crate) fn pr(state: PrState) -> PullRequest {
+    PullRequest {
+        number: 7,
+        title: "Add thing".into(),
+        url: "https://github.com/o/r/pull/7".into(),
+        state,
+        mergeable: Mergeable::Mergeable,
+        merge_state: MergeState::Clean,
+        review: None,
+        base: "main".into(),
+        head: "feat".into(),
+        head_oid: "abc".into(),
+        checks: Vec::new(),
+        updated_at: String::new(),
+    }
+}
+
+pub(crate) fn check(state: CheckState) -> Check {
+    Check { name: "ci".into(), workflow: None, state, url: None }
+}
+
+pub(crate) fn remote() -> RemoteRepo {
+    RemoteRepo { host: "github.com".into(), owner: "o".into(), name: "r".into() }
+}
+
+pub(crate) struct Scripted(pub GhOutput);
+
+impl GhExec for Scripted {
+    fn run(&self, _: &Path, _: &[String], _: Duration) -> Result<GhOutput, ForgeError> {
+        Ok(self.0.clone())
+    }
+}
+
+pub(crate) fn gh_with(code: i32, stdout: &str) -> GitHub<Scripted> {
+    let output = GhOutput { code: Some(code), stdout: stdout.into(), stderr: "no logs".into() };
+    GitHub::with_exec(Scripted(output), ".".into(), remote())
+}

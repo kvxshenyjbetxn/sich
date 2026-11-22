@@ -40,10 +40,20 @@ pub struct Session {
 pub enum RightTab {
     #[default]
     Git,
+    Pr,
 }
 
 impl RightTab {
-    pub const ALL: &'static [Self] = &[Self::Git];
+    pub const ALL: &'static [Self] = &[Self::Git, Self::Pr];
+
+    /// The tab to actually show: the "Pull request" tab exists only while the PR section does,
+    /// otherwise the panel falls back to Git (the saved choice is kept for when it returns).
+    pub fn effective(self, pr_visible: bool) -> Self {
+        match self {
+            Self::Pr if !pr_visible => Self::Git,
+            tab => tab,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -641,6 +651,23 @@ mod tests {
     #[test]
     fn empty_object_is_default() {
         assert_eq!(Session::parse("{}"), Some(Session::default()));
+    }
+
+    #[test]
+    fn pr_tab_round_trips_defaults_to_git_and_falls_back_while_invisible() {
+        assert_eq!(RightTab::default(), RightTab::Git);
+        let prefs = RightPanelState { tab: RightTab::Pr, ..RightPanelState::default() };
+        let json = serde_json::to_string(&Session { right_panel: prefs, ..Default::default() }).unwrap();
+        assert!(json.contains(r#""tab":"pr""#), "{json}");
+        assert_eq!(Session::parse(&json).unwrap().right_panel.tab, RightTab::Pr);
+        let old = Session::parse(r#"{"right_panel":{"open":true}}"#).unwrap();
+        assert_eq!(old.right_panel.tab, RightTab::Git);
+
+        assert_eq!(RightTab::Pr.effective(true), RightTab::Pr);
+        assert_eq!(RightTab::Pr.effective(false), RightTab::Git);
+        assert_eq!(RightTab::Git.effective(true), RightTab::Git);
+        assert_eq!(RightTab::Git.effective(false), RightTab::Git);
+        assert_eq!(RightTab::ALL, &[RightTab::Git, RightTab::Pr]);
     }
 
     #[test]

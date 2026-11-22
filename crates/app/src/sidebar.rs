@@ -775,6 +775,25 @@ impl AppView {
             );
         }
         row = row.child(div().flex_1());
+        if let Some(glyph) = self.pr_store.read(cx).glyph_for(&w.path) {
+            let color = crate::pr_store::tone_color(glyph.tone, &theme);
+            let tip: SharedString = glyph.tooltip(lang).into();
+            let key = key.clone();
+            row = row.child(
+                h_flex()
+                    .id(SharedString::from(format!("wt-pr:{uid}")))
+                    .flex_shrink_0()
+                    .size(px(16.))
+                    .items_center()
+                    .justify_center()
+                    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.open_pr_tab(key.clone(), window, cx)
+                    }))
+                    .child(Icon::new(glyph.icon.icon()).size(px(13.)).text_color(color)),
+            );
+        }
         if w.dirty {
             let text = tr(lang, Tr::UncommittedChanges);
             row = row.child(

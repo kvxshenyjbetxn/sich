@@ -32,6 +32,10 @@ gpui_kit::assets::icon_assets!(ExtraIcons, [
     Circle,
     Timer,
     Download,
+    GitPullRequest,
+    GitPullRequestDraft,
+    GitPullRequestClosed,
+    GitMerge,
 ]);
 
 /// Agent icons (single-color SVGs, tinted at render time): `(asset path, bytes)`.
@@ -74,6 +78,14 @@ mod tests {
     fn worker_banner_timer_icon_is_registered() {
         let svg = AppAssets.load("icons/timer.svg").unwrap().expect("timer icon must be registered");
         assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"));
+    }
+
+    #[test]
+    fn pull_request_glyph_icons_are_registered() {
+        for name in ["git-pull-request", "git-pull-request-draft", "git-pull-request-closed", "git-merge"] {
+            let svg = AppAssets.load(&format!("icons/{name}.svg")).unwrap().unwrap_or_else(|| panic!("{name}"));
+            assert!(std::str::from_utf8(&svg).unwrap().contains("<svg"), "{name}");
+        }
     }
 
     #[test]

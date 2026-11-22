@@ -29,6 +29,7 @@ use crate::diff_view::DiffView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
+use crate::pr_store::{PrStore, tone_color, tracked_worktrees};
 use crate::notify::{self, Cooldown, NotifyKind};
 use crate::quick_commands::{self, TemporaryCommand};
 use crate::orch_watch;
@@ -174,6 +175,7 @@ pub struct AppView {
     /// The sidebar handle is being dragged.
     sidebar_dragging: bool,
     git_panel: Entity<GitPanel>,
+    pub(crate) pr_store: Entity<PrStore>,
     pub(crate) right_panel: RightPanelState,
     right_dragging: bool,
     hidden_to_tray: bool,
@@ -196,7 +198,10 @@ impl AppView {
             .map_or(DEFAULT_SIDEBAR_W, |w| clamp_sidebar_w(w, f32::INFINITY));
         let mut right_panel = saved.as_ref().map_or_else(RightPanelState::default, |s| s.right_panel);
         right_panel.width = right_panel.width.map(|width| clamp_right_w(width, f32::INFINITY, 0.));
-        let git_panel = cx.new(|_| GitPanel::new(right_panel.history_collapsed, right_panel.history_height));
+        let pr_store = cx.new(|_| PrStore::new());
+        let git_panel = cx.new(|cx| {
+            GitPanel::new(pr_store.clone(), right_panel.history_collapsed, right_panel.history_height, cx)
+        });
         // Coalescing wake path: bounded(1), try_send never blocks.
         let (wake_tx, wake_rx) = async_channel::bounded::<()>(1);
         let client = DaemonPool::start(
@@ -357,6 +362,7 @@ impl AppView {
             sidebar_w,
             sidebar_dragging: false,
             git_panel,
+            pr_store,
             right_panel,
             right_dragging: false,
             hidden_to_tray: false,
@@ -498,6 +504,7 @@ impl AppView {
                 this.sidebar_changed(cx);
             }
         }).detach();
+        cx.observe(&self.pr_store, |_, _, cx| cx.notify()).detach();
         cx.subscribe_in(&self.git_panel, window, |this, _, event, window, cx| {
             this.on_git_panel_event(event, window, cx);
         }).detach();
@@ -1180,6 +1187,11 @@ impl AppView {
             GitPanelEvent::SendToAgent { worktree, text } => {
                 self.send_to_agent(worktree, text, window, cx);
             }
+            GitPanelEvent::OpenPrTab => {
+                self.right_panel.tab = RightTab::Pr;
+                self.sync_right_worktree(cx);
+                self.sidebar_changed(cx);
+            }
             GitPanelEvent::Refreshed(worktree) | GitPanelEvent::Mutated { worktree, .. } => {
                 if let GitPanelEvent::Mutated { branch_switched: true, .. } = event {
                     self.client.refresh_projects();
@@ -1590,6 +1602,7 @@ impl AppView {
             }
         }
         self.track_agents(snap, &settings::get(cx));
+        self.sync_pr_tracking(cx);
         self.update_tray(infos, cx);
         self.touch_session(infos, cx);
     }
@@ -1946,20 +1959,28 @@ impl AppView {
 
     fn render_right_panel(&self, width: f32, lang: i18n::Language, cx: &Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
-        let pane = match self.right_panel.tab {
-            RightTab::Git => self.git_panel.clone().into_any_element(),
-        };
-        let tabs = RightTab::ALL.iter().map(|&tab| {
+        let pr_visible = self.pr_tab_visible(cx);
+        let active_tab = self.right_panel.tab.effective(pr_visible);
+        let glyph = self.ws.selected.path().and_then(|path| self.pr_store.read(cx).glyph_for(path));
+        // Both tabs are views of the same panel entity (it needs the status for either).
+        let pane = self.git_panel.clone().into_any_element();
+        let tabs = RightTab::ALL.iter().copied().filter(|&tab| tab == RightTab::Git || pr_visible).map(|tab| {
             let (id, icon, label) = match tab {
                 RightTab::Git => ("right-tab-git", Ic::GitBranch, Tr::Git),
+                RightTab::Pr => ("right-tab-pr", Ic::GitPullRequest, Tr::PrTabLabel),
             };
-            let active = self.right_panel.tab == tab;
-            h_flex().id(id).h_full().px_3().gap_1().cursor_pointer().border_b_2()
+            let active = active_tab == tab;
+            let dot = glyph
+                .as_ref()
+                .filter(|_| tab == RightTab::Pr)
+                .map(|glyph| div().flex_shrink_0().size(px(6.)).rounded_full().bg(tone_color(glyph.tone, theme)));
+            h_flex().id(id).h_full().px_3().gap_1().items_center().cursor_pointer().border_b_2()
                 .border_color(if active { theme.primary } else { theme.primary.opacity(0.) })
                 .bg(if active { theme.sidebar } else { theme.tab_bar })
                 .text_size(px(12.5))
                 .child(Icon::new(icon).size(px(14.)))
                 .child(tr(lang, label))
+                .children(dot)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.right_panel.tab != tab {
                         this.right_panel.tab = tab;
@@ -2162,9 +2183,53 @@ impl AppView {
     }
 
     fn sync_right_worktree(&self, cx: &mut Context<Self>) {
-        let visible = self.right_panel.open && self.right_panel.tab == RightTab::Git && !self.hidden_to_tray;
+        // Both tabs are views of the same panel: it follows the selection while the panel is open.
+        let visible = self.right_panel.open && !self.hidden_to_tray;
         let path = if visible { self.ws.selected.path() } else { None };
-        self.git_panel.update(cx, |panel, cx| panel.select(path, cx));
+        let tab = self.effective_right_tab(cx);
+        self.git_panel.update(cx, |panel, cx| {
+            panel.set_pane(tab, cx);
+            panel.select(path, cx);
+        });
+    }
+
+    /// The "Pull request" tab exists only while the PR section of the selected worktree does.
+    fn pr_tab_visible(&self, cx: &gpui_kit::App) -> bool {
+        self.pr_store.read(cx).section_visible_for(self.ws.selected.path())
+    }
+
+    fn effective_right_tab(&self, cx: &gpui_kit::App) -> RightTab {
+        self.right_panel.tab.effective(self.pr_tab_visible(cx))
+    }
+
+    /// Feeds the PR store the worktrees to keep up to date (the selected one plus every sidebar
+    /// row) and keeps the right panel on a tab that exists. Cheap: the store ignores no-op updates.
+    fn sync_pr_tracking(&mut self, cx: &mut Context<Self>) {
+        let prefs = settings::get(cx);
+        let selected = self.ws.selected.path().map(std::path::Path::to_path_buf);
+        let rows = tracked_worktrees(
+            &self.projects,
+            &self.groups,
+            &self.collapsed,
+            &self.collapsed_groups,
+            &self.worktree_visibility,
+            prefs.show_external_worktrees,
+            self.ws.selected.path(),
+        );
+        // Only "hidden to the tray" is detectable; a merely minimized window keeps polling.
+        let active = !self.hidden_to_tray;
+        self.pr_store.update(cx, |store, cx| store.set_tracking(selected, rows, prefs.github_prs, active, cx));
+        let tab = self.effective_right_tab(cx);
+        self.git_panel.update(cx, |panel, cx| panel.set_pane(tab, cx));
+    }
+
+    /// Glyph click in the sidebar: select the worktree and show its "Pull request" tab.
+    pub(crate) fn open_pr_tab(&mut self, key: WorkspaceKey, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_workspace(key, window, cx);
+        self.right_panel.open = true;
+        self.right_panel.tab = RightTab::Pr;
+        self.sync_right_worktree(cx);
+        self.sidebar_changed(cx);
     }
 
     pub(crate) fn toggle_right_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {

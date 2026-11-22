@@ -1,202 +1,17 @@
-//! Pull request state for the Git tab. Everything goes through the user's own `gh` CLI
-//! (`sich_git::forge`); Sich never reads or stores GitHub credentials.
+//! Pull request logic of the Git panel that depends on the panel's own state (status, commit
+//! counts, unpushed commits) plus thin wrappers around the shared `PrStore`. The state, the refresh
+//! policy and the `gh` work live in `crate::pr_store`.
 //!
-//! The pure pieces (visibility, refresh policy, chips, merge blockers) are separate functions so
-//! they are unit-tested; the `impl GitPanel` part only schedules background work and applies
-//! generation-checked results.
+//! The pure pieces (chips, merge blockers, unpushed rules, create-button logic, compact row) are
+//! separate functions so they are unit-tested.
 
-use std::time::{Duration, Instant};
-
-use sich_git::forge::{
-    CheckState, FailedJob, ForgeError, GhExec, GitHub, LOG_TAIL_BYTES, LOG_TAIL_LINES, MergeMethod,
-    MergeState, Mergeable, PrState, PullRequest, RemoteRepo, ReviewDecision, agent_prompt, agent_prompt_line, log_tail,
-    write_report,
-};
+use gpui_kit::App;
+use sich_git::forge::{CheckState, MergeMethod, MergeState, Mergeable, PrState, PullRequest, ReviewDecision};
 
 use super::*;
 use crate::i18n::Tr;
-use crate::settings::{self, PrMergeMethod};
-
-/// Minimum time between two `gh` fetches caused by anything but one of our own actions.
-pub(super) const COOLDOWN: Duration = Duration::from_secs(10);
-/// Polling interval for an open PR whose checks are still running.
-pub(super) const POLL_PENDING: Duration = Duration::from_secs(60);
-/// Polling interval for everything else that can still change.
-pub(super) const POLL_IDLE: Duration = Duration::from_secs(300);
-/// How often the panel timer re-evaluates the refresh policy.
-const TICK: Duration = Duration::from_secs(5);
-
-/// Where pull requests of a worktree live: the push remote, its GitHub repository and the
-/// branch pull requests normally target.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PrTarget {
-    pub remote: String,
-    pub repo: RemoteRepo,
-    pub base: Option<String>,
-}
-
-impl PrTarget {
-    /// `<remote>/<base>`, the ref commits are counted against.
-    pub(super) fn base_ref(&self) -> Option<String> {
-        self.base.as_ref().map(|base| format!("{}/{base}", self.remote))
-    }
-}
-
-/// What a PR fetch depends on. When it changes after a status refresh, something moved the
-/// branch (an agent pushed, ran `gh pr create`, switched branch...).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PrKey {
-    pub branch: String,
-    pub upstream: Option<String>,
-    pub ahead: u32,
-    pub head_oid: Option<String>,
-}
-
-/// `None` on a detached HEAD: pull requests need a branch.
-pub(super) fn pr_key(status: &RepoStatus) -> Option<PrKey> {
-    Some(PrKey {
-        branch: status.branch.clone()?,
-        upstream: status.upstream.clone(),
-        ahead: status.ahead,
-        head_oid: status.head_oid.clone(),
-    })
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) enum PrView {
-    /// Not a GitHub repository, no remote, or nothing to show yet.
-    #[default]
-    Hidden,
-    Loading,
-    GhMissing,
-    NotAuthenticated,
-    Error(String),
-    NoPr,
-    Pr(Box<PullRequest>),
-}
-
-impl PrView {
-    pub(super) fn pr(&self) -> Option<&PullRequest> {
-        match self {
-            Self::Pr(pr) => Some(pr),
-            _ => None,
-        }
-    }
-}
-
-/// Maps the result of `gh pr view` to what the section shows.
-pub(super) fn view_from_result(result: Result<Option<PullRequest>, ForgeError>) -> PrView {
-    match result {
-        Ok(Some(pr)) => PrView::Pr(Box::new(pr)),
-        Ok(None) => PrView::NoPr,
-        Err(ForgeError::GhMissing) => PrView::GhMissing,
-        Err(ForgeError::NotAuthenticated) => PrView::NotAuthenticated,
-        Err(ForgeError::Unsupported | ForgeError::NoBranch) => PrView::Hidden,
-        Err(error) => PrView::Error(error.to_string()),
-    }
-}
-
-/// A transient failure while refreshing keeps showing the data we already have.
-pub(super) fn merge_result(previous: &PrView, new: PrView) -> PrView {
-    match (previous, &new) {
-        (PrView::Pr(_), PrView::Error(_)) => previous.clone(),
-        _ => new,
-    }
-}
-
-pub(super) fn fetch_view<E: GhExec>(gh: &GitHub<E>, branch: &str) -> PrView {
-    view_from_result(gh.pr_for_branch(branch))
-}
-
-/// The section exists only for a branch of a GitHub repository, and not on the default branch.
-pub(super) fn section_visible(enabled: bool, branch: Option<&str>, state: Option<&PrEntry>) -> bool {
-    let (true, Some(branch), Some(state)) = (enabled, branch, state) else {
-        return false;
-    };
-    if state.view == PrView::Hidden {
-        return false;
-    }
-    state.target.as_ref().and_then(|target| target.base.as_deref()) != Some(branch)
-}
-
-// ---------------------------------------------------------------------------------------------
-// Refresh policy
-// ---------------------------------------------------------------------------------------------
-
-#[derive(Clone, Debug, Default)]
-pub(super) struct FetchState {
-    pub in_flight: bool,
-    /// An action finished while a fetch was running: fetch again afterwards.
-    pub queued: bool,
-    pub last_fetch: Option<Instant>,
-    pub last_key: Option<PrKey>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PrTrigger {
-    /// The section was first shown for this worktree (or the cache was invalidated).
-    Shown,
-    /// A status refresh saw a different branch / upstream / ahead / head.
-    Changed,
-    Periodic,
-    /// Manual refresh button.
-    Manual,
-    /// One of our own PR/push actions finished: bypasses the cooldown.
-    Action,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Decision {
-    Fetch,
-    /// Remember to fetch again as soon as the running fetch finishes.
-    Queue,
-    Skip,
-}
-
-pub(super) fn decide(trigger: PrTrigger, now: Instant, state: &FetchState) -> Decision {
-    let cooled = state
-        .last_fetch
-        .is_none_or(|last| now.saturating_duration_since(last) >= COOLDOWN);
-    let wanted = trigger == PrTrigger::Action || cooled;
-    if !wanted {
-        Decision::Skip
-    } else if state.in_flight {
-        if trigger == PrTrigger::Action { Decision::Queue } else { Decision::Skip }
-    } else {
-        Decision::Fetch
-    }
-}
-
-/// How often a PR in this state is re-read in the background; `None` = never.
-pub(super) fn poll_interval(view: &PrView) -> Option<Duration> {
-    match view {
-        PrView::Hidden | PrView::Loading => None,
-        PrView::Pr(pr) => match pr.state {
-            PrState::Merged | PrState::Closed => None,
-            PrState::Open | PrState::Draft => {
-                if pr.summary().pending > 0 { Some(POLL_PENDING) } else { Some(POLL_IDLE) }
-            }
-        },
-        PrView::GhMissing | PrView::NotAuthenticated | PrView::Error(_) | PrView::NoPr => Some(POLL_IDLE),
-    }
-}
-
-/// Which trigger (if any) applies to a status refresh or timer tick.
-pub(super) fn sync_trigger(
-    now: Instant,
-    state: &FetchState,
-    key: &PrKey,
-    view: &PrView,
-) -> Option<PrTrigger> {
-    let Some(last) = state.last_fetch else {
-        return Some(PrTrigger::Shown);
-    };
-    if state.last_key.as_ref() != Some(key) {
-        return Some(PrTrigger::Changed);
-    }
-    let interval = poll_interval(view)?;
-    (now.saturating_duration_since(last) >= interval).then_some(PrTrigger::Periodic)
-}
+use crate::pr_store::{Glyph, PrAction, PrEntry, PrView, Tone, glyph_of_pr, pr_key};
+use crate::settings::PrMergeMethod;
 
 // ---------------------------------------------------------------------------------------------
 // Derived UI state
@@ -268,14 +83,6 @@ pub(super) fn create_button(status: &RepoStatus, divergence: Option<(u32, u32)>)
     CreateButton { block, ahead: divergence.map(|(ahead, _)| ahead), will_push: needs_push(status) }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Tone {
-    Success,
-    Warning,
-    Danger,
-    Muted,
-    Merged,
-}
 
 pub(super) fn state_pill(state: PrState) -> (Tr, Tone) {
     match state {
@@ -489,448 +296,124 @@ pub(super) fn should_overwrite(current: &str, last_prefill: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Background work
+// Compact row of the Git tab
 // ---------------------------------------------------------------------------------------------
 
-/// Finds the push remote and its GitHub repository (git only, no network).
-pub(super) fn resolve_target(repo: &Repo) -> Option<PrTarget> {
-    let remote = repo.push_remote().ok().flatten()?;
-    let remote_repo = repo.remote_repo().ok().flatten().filter(RemoteRepo::is_github)?;
-    let base = repo.default_base(&remote).ok().flatten();
-    Some(PrTarget { remote, repo: remote_repo, base })
-}
-
-pub(super) struct Fetched {
-    pub view: PrView,
-    pub divergence: Option<(u32, u32)>,
-}
-
-pub(super) fn divergence(repo: &Repo, target: &PrTarget) -> Option<(u32, u32)> {
-    repo.base_divergence(&target.base_ref()?).ok()
-}
-
-pub(super) fn fetch_pr(repo: &Repo, target: &PrTarget, branch: &str) -> Fetched {
-    let divergence = divergence(repo, target);
-    let view = if target.base.as_deref() == Some(branch) {
-        PrView::NoPr
-    } else {
-        let gh = GitHub::new(repo.root().to_path_buf(), target.repo.clone());
-        fetch_view(&gh, branch)
-    };
-    Fetched { view, divergence }
-}
-
+/// What the one-line pull request summary under the branch header shows.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum PrAction {
-    Merge(MergeMethod),
-    Ready(bool),
-    Close,
-    Reopen,
-    Rerun(Vec<u64>),
+pub(super) struct CompactRow {
+    pub glyph: Glyph,
+    /// `#123`.
+    pub number: String,
+    pub title: String,
+    /// Checks mini-chip, only while the PR is open and has checks worth showing.
+    pub checks: Option<Chip>,
 }
 
-fn run_action(repo: &Repo, target: &PrTarget, pr: &PullRequest, action: PrAction) -> Result<(), ForgeError> {
-    let gh = GitHub::new(repo.root().to_path_buf(), target.repo.clone());
-    match action {
-        PrAction::Merge(method) => {
-            gh.merge_pr(pr.number, method, &pr.head_oid)?;
-            // Bring the merge result (and pruned branch) into the local remote-tracking refs.
-            let _ = repo.fetch();
-            Ok(())
-        }
-        PrAction::Ready(ready) => gh.set_ready(pr.number, ready),
-        PrAction::Close => gh.close_pr(pr.number),
-        PrAction::Reopen => gh.reopen_pr(pr.number),
-        PrAction::Rerun(ids) => gh.rerun_failed(&ids),
+pub(super) fn compact_row(pr: &PullRequest) -> CompactRow {
+    CompactRow {
+        glyph: glyph_of_pr(pr),
+        number: format!("#{}", pr.number),
+        title: pr.title.clone(),
+        checks: if pr.is_open() { checks_chip(pr) } else { None },
     }
 }
 
-/// Builds the agent prompt for `jobs`, fetching each job's failed-step log through `gh`.
-/// A log that cannot be fetched (no job id, gh error, empty output) becomes "(log not available)".
-pub(super) fn build_agent_prompt<E: GhExec>(
-    gh: &GitHub<E>,
-    pr: &PullRequest,
-    jobs: Vec<FailedJob>,
-) -> String {
-    let failures: Vec<(FailedJob, Option<String>)> = jobs
-        .into_iter()
-        .map(|job| {
-            let tail = job
-                .job_id
-                .and_then(|id| gh.failed_job_log(id).ok())
-                .map(|raw| log_tail(&raw, LOG_TAIL_LINES, LOG_TAIL_BYTES))
-                .filter(|tail| !tail.is_empty());
-            (job, tail)
-        })
-        .collect();
-    agent_prompt(pr, &failures)
+/// What the Git tab shows for the pull request section.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum GitTabPr {
+    /// Nothing: the section is hidden, or the state (loading, no `gh`, not signed in, error) is
+    /// only shown in the "Pull request" tab.
+    Nothing,
+    /// "Create pull request" row.
+    Create,
+    Compact(Box<CompactRow>),
 }
 
-/// Builds the full report, writes it to `<reports_dir>/pr-<number>-<unix_ms>.md` and returns the
-/// single line to paste into the agent terminal. Never contains a line break.
-pub(super) fn prepare_agent_line<E: GhExec>(
-    gh: &GitHub<E>,
-    pr: &PullRequest,
-    jobs: Vec<FailedJob>,
-    reports_dir: &Path,
-    unix_ms: u128,
-) -> Result<String, String> {
-    let names: Vec<String> = jobs.iter().map(|job| job.name.clone()).collect();
-    let report = build_agent_prompt(gh, pr, jobs);
-    let path = write_report(reports_dir, pr.number, unix_ms, &report)
-        .map_err(|err| format!("Could not write the report to {}: {err}", reports_dir.display()))?;
-    Ok(agent_prompt_line(pr, &names, &path))
-}
-
-/// `<sich data dir>/sich/agent-prompts`, honoring `SICH_DATA_DIR`.
-fn agent_prompts_dir() -> Option<PathBuf> {
-    sich_daemon::data_local_dir().map(|dir| dir.join("sich").join("agent-prompts"))
-}
-
-// ---------------------------------------------------------------------------------------------
-// Panel state and driver
-// ---------------------------------------------------------------------------------------------
-
-/// Per-worktree pull request state, cached by worktree path.
-#[derive(Default)]
-pub(super) struct PrEntry {
-    pub target: Option<PrTarget>,
-    pub resolved_branch: Option<String>,
-    pub resolving: bool,
-    pub view: PrView,
-    pub fetch: FetchState,
-    pub divergence: Option<(u32, u32)>,
-    pub div_in_flight: bool,
-    pub checks_open: bool,
-    pub busy: bool,
-    pub action_error: Option<String>,
-}
-
-impl PrEntry {
-    /// Results of work started under an older selection are dropped, so forget that it runs.
-    fn reset_in_flight(&mut self) {
-        self.fetch.in_flight = false;
-        self.fetch.queued = false;
-        self.resolving = false;
-        self.div_in_flight = false;
-        self.busy = false;
+pub(super) fn git_tab_pr(visible: bool, view: &PrView) -> GitTabPr {
+    if !visible {
+        return GitTabPr::Nothing;
+    }
+    match view {
+        PrView::NoPr => GitTabPr::Create,
+        PrView::Pr(pr) => GitTabPr::Compact(Box::new(compact_row(pr))),
+        _ => GitTabPr::Nothing,
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Panel wrappers around the store
+// ---------------------------------------------------------------------------------------------
 
 impl GitPanel {
-    pub(super) fn pr_state(&self) -> Option<&PrEntry> {
-        self.worktree.as_ref().and_then(|path| self.pr.get(path))
+    /// A snapshot of the selected worktree's PR state.
+    pub(super) fn pr_state(&self, cx: &App) -> Option<PrEntry> {
+        let path = self.worktree.as_deref()?;
+        self.store.read(cx).entry(path).cloned()
     }
 
-    pub(super) fn pr_reset_in_flight(&mut self) {
-        self.pr.values_mut().for_each(PrEntry::reset_in_flight);
+    pub(super) fn pr_fetching(&self, cx: &App) -> bool {
+        self.worktree.as_deref().is_some_and(|path| self.store.read(cx).fetching(path))
     }
 
-    pub(super) fn pr_fetching(&self) -> bool {
-        self.pr_state().is_some_and(|state| state.fetch.in_flight || state.resolving)
-    }
-
-    /// Timer owned by the panel; it ends with the selection (generation).
-    pub(super) fn start_pr_timer(&mut self, cx: &mut Context<Self>) {
-        let generation = self.generation;
-        self.pr_task = Some(cx.spawn(async move |panel, cx| {
-            loop {
-                cx.background_executor().timer(TICK).await;
-                let alive = panel.update(cx, |panel, cx| {
-                    if panel.generation != generation {
-                        return false;
-                    }
-                    panel.pr_sync(false, cx);
-                    true
-                });
-                if !matches!(alive, Ok(true)) {
-                    break;
-                }
-            }
-        }));
-    }
-
-    /// Called after every status refresh (`from_status`) and by the timer.
-    pub(super) fn pr_sync(&mut self, from_status: bool, cx: &mut Context<Self>) {
-        if !settings::get(cx).github_prs {
-            return;
-        }
+    /// Called after every status refresh: tells the store the branch/upstream/head the PR depends on.
+    pub(super) fn pr_sync_status(&mut self, cx: &mut Context<Self>) {
         let (Some(path), Some(status)) = (self.worktree.clone(), self.status.as_ref()) else {
             return;
         };
-        let Some(key) = pr_key(status) else { return };
-        let state = self.pr.entry(path).or_default();
-        if state.resolved_branch.as_deref() != Some(key.branch.as_str()) {
-            if !state.resolving {
-                self.pr_resolve(PrTrigger::Shown, false, cx);
-            }
-            return;
-        }
-        if state.target.is_none() {
-            return;
-        }
-        let trigger = sync_trigger(Instant::now(), &state.fetch, &key, &state.view);
-        let wants_divergence = from_status && state.view == PrView::NoPr && !state.div_in_flight;
-        if wants_divergence {
-            self.pr_refresh_divergence(cx);
-        }
-        if let Some(trigger) = trigger {
-            self.pr_request(trigger, cx);
-        }
+        let key = pr_key(status);
+        self.store.update(cx, |store, cx| store.report_status(&path, key, cx));
     }
 
     /// Manual refresh: re-resolve the remote, then fetch (the 10 s cooldown still applies).
     pub(super) fn pr_manual(&mut self, cx: &mut Context<Self>) {
-        if settings::get(cx).github_prs {
-            self.pr_resolve(PrTrigger::Manual, true, cx);
+        if let Some(path) = self.worktree.clone() {
+            self.store
+                .update(cx, |store, cx| store.refresh(&path, crate::pr_store::PrTrigger::Manual, cx));
         }
     }
 
     /// Explicit refresh from a menu, bypassing the cooldown.
     pub(super) fn pr_refresh_now(&mut self, cx: &mut Context<Self>) {
-        if settings::get(cx).github_prs {
-            self.pr_resolve(PrTrigger::Action, true, cx);
+        if let Some(path) = self.worktree.clone() {
+            self.store
+                .update(cx, |store, cx| store.refresh(&path, crate::pr_store::PrTrigger::Action, cx));
         }
     }
 
-    fn pr_resolve(&mut self, then: PrTrigger, keep_view: bool, cx: &mut Context<Self>) {
-        let (Some(path), Some(repo), Some(branch)) = (
-            self.worktree.clone(),
-            self.repo.clone(),
-            self.status.as_ref().and_then(|status| status.branch.clone()),
-        ) else {
-            return;
-        };
-        let state = self.pr.entry(path.clone()).or_default();
-        if state.resolving {
-            return;
-        }
-        state.resolving = true;
-        let generation = self.generation;
-        let job = cx.background_spawn(async move { resolve_target(&repo) });
-        cx.spawn(async move |panel, cx| {
-            let target = job.await;
-            let _ = panel.update(cx, |panel, cx| {
-                panel.generation.apply(generation, || {
-                    panel.pr_resolved(path, branch, target, then, keep_view, cx)
-                });
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    fn pr_resolved(
-        &mut self,
-        path: PathBuf,
-        branch: String,
-        target: Option<PrTarget>,
-        then: PrTrigger,
-        keep_view: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let state = self.pr.entry(path).or_default();
-        state.resolving = false;
-        let same_branch = state.resolved_branch.as_deref() == Some(branch.as_str());
-        state.resolved_branch = Some(branch);
-        state.target = target;
-        if state.target.is_none() {
-            state.view = PrView::Hidden;
-            state.divergence = None;
-        } else if !(same_branch && keep_view) {
-            state.view = PrView::Loading;
-            state.divergence = None;
-            state.fetch = FetchState::default();
-            state.checks_open = false;
-            state.action_error = None;
-        }
-        let found = state.target.is_some();
-        cx.notify();
-        if found {
-            self.pr_request(then, cx);
-        }
-    }
-
-    pub(super) fn pr_request(&mut self, trigger: PrTrigger, cx: &mut Context<Self>) {
-        let (Some(path), Some(repo), Some(status)) =
-            (self.worktree.clone(), self.repo.clone(), self.status.as_ref())
-        else {
-            return;
-        };
-        let Some(key) = pr_key(status) else { return };
-        let Some(state) = self.pr.get_mut(&path) else { return };
-        let Some(target) = state.target.clone() else { return };
-        match decide(trigger, Instant::now(), &state.fetch) {
-            Decision::Skip => return,
-            Decision::Queue => {
-                state.fetch.queued = true;
-                return;
-            }
-            Decision::Fetch => {}
-        }
-        state.fetch.in_flight = true;
-        state.fetch.last_key = Some(key.clone());
-        let generation = self.generation;
-        let branch = key.branch;
-        let job = cx.background_spawn(async move { fetch_pr(&repo, &target, &branch) });
-        cx.spawn(async move |panel, cx| {
-            let fetched = job.await;
-            let _ = panel.update(cx, |panel, cx| {
-                panel.generation.apply(generation, || panel.pr_fetched(path, fetched, cx));
-            });
-        })
-        .detach();
-        cx.notify();
-    }
-
-    fn pr_fetched(&mut self, path: PathBuf, fetched: Fetched, cx: &mut Context<Self>) {
-        let Some(state) = self.pr.get_mut(&path) else { return };
-        state.fetch.in_flight = false;
-        state.fetch.last_fetch = Some(Instant::now());
-        state.view = merge_result(&state.view, fetched.view);
-        state.divergence = fetched.divergence;
-        let queued = std::mem::take(&mut state.fetch.queued);
-        cx.notify();
-        if queued {
-            self.pr_request(PrTrigger::Action, cx);
-        }
-    }
-
-    /// Commit counts against the base are cheap git calls, refreshed together with status.
-    fn pr_refresh_divergence(&mut self, cx: &mut Context<Self>) {
-        let (Some(path), Some(repo)) = (self.worktree.clone(), self.repo.clone()) else {
-            return;
-        };
-        let Some(state) = self.pr.get_mut(&path) else { return };
-        let Some(target) = state.target.clone() else { return };
-        state.div_in_flight = true;
-        let generation = self.generation;
-        let job = cx.background_spawn(async move { divergence(&repo, &target) });
-        cx.spawn(async move |panel, cx| {
-            let counts = job.await;
-            let _ = panel.update(cx, |panel, cx| {
-                panel.generation.apply(generation, || {
-                    if let Some(state) = panel.pr.get_mut(&path) {
-                        state.div_in_flight = false;
-                        if state.divergence != counts {
-                            state.divergence = counts;
-                            cx.notify();
-                        }
-                    }
-                });
-            });
-        })
-        .detach();
-    }
-
-    pub(super) fn pr_toggle_checks(&mut self, cx: &mut Context<Self>) {
-        if let Some(state) = self.worktree.clone().and_then(|path| self.pr.get_mut(&path)) {
-            state.checks_open = !state.checks_open;
-            cx.notify();
+    /// One of our own actions (push, amend, ...) finished: fetch again now.
+    pub(super) fn pr_request_action(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.worktree.clone() {
+            self.store.update(cx, |store, cx| store.request_action_refresh(&path, cx));
         }
     }
 
     pub(super) fn pr_dismiss_error(&mut self, cx: &mut Context<Self>) {
-        if let Some(state) = self.worktree.clone().and_then(|path| self.pr.get_mut(&path)) {
-            state.action_error = None;
-            cx.notify();
+        if let Some(path) = self.worktree.clone() {
+            self.store.update(cx, |store, cx| store.dismiss_error(&path, cx));
         }
     }
 
     pub(super) fn pr_run_action(&mut self, action: PrAction, cx: &mut Context<Self>) {
-        let (Some(path), Some(repo)) = (self.worktree.clone(), self.repo.clone()) else {
-            return;
-        };
-        let Some(state) = self.pr.get_mut(&path) else { return };
-        let (Some(target), Some(pr)) = (state.target.clone(), state.view.pr().cloned()) else {
-            return;
-        };
-        if state.busy {
-            return;
+        if let Some(path) = self.worktree.clone() {
+            self.store.update(cx, |store, cx| store.run_action(&path, action, cx));
         }
-        state.busy = true;
-        state.action_error = None;
-        let merged = matches!(action, PrAction::Merge(_));
-        let generation = self.generation;
-        let job = cx.background_spawn(async move { run_action(&repo, &target, &pr, action) });
-        cx.spawn(async move |panel, cx| {
-            let result = job.await;
-            let _ = panel.update(cx, |panel, cx| {
-                if let Some(state) = panel.pr.get_mut(&path) {
-                    state.busy = false;
-                    state.action_error = result.err().map(|error| error.to_string());
-                    // Whoever shows this worktree next must not trust the cached PR.
-                    state.fetch.last_fetch = None;
-                }
-                panel.generation.apply(generation, || {
-                    panel.pr_request(PrTrigger::Action, cx);
-                    if merged {
-                        panel.request_refresh(true);
-                    }
-                    cx.notify();
-                });
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
-    /// Fetches the failed-step logs of `jobs` in the background, builds the prompt and emits
-    /// `GitPanelEvent::SendToAgent`. The app pastes it into an agent terminal without Enter.
-    pub(super) fn pr_send_to_agent(&mut self, jobs: Vec<FailedJob>, cx: &mut Context<Self>) {
-        let (Some(path), Some(repo)) = (self.worktree.clone(), self.repo.clone()) else {
-            return;
-        };
-        let Some(state) = self.pr.get_mut(&path) else { return };
-        let (Some(target), Some(pr)) = (state.target.clone(), state.view.pr().cloned()) else {
-            return;
-        };
-        if state.busy || jobs.is_empty() {
-            return;
+    pub(super) fn pr_send_to_agent(&mut self, jobs: Vec<sich_git::forge::FailedJob>, cx: &mut Context<Self>) {
+        if let Some(path) = self.worktree.clone() {
+            self.store.update(cx, |store, cx| store.send_to_agent(&path, jobs, cx));
         }
-        state.busy = true;
-        state.action_error = None;
-        let generation = self.generation;
-        let job = cx.background_spawn(async move {
-            let gh = GitHub::new(repo.root().to_path_buf(), target.repo.clone());
-            let dir = agent_prompts_dir().ok_or_else(|| "No local data directory for the report".to_owned())?;
-            let unix_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis());
-            prepare_agent_line(&gh, &pr, jobs, &dir, unix_ms)
-        });
-        cx.spawn(async move |panel, cx| {
-            let result = job.await;
-            let _ = panel.update(cx, |panel, cx| {
-                if let Some(state) = panel.pr.get_mut(&path) {
-                    state.busy = false;
-                }
-                panel.generation.apply(generation, || match result {
-                    Ok(text) => cx.emit(GitPanelEvent::SendToAgent { worktree: path, text }),
-                    Err(message) => panel.pr_report_error(&path, message, cx),
-                });
-                cx.notify();
-            });
-        })
-        .detach();
-        cx.notify();
     }
 
     /// Shows an error in the PR section of `path` (used when the app cannot deliver a prompt).
     pub(crate) fn pr_report_error(&mut self, path: &Path, message: String, cx: &mut Context<Self>) {
-        self.pr.entry(path.to_path_buf()).or_default().action_error = Some(message);
-        cx.notify();
+        self.store.update(cx, |store, cx| store.report_error(path, message, cx));
     }
 
     /// A pull request was created from the dialog (or already existed).
     pub(super) fn pr_created(&mut self, path: &Path, created: sich_git::forge::CreatedPr, cx: &mut Context<Self>) {
-        if let Some(state) = self.pr.get_mut(path) {
-            if let sich_git::forge::CreatedPr::Existing(pr) = created {
-                state.view = PrView::Pr(Box::new(pr));
-            }
-            state.action_error = None;
-        }
-        self.pr_request(PrTrigger::Action, cx);
+        self.store.update(cx, |store, cx| store.created(path, created, cx));
         self.request_refresh(true);
         cx.notify();
     }
@@ -942,7 +425,7 @@ impl GitPanel {
         else {
             return;
         };
-        let Some(target) = self.pr.get(&path).and_then(|state| state.target.clone()) else {
+        let Some(target) = self.store.read(cx).entry(&path).and_then(|state| state.target.clone()) else {
             return;
         };
         let Some(branch) = status.branch.clone() else { return };
@@ -964,32 +447,8 @@ impl GitPanel {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
-    use sich_git::forge::{Check, GhOutput};
-
     use super::*;
-
-    fn pr(state: PrState) -> PullRequest {
-        PullRequest {
-            number: 7,
-            title: "Add thing".into(),
-            url: "https://github.com/o/r/pull/7".into(),
-            state,
-            mergeable: Mergeable::Mergeable,
-            merge_state: MergeState::Clean,
-            review: None,
-            base: "main".into(),
-            head: "feat".into(),
-            head_oid: "abc".into(),
-            checks: Vec::new(),
-            updated_at: String::new(),
-        }
-    }
-
-    fn check(state: CheckState) -> Check {
-        Check { name: "ci".into(), workflow: None, state, url: None }
-    }
+    use crate::pr_store::testutil::{check, pr};
 
     fn status(branch: Option<&str>) -> RepoStatus {
         RepoStatus {
@@ -1000,226 +459,47 @@ mod tests {
         }
     }
 
-    fn state_with(view: PrView, base: Option<&str>) -> PrEntry {
-        PrEntry {
-            target: Some(PrTarget {
-                remote: "origin".into(),
-                repo: RemoteRepo { host: "github.com".into(), owner: "o".into(), name: "r".into() },
-                base: base.map(str::to_owned),
-            }),
-            view,
-            ..PrEntry::default()
+    #[test]
+    fn compact_row_shows_number_title_glyph_and_the_checks_chip() {
+        let mut p = pr(PrState::Open);
+        p.checks = vec![check(CheckState::Success), check(CheckState::Failure)];
+        let row = compact_row(&p);
+        assert_eq!(row.number, "#7");
+        assert_eq!(row.title, "Add thing");
+        assert_eq!(row.checks, Some(Chip::Checks(ChecksKind::Failing, 1)));
+        assert_eq!(row.glyph.tone, Tone::Danger);
+        p.checks.clear();
+        assert_eq!(compact_row(&p).checks, None, "no checks, no chip");
+    }
+
+    #[test]
+    fn compact_row_has_no_checks_chip_once_the_pr_is_merged_or_closed() {
+        for state in [PrState::Merged, PrState::Closed] {
+            let mut p = pr(state);
+            p.checks = vec![check(CheckState::Success)];
+            assert_eq!(compact_row(&p).checks, None, "{state:?}");
         }
+        let mut draft = pr(PrState::Draft);
+        draft.checks = vec![check(CheckState::Success)];
+        assert_eq!(compact_row(&draft).checks, Some(Chip::Checks(ChecksKind::Passed, 1)));
     }
 
     #[test]
-    fn key_needs_a_branch_and_tracks_head_upstream_and_ahead() {
-        assert!(pr_key(&status(None)).is_none());
-        let a = pr_key(&status(Some("feat"))).unwrap();
-        let mut moved = status(Some("feat"));
-        moved.ahead = 1;
-        assert_ne!(a, pr_key(&moved).unwrap());
-        let mut pushed = status(Some("feat"));
-        pushed.head_oid = Some("bbbb".into());
-        assert_ne!(a, pr_key(&pushed).unwrap());
-        let mut no_upstream = status(Some("feat"));
-        no_upstream.upstream = None;
-        assert_ne!(a, pr_key(&no_upstream).unwrap());
-        assert_eq!(a, pr_key(&status(Some("feat"))).unwrap());
-    }
-
-    #[test]
-    fn section_is_hidden_without_setting_branch_github_or_on_the_default_branch() {
-        let shown = state_with(PrView::NoPr, Some("main"));
-        assert!(section_visible(true, Some("feat"), Some(&shown)));
-        assert!(!section_visible(false, Some("feat"), Some(&shown)));
-        assert!(!section_visible(true, None, Some(&shown)));
-        assert!(!section_visible(true, Some("feat"), None));
-        assert!(!section_visible(true, Some("main"), Some(&shown)));
-        let hidden = state_with(PrView::Hidden, Some("main"));
-        assert!(!section_visible(true, Some("feat"), Some(&hidden)));
-        let unknown_base = state_with(PrView::Loading, None);
-        assert!(section_visible(true, Some("main"), Some(&unknown_base)));
-    }
-
-    #[test]
-    fn gh_results_map_to_views() {
-        assert_eq!(view_from_result(Ok(None)), PrView::NoPr);
-        assert!(matches!(view_from_result(Ok(Some(pr(PrState::Open)))), PrView::Pr(_)));
-        assert_eq!(view_from_result(Err(ForgeError::GhMissing)), PrView::GhMissing);
-        assert_eq!(view_from_result(Err(ForgeError::NotAuthenticated)), PrView::NotAuthenticated);
-        assert_eq!(view_from_result(Err(ForgeError::Unsupported)), PrView::Hidden);
-        assert_eq!(view_from_result(Err(ForgeError::NoBranch)), PrView::Hidden);
-        assert!(matches!(view_from_result(Err(ForgeError::TimedOut)), PrView::Error(text) if !text.is_empty()));
-        assert_eq!(view_from_result(Err(ForgeError::Failed("boom".into()))), PrView::Error("boom".into()));
-    }
-
-    #[test]
-    fn a_failed_refresh_keeps_the_known_pr_but_other_states_replace_it() {
-        let known = PrView::Pr(Box::new(pr(PrState::Open)));
-        assert_eq!(merge_result(&known, PrView::Error("x".into())), known);
-        assert_eq!(merge_result(&known, PrView::NoPr), PrView::NoPr);
-        assert_eq!(merge_result(&known, PrView::NotAuthenticated), PrView::NotAuthenticated);
-        assert_eq!(merge_result(&PrView::Loading, PrView::Error("x".into())), PrView::Error("x".into()));
-    }
-
-    struct Scripted(GhOutput);
-
-    impl GhExec for Scripted {
-        fn run(&self, _: &Path, _: &[String], _: Duration) -> Result<GhOutput, ForgeError> {
-            Ok(self.0.clone())
+    fn git_tab_shows_the_row_only_for_a_pr_and_create_only_without_one() {
+        let found = PrView::Pr(Box::new(pr(PrState::Open)));
+        assert!(matches!(git_tab_pr(true, &found), GitTabPr::Compact(row) if row.number == "#7"));
+        assert_eq!(git_tab_pr(true, &PrView::NoPr), GitTabPr::Create);
+        for view in [
+            PrView::Hidden,
+            PrView::Loading,
+            PrView::GhMissing,
+            PrView::NotAuthenticated,
+            PrView::Error("boom".into()),
+        ] {
+            assert_eq!(git_tab_pr(true, &view), GitTabPr::Nothing, "{view:?}");
         }
-    }
-
-    #[test]
-    fn fetch_view_classifies_gh_output() {
-        let remote = RemoteRepo { host: "github.com".into(), owner: "o".into(), name: "r".into() };
-        let run = |code, stdout: &str, stderr: &str| {
-            let output = GhOutput { code: Some(code), stdout: stdout.into(), stderr: stderr.into() };
-            fetch_view(&GitHub::with_exec(Scripted(output), ".".into(), remote.clone()), "feat")
-        };
-        assert_eq!(run(1, "", "no pull requests found for branch \"feat\""), PrView::NoPr);
-        assert!(matches!(run(1, "", "boom"), PrView::Error(_) | PrView::NotAuthenticated));
-        assert!(matches!(run(0, "not json", ""), PrView::Error(_)));
-    }
-
-    fn gh_with(code: i32, stdout: &str) -> GitHub<Scripted> {
-        let output = GhOutput { code: Some(code), stdout: stdout.into(), stderr: "no logs".into() };
-        let remote = RemoteRepo { host: "github.com".into(), owner: "o".into(), name: "r".into() };
-        GitHub::with_exec(Scripted(output), ".".into(), remote)
-    }
-
-    fn job(name: &str, job_id: Option<u64>) -> FailedJob {
-        FailedJob { name: name.into(), url: None, job_id }
-    }
-
-    #[test]
-    fn agent_prompt_includes_the_cleaned_log_tail() {
-        let gh = gh_with(0, "build\tstep\t2026-11-22T10:00:00Z error: boom\n");
-        let text = build_agent_prompt(&gh, &pr(PrState::Open), vec![job("CI / test", Some(5))]);
-        assert!(text.contains("PR #7"), "{text}");
-        assert!(text.contains("Failed check: CI / test"), "{text}");
-        assert!(text.contains("```\nerror: boom\n```"), "{text}");
-        assert!(!text.contains("(log not available)"));
-    }
-
-    #[test]
-    fn agent_prompt_falls_back_when_the_log_cannot_be_fetched() {
-        let failing = build_agent_prompt(&gh_with(1, ""), &pr(PrState::Open), vec![job("a", Some(5))]);
-        assert!(failing.contains("(log not available)"), "{failing}");
-        let no_id = build_agent_prompt(&gh_with(0, "x"), &pr(PrState::Open), vec![job("a", None)]);
-        assert!(no_id.contains("(log not available)"), "{no_id}");
-        let empty = build_agent_prompt(&gh_with(0, "\n\n"), &pr(PrState::Open), vec![job("a", Some(1))]);
-        assert!(empty.contains("(log not available)"), "{empty}");
-        let several = build_agent_prompt(
-            &gh_with(0, "j\ts\t2026-11-22T10:00:00Z line"),
-            &pr(PrState::Open),
-            vec![job("a", Some(1)), job("b", None)],
-        );
-        assert_eq!(several.matches("Failed check: ").count(), 2);
-        assert_eq!(several.matches("(log not available)").count(), 1);
-        assert!(!several.ends_with('\n'), "never ends with a newline");
-    }
-
-    #[test]
-    fn prepared_agent_line_is_single_line_and_report_goes_to_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let reports = dir.path().join("agent-prompts");
-        let gh = gh_with(0, "j\ts\t2026-11-22T10:00:00Z rm -rf /\nj\ts\t2026-11-22T10:00:00Z second\r\n");
-        let jobs = vec![job("CI / test", Some(5)), job("lint\nx", None)];
-        let line = prepare_agent_line(&gh, &pr(PrState::Open), jobs, &reports, 42).unwrap();
-        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
-        assert!(line.contains("pr-7-42.md"), "{line}");
-        let report = std::fs::read_to_string(reports.join("pr-7-42.md")).unwrap();
-        assert!(report.contains("rm -rf /\nsecond"), "{report}");
-        assert!(report.contains("Failed check: CI / test"));
-    }
-
-    #[test]
-    fn prepared_agent_line_reports_write_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let blocker = dir.path().join("file");
-        std::fs::write(&blocker, "x").unwrap();
-        let gh = gh_with(0, "x");
-        let err = prepare_agent_line(&gh, &pr(PrState::Open), vec![job("a", None)], &blocker.join("sub"), 1)
-            .unwrap_err();
-        assert!(err.contains("Could not write the report"), "{err}");
-    }
-
-    #[test]
-    fn decide_applies_cooldown_to_everything_but_actions() {
-        let now = Instant::now();
-        let mut state = FetchState::default();
-        for trigger in [PrTrigger::Shown, PrTrigger::Changed, PrTrigger::Periodic, PrTrigger::Manual, PrTrigger::Action] {
-            assert_eq!(decide(trigger, now, &state), Decision::Fetch, "{trigger:?} on a fresh state");
-        }
-        state.last_fetch = Some(now);
-        let soon = now + Duration::from_secs(3);
-        for trigger in [PrTrigger::Shown, PrTrigger::Changed, PrTrigger::Periodic, PrTrigger::Manual] {
-            assert_eq!(decide(trigger, soon, &state), Decision::Skip, "{trigger:?} inside the cooldown");
-        }
-        assert_eq!(decide(PrTrigger::Action, soon, &state), Decision::Fetch);
-        let later = now + COOLDOWN;
-        assert_eq!(decide(PrTrigger::Manual, later, &state), Decision::Fetch);
-    }
-
-    #[test]
-    fn decide_allows_one_fetch_in_flight_and_queues_actions() {
-        let now = Instant::now();
-        let state = FetchState { in_flight: true, ..FetchState::default() };
-        assert_eq!(decide(PrTrigger::Shown, now, &state), Decision::Skip);
-        assert_eq!(decide(PrTrigger::Manual, now, &state), Decision::Skip);
-        assert_eq!(decide(PrTrigger::Changed, now, &state), Decision::Skip);
-        assert_eq!(decide(PrTrigger::Action, now, &state), Decision::Queue);
-    }
-
-    #[test]
-    fn poll_interval_depends_on_pr_state() {
-        let mut pending = pr(PrState::Open);
-        pending.checks = vec![check(CheckState::Pending), check(CheckState::Success)];
-        assert_eq!(poll_interval(&PrView::Pr(Box::new(pending.clone()))), Some(POLL_PENDING));
-        pending.state = PrState::Draft;
-        assert_eq!(poll_interval(&PrView::Pr(Box::new(pending))), Some(POLL_PENDING));
-        let mut passed = pr(PrState::Open);
-        passed.checks = vec![check(CheckState::Success)];
-        assert_eq!(poll_interval(&PrView::Pr(Box::new(passed))), Some(POLL_IDLE));
-        assert_eq!(poll_interval(&PrView::Pr(Box::new(pr(PrState::Open)))), Some(POLL_IDLE));
-        assert_eq!(poll_interval(&PrView::NoPr), Some(POLL_IDLE));
-        assert_eq!(poll_interval(&PrView::Error("x".into())), Some(POLL_IDLE));
-        assert_eq!(poll_interval(&PrView::Pr(Box::new(pr(PrState::Merged)))), None);
-        assert_eq!(poll_interval(&PrView::Pr(Box::new(pr(PrState::Closed)))), None);
-        assert_eq!(poll_interval(&PrView::Hidden), None);
-        assert_eq!(poll_interval(&PrView::Loading), None);
-    }
-
-    #[test]
-    fn sync_trigger_covers_first_show_key_change_and_polling() {
-        let now = Instant::now();
-        let key = pr_key(&status(Some("feat"))).unwrap();
-        let mut state = FetchState::default();
-        assert_eq!(sync_trigger(now, &state, &key, &PrView::Loading), Some(PrTrigger::Shown));
-
-        state.last_fetch = Some(now);
-        state.last_key = Some(key.clone());
-        assert_eq!(sync_trigger(now, &state, &key, &PrView::NoPr), None);
-
-        let mut moved = key.clone();
-        moved.ahead = 2;
-        assert_eq!(sync_trigger(now, &state, &moved, &PrView::NoPr), Some(PrTrigger::Changed));
-
-        let open = PrView::Pr(Box::new(pr(PrState::Open)));
-        assert_eq!(sync_trigger(now + Duration::from_secs(299), &state, &key, &open), None);
-        assert_eq!(sync_trigger(now + POLL_IDLE, &state, &key, &open), Some(PrTrigger::Periodic));
-
-        let mut pending = pr(PrState::Open);
-        pending.checks = vec![check(CheckState::Pending)];
-        let pending = PrView::Pr(Box::new(pending));
-        assert_eq!(sync_trigger(now + POLL_PENDING, &state, &key, &pending), Some(PrTrigger::Periodic));
-
-        let merged = PrView::Pr(Box::new(pr(PrState::Merged)));
-        assert_eq!(sync_trigger(now + Duration::from_secs(86_400), &state, &key, &merged), None);
-        // A branch change still refreshes a merged PR's cache.
-        assert_eq!(sync_trigger(now, &state, &moved, &merged), Some(PrTrigger::Changed));
+        assert_eq!(git_tab_pr(false, &found), GitTabPr::Nothing);
+        assert_eq!(git_tab_pr(false, &PrView::NoPr), GitTabPr::Nothing);
     }
 
     #[test]
@@ -1422,28 +702,5 @@ mod tests {
         assert!(!should_overwrite("My own title", "Title from commits"));
         assert!(should_overwrite("  \n", "Title from commits"), "a cleared field may be refilled");
         assert!(!should_overwrite("typed", ""));
-    }
-
-    #[test]
-    fn target_base_ref_joins_remote_and_base() {
-        let state = state_with(PrView::NoPr, Some("main"));
-        assert_eq!(state.target.as_ref().unwrap().base_ref().as_deref(), Some("origin/main"));
-        let state = state_with(PrView::NoPr, None);
-        assert_eq!(state.target.as_ref().unwrap().base_ref(), None);
-    }
-
-    #[test]
-    fn reset_in_flight_clears_work_started_under_an_older_selection() {
-        let mut state = state_with(PrView::NoPr, Some("main"));
-        state.fetch.in_flight = true;
-        state.fetch.queued = true;
-        state.resolving = true;
-        state.div_in_flight = true;
-        state.busy = true;
-        state.fetch.last_fetch = Some(Instant::now());
-        state.reset_in_flight();
-        assert!(!state.fetch.in_flight && !state.fetch.queued);
-        assert!(!state.resolving && !state.div_in_flight && !state.busy);
-        assert!(state.fetch.last_fetch.is_some(), "cached data stays usable");
     }
 }

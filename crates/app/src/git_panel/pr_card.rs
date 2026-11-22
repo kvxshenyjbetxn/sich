@@ -11,29 +11,21 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, App, ClipboardItem, Div, ElementId, Hsla, InteractiveElement as _, IntoElement,
     ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div,
-    px, rgb,
+    px,
 };
 use sich_git::forge::{Check, CheckState, PrState, PullRequest};
-use super::pr::{
-    self, Chip, CreateBlock, MergeBlock, PrAction, PrEntry, PrView, Tone, chip_text, chips,
-};
+use super::pr::{self, CompactRow, CreateBlock, GitTabPr, MergeBlock, chip_text, chips, git_tab_pr};
 use super::render::{tool_button, tiny};
 use super::*;
 use crate::links;
+use crate::pr_store::{PrAction, PrEntry, PrView, Tone};
 use crate::settings::{self, PrMergeMethod};
 
 const GH_SITE: &str = "https://cli.github.com";
 const GH_LOGIN: &str = "gh auth login";
 
-fn tone_color(tone: Tone, cx: &Context<GitPanel>) -> Hsla {
-    let theme = cx.theme();
-    match tone {
-        Tone::Success => theme.green,
-        Tone::Warning => theme.yellow,
-        Tone::Danger => theme.red,
-        Tone::Muted => theme.muted_foreground,
-        Tone::Merged => rgb(0x8250df).into(),
-    }
+pub(super) fn tone_color(tone: Tone, cx: &Context<GitPanel>) -> Hsla {
+    crate::pr_store::tone_color(tone, cx.theme())
 }
 
 fn chip_el(id: impl Into<ElementId>, text: String, color: Hsla) -> Stateful<Div> {
@@ -84,23 +76,151 @@ fn check_label(check: &Check) -> String {
 
 impl GitPanel {
     pub(super) fn pr_section_visible(&self, status: &RepoStatus, cx: &Context<Self>) -> bool {
-        pr::section_visible(settings::get(cx).github_prs, status.branch.as_deref(), self.pr_state())
+        let entry = self.worktree.as_deref().and_then(|path| self.store.read(cx).entry(path));
+        crate::pr_store::section_visible(settings::get(cx).github_prs, status.branch.as_deref(), entry)
     }
 
-    pub(super) fn pr_section(
+    /// The Git tab's single pull request row under the branch header: a compact summary of the PR
+    /// (click opens the "Pull request" tab) or the "Create pull request" row. Loading, `gh` missing,
+    /// not signed in and errors are shown in the "Pull request" tab only.
+    pub(super) fn pr_git_row(
         &self,
         status: &RepoStatus,
         busy: Option<Operation>,
         lang: Language,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.pr_section_visible(status, cx) {
-            return None;
+        let state = self.pr_state(cx)?;
+        let visible = self.pr_section_visible(status, cx);
+        match git_tab_pr(visible, &state.view) {
+            GitTabPr::Nothing => None,
+            GitTabPr::Create => Some(
+                div()
+                    .flex_shrink_0()
+                    .px_2()
+                    .pb_1()
+                    .child(self.pr_create_row(status, &state, busy, lang, false, cx))
+                    .into_any_element(),
+            ),
+            GitTabPr::Compact(row) => Some(self.pr_compact_row(&row, lang, cx)),
         }
-        let state = self.pr_state()?;
+    }
+
+    fn pr_compact_row(&self, row: &CompactRow, lang: Language, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().clone();
+        let color = tone_color(row.glyph.tone, cx);
+        let tooltip: SharedString = row.glyph.tooltip(lang).into();
+        let title: SharedString = row.title.clone().into();
+        let chip = row
+            .checks
+            .as_ref()
+            .map(|chip| chip_el("pr-compact-chip", chip_text(lang, chip), tone_color(chip.tone(), cx)));
+        h_flex()
+            .id("pr-compact-row")
+            .h(px(28.))
+            .flex_shrink_0()
+            .min_w_0()
+            .px_2()
+            .gap_1()
+            .items_center()
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.list_hover))
+            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(GitPanelEvent::OpenPrTab)))
+            .child(Icon::new(row.glyph.icon.icon()).size(px(13.)).text_color(color).flex_shrink_0())
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child(row.number.clone()),
+            )
+            .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(title))
+            .children(chip)
+            .into_any_element()
+    }
+
+    /// The "Pull request" tab: everything about the PR of the selected worktree, scrollable.
+    pub(super) fn pr_tab(
+        &self,
+        status: &RepoStatus,
+        busy: Option<Operation>,
+        lang: Language,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let state = self.pr_state(cx).unwrap_or_default();
+        let branch = status.branch.clone().unwrap_or_default();
+        let header = h_flex()
+            .h(px(34.))
+            .flex_shrink_0()
+            .min_w_0()
+            .px_2()
+            .gap_1()
+            .items_center()
+            .child(Icon::new(Ic::GitBranch).size(px(14.)).flex_shrink_0())
+            .child(div().flex_1().min_w_0().truncate().text_size(px(12.5)).child(branch))
+            .child(
+                tool_button("pr-tab-refresh", Ic::RefreshCw, tr(lang, Tr::Refresh))
+                    .loading(self.refreshing || self.pr_fetching(cx))
+                    .on_click(cx.listener(|panel, _, _, cx| {
+                        panel.refresh(cx);
+                        panel.pr_manual(cx);
+                    })),
+            );
         let body = match &state.view {
-            PrView::Hidden => return None,
+            PrView::Hidden => None,
+            PrView::NoPr => Some(self.pr_create_row(status, &state, busy, lang, true, cx)),
+            PrView::Pr(pr) => Some(self.pr_card(pr, &state, status, lang, cx)),
+            other => self.pr_state_body(other, lang, cx),
+        };
+        let content = v_flex()
+            .gap_2()
+            .px_2()
+            .pb_2()
+            .children(body)
+            .children(state.action_error.as_ref().map(|error| {
+                h_flex()
+                    .items_start()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(11.))
+                            .text_color(theme.red)
+                            .line_clamp(3)
+                            .child(error.lines().take(3).collect::<Vec<_>>().join("\n")),
+                    )
+                    .child(
+                        Button::new("pr-dismiss-error")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::Close))
+                            .tooltip(tr(lang, Tr::GitDismiss))
+                            .on_click(cx.listener(|panel, _, _, cx| panel.pr_dismiss_error(cx))),
+                    )
+            }));
+        v_flex()
+            .flex_1()
+            .min_h_0()
+            .child(header)
+            .child(
+                div()
+                    .id("pr-tab-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    /// Loading, `gh` missing, not signed in and error states (and their actions).
+    fn pr_state_body(&self, view: &PrView, lang: Language, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = cx.theme().clone();
+        Some(match view {
             PrView::Loading => tiny(tr(lang, Tr::PrChecking), cx),
             PrView::GhMissing => v_flex()
                 .gap_1()
@@ -165,40 +285,8 @@ impl GitPanel {
                     )
                     .into_any_element()
             }
-            PrView::NoPr => self.pr_create_row(status, state, busy, lang, cx),
-            PrView::Pr(pr) => self.pr_card(pr, state, status, lang, cx),
-        };
-        Some(
-            v_flex()
-                .flex_shrink_0()
-                .gap_1()
-                .px_2()
-                .pb_1()
-                .child(body)
-                .children(state.action_error.as_ref().map(|error| {
-                    h_flex()
-                        .items_start()
-                        .gap_1()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .text_size(px(11.))
-                                .text_color(theme.red)
-                                .line_clamp(3)
-                                .child(error.lines().take(3).collect::<Vec<_>>().join("\n")),
-                        )
-                        .child(
-                            Button::new("pr-dismiss-error")
-                                .ghost()
-                                .xsmall()
-                                .icon(Icon::new(IconName::Close))
-                                .tooltip(tr(lang, Tr::GitDismiss))
-                                .on_click(cx.listener(|panel, _, _, cx| panel.pr_dismiss_error(cx))),
-                        )
-                }))
-                .into_any_element(),
-        )
+            PrView::Hidden | PrView::NoPr | PrView::Pr(_) => return None,
+        })
     }
 
     fn pr_create_row(
@@ -207,6 +295,7 @@ impl GitPanel {
         state: &PrEntry,
         busy: Option<Operation>,
         lang: Language,
+        stacked: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
@@ -225,29 +314,32 @@ impl GitPanel {
         if create.will_push {
             hint.push(tr(lang, Tr::PrWillPush).to_owned());
         }
-        h_flex()
-            .gap_2()
-            .items_center()
-            .child(with_reason(
-                "pr-create-wrap",
-                Button::new("pr-create")
-                    .primary()
-                    .xsmall()
-                    .label(tr(lang, Tr::PrCreate))
-                    .disabled(!create.enabled() || busy.is_some())
-                    .on_click(cx.listener(|panel, _, window, cx| panel.pr_open_dialog(window, cx))),
-                reason,
-            ))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(11.))
-                    .text_color(theme.muted_foreground)
-                    .child(hint.join(" \u{b7} ")),
-            )
-            .into_any_element()
+        let button = with_reason(
+            "pr-create-wrap",
+            Button::new("pr-create")
+                .primary()
+                .xsmall()
+                .label(tr(lang, Tr::PrCreate))
+                .disabled(!create.enabled() || busy.is_some())
+                .on_click(cx.listener(|panel, _, window, cx| panel.pr_open_dialog(window, cx))),
+            reason,
+        );
+        let hint = div()
+            .min_w_0()
+            .text_size(px(11.))
+            .text_color(theme.muted_foreground)
+            .child(hint.join(" \u{b7} "));
+        if stacked {
+            // The tab has room: let the hint wrap instead of cutting it off.
+            v_flex().gap_1().items_start().child(button).child(hint).into_any_element()
+        } else {
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(button)
+                .child(hint.flex_1().truncate())
+                .into_any_element()
+        }
     }
 
     fn pr_card(
@@ -304,33 +396,22 @@ impl GitPanel {
             )
             .children(more_head);
 
-        let chips_row = h_flex().flex_wrap().gap_1().children(chips(pr).into_iter().enumerate().map(
-            |(index, chip)| {
-                let color = tone_color(chip.tone(), cx);
-                let element = chip_el(("pr-chip", index), chip_text(lang, &chip), color);
-                if matches!(chip, Chip::Checks(..)) {
-                    element
-                        .cursor_pointer()
-                        .on_click(cx.listener(|panel, _, _, cx| panel.pr_toggle_checks(cx)))
-                } else {
-                    element
-                }
-            },
-        ));
+        let chips_row = h_flex().flex_wrap().gap_1().children(
+            chips(pr)
+                .into_iter()
+                .enumerate()
+                .map(|(index, chip)| chip_el(("pr-chip", index), chip_text(lang, &chip), tone_color(chip.tone(), cx))),
+        );
 
-        let checks = (state.checks_open && !pr.checks.is_empty()).then(|| self.pr_checks_list(pr, state, lang, cx));
+        let checks = (!pr.checks.is_empty()).then(|| self.pr_checks_list(pr, state, lang, cx));
         let actions = more_actions.map(|more| self.pr_actions(pr, state, status, more, lang, cx));
 
         v_flex()
-            .gap_1()
-            .p_2()
-            .rounded(px(6.))
-            .border_1()
-            .border_color(theme.border)
+            .gap_2()
             .child(heading)
             .child(chips_row)
-            .children(checks)
             .children(actions)
+            .children(checks)
             .into_any_element()
     }
 
@@ -375,9 +456,6 @@ impl GitPanel {
             }))
             .child(
                 v_flex()
-                    .id("pr-checks-list")
-                    .max_h(px(140.))
-                    .overflow_y_scroll()
                     .children(pr.checks.iter().enumerate().map(|(index, check)| {
                         let label: SharedString = check_label(check).into();
                         let tooltip = label.clone();
