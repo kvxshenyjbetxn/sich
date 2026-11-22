@@ -29,6 +29,7 @@ use crate::diff_view::DiffView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
+use crate::notify::{self, Cooldown, NotifyKind};
 use crate::quick_commands::{self, TemporaryCommand};
 use crate::orch_watch;
 use crate::sidebar::{DEFAULT_SIDEBAR_W, clamp_sidebar_w};
@@ -49,6 +50,7 @@ use crate::workspace::{
 use crate::workspace_tabs::{WorkspaceTab, WorkspaceTabs};
 use crate::win_flash;
 use crate::win_show;
+use crate::win_toast;
 use crate::worktree_dialogs;
 
 /// How often the sidebar is repainted while agents are present, to refresh relative times.
@@ -141,6 +143,9 @@ pub struct AppView {
     hwnd: Option<isize>,
     /// Last badge kind seen per terminal, to detect transitions into "needs the user".
     attention: HashMap<TermId, Option<BadgeKind>>,
+    toast_cooldown: Cooldown,
+    /// Toasts to clear when a terminal becomes visible.
+    unseen_toasts: HashSet<TermId>,
     /// `since_unix_ms` of the status for which `mark_seen` was already sent, per terminal.
     seen_sent: HashMap<TermId, u64>,
     events_tx: UnboundedSender<UiEvent>,
@@ -328,6 +333,8 @@ impl AppView {
             window_active: false,
             hwnd: None,
             attention: HashMap::new(),
+            toast_cooldown: Cooldown::default(),
+            unseen_toasts: HashSet::new(),
             seen_sent: HashMap::new(),
             events_tx: events.0,
             events_rx: Some(events.1),
@@ -464,10 +471,11 @@ impl AppView {
         }
         let snap = self.client.snapshot();
         self.finish_restore_targets(&snap);
-        self.track_agents(&snap);
+        let prefs = settings::get(cx);
+        self.track_agents(&snap, &prefs);
         // The window may be hidden in the tray (no renders), so keep these going from here too.
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
-        self.tick_quick_terminals(&snap, settings::get(cx).orch_auto_close_workers, sich_orch::paths::now_ms());
+        self.tick_quick_terminals(&snap, prefs.orch_auto_close_workers, sich_orch::paths::now_ms());
         self.update_tray(&infos, cx);
         self.touch_session(&infos, cx);
         cx.notify();
@@ -541,38 +549,55 @@ impl AppView {
             }
             this.window_active = active;
             let snap = this.client.snapshot();
-            this.track_agents(&snap);
+            this.track_agents(&snap, &settings::get(cx));
             cx.notify();
         })
         .detach();
     }
 
-    /// Agent status side effects: taskbar flash on a transition into "needs the user" while the
-    /// window is in the background, and `mark_seen` for the visible terminal.
-    fn track_agents(&mut self, snap: &Snapshot) {
+    /// Flash and notify on attention transitions, then mark the visible terminal seen.
+    fn track_agents(&mut self, snap: &Snapshot, prefs: &settings::AppSettings) {
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
         let ws_ids = self.workspace_ids(&infos);
         let active = if self.active_tab().is_none() { self.ws.active_in(&self.ws.selected, &ws_ids) } else { None };
+        let window_active = self.window_active && !self.hidden_to_tray;
         let mut flash = false;
+        let instant = Instant::now();
         for t in &snap.terminals {
             let id = t.info.id;
             let status = t.info.agent.as_ref();
             let now = kind_of(status);
-            // A terminal seen for the first time only seeds the state (no flash at startup).
+            // The first snapshot of a terminal only seeds its state.
             if let Some(prev) = self.attention.insert(id, now) {
                 flash |= !self.window_active && should_flash(prev, now);
+                if cfg!(windows)
+                    && let Some(kind) = notify::notify_kind(prev, now)
+                    && notify::should_notify(kind, prefs, window_active, ws_ids.contains(&id))
+                    && self.toast_cooldown.allow(id, instant)
+                {
+                    self.notify_agent(kind, &t.info, prefs);
+                    self.unseen_toasts.insert(id);
+                }
             }
-            if should_mark_seen(active == Some(id), self.window_active, status) {
+            let visible = window_active && active == Some(id);
+            let mut clear_toast = visible && self.unseen_toasts.remove(&id);
+            if should_mark_seen(active == Some(id), window_active, status) {
                 let since = status.map_or(0, |s| s.since_unix_ms);
                 if self.seen_sent.get(&id) != Some(&since) {
                     self.seen_sent.insert(id, since);
                     self.client.mark_seen(id);
+                    clear_toast = true;
                 }
             }
+            if clear_toast {
+                win_toast::remove(id);
+            }
         }
-        let alive: Vec<TermId> = infos.iter().map(|t| t.id).collect();
+        let alive: HashSet<TermId> = infos.iter().map(|t| t.id).collect();
         self.attention.retain(|id, _| alive.contains(id));
         self.seen_sent.retain(|id, _| alive.contains(id));
+        self.toast_cooldown.retain(|id| alive.contains(&id));
+        self.unseen_toasts.retain(|id| alive.contains(id));
         if flash {
             if let Some(hwnd) = self.hwnd {
                 win_flash::flash(hwnd);
@@ -580,11 +605,36 @@ impl AppView {
         }
     }
 
+    fn notify_agent(&self, kind: NotifyKind, info: &TerminalInfo, prefs: &settings::AppSettings) {
+        let project = notify::project_label(info, &self.projects);
+        let (title, body) = notify::toast_text(kind, info, &project, prefs.language);
+        let xml = notify::toast_xml(&title, &body, !prefs.notify_sound);
+        win_toast::show(&xml, Some(info.id), self.events_tx.clone());
+    }
+
+    pub(crate) fn test_notification(&self, prefs: &settings::AppSettings) {
+        let xml = notify::toast_xml(
+            tr(prefs.language, Tr::TestNotification),
+            tr(prefs.language, Tr::TestNotificationBody),
+            !prefs.notify_sound,
+        );
+        win_toast::show(&xml, None, self.events_tx.clone());
+    }
+
     // ---- tray, quit ------------------------------------------------------------------------
 
     fn on_ui_event(&mut self, ev: UiEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
             UiEvent::Show => self.show_window(cx),
+            #[cfg(windows)]
+            UiEvent::FocusTerminal(id) => {
+                let snap = self.client.snapshot();
+                if let Some(entry) = snap.terminals.iter().find(|entry| entry.info.id == id) {
+                    let key = WorkspaceKey::of(entry.info.worktree.as_deref());
+                    self.show_window(cx);
+                    self.activate_terminal_in(key, id, window, cx);
+                }
+            }
             UiEvent::Takeover if !self.restarting_daemon => {
                 match self.save_current_session() {
                     Ok(()) => self.quit_ui_only(cx),
@@ -1506,7 +1556,7 @@ impl AppView {
                 window.blur(cx);
             }
         }
-        self.track_agents(snap);
+        self.track_agents(snap, &settings::get(cx));
         self.update_tray(infos, cx);
         self.touch_session(infos, cx);
     }

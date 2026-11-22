@@ -3,14 +3,18 @@
 
 use futures::channel::mpsc::UnboundedSender;
 use sich_proto::{AgentState, TerminalInfo};
+#[cfg(windows)]
+use sich_proto::TermId;
 
 use crate::i18n::{Language, Tr, tr};
 
-/// Requests that reach the UI from the tray menu and from a second `sich` launch.
+/// Requests that reach the UI from the tray, Windows toasts, or a second `sich` launch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiEvent {
     /// Bring the window to the front.
     Show,
+    #[cfg(windows)]
+    FocusTerminal(TermId),
     Takeover,
     Restart,
     /// Quit Sich (daemon included), asking first when agents are busy.

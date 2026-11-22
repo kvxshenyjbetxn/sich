@@ -46,6 +46,9 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                             .on_click(|checked, _, cx| settings::set_show_external_worktrees(*checked, cx)),
                     )
                     .child(section(tr(lang, Tr::AgentsSection), agents_section(lang, cx), cx))
+                    .children(cfg!(windows).then(|| {
+                        section(tr(lang, Tr::Notifications), notification_controls(lang, app.clone(), &prefs), cx)
+                    }))
                     .child(
                         Switch::new("usage-limits")
                             .checked(prefs.usage_limits)
@@ -106,6 +109,46 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                     ),
             )
     });
+}
+
+fn notification_controls(lang: Language, app: Entity<AppView>, prefs: &settings::AppSettings) -> impl IntoElement {
+    let enabled = prefs.notifications_enabled;
+    v_flex()
+        .gap_2()
+        .items_start()
+        .child(
+            Switch::new("notifications-enabled")
+                .label(tr(lang, Tr::NotificationsEnabled))
+                .checked(enabled)
+                .on_click(|checked, _, cx| settings::set_notifications_enabled(*checked, cx)),
+        )
+        .child(
+            Checkbox::new("notify-agent-needs-input")
+                .label(tr(lang, Tr::NotifyAgentNeedsInput))
+                .checked(prefs.notify_agent_needs_input)
+                .disabled(!enabled)
+                .on_click(|checked, _, cx| settings::set_notify_agent_needs_input(*checked, cx)),
+        )
+        .child(
+            Checkbox::new("notify-agent-done")
+                .label(tr(lang, Tr::NotifyAgentDone))
+                .checked(prefs.notify_agent_done)
+                .disabled(!enabled)
+                .on_click(|checked, _, cx| settings::set_notify_agent_done(*checked, cx)),
+        )
+        .child(
+            Checkbox::new("notify-sound")
+                .label(tr(lang, Tr::NotifySound))
+                .checked(prefs.notify_sound)
+                .disabled(!enabled)
+                .on_click(|checked, _, cx| settings::set_notify_sound(*checked, cx)),
+        )
+        .child(
+            Button::new("test-notification")
+                .xsmall()
+                .label(tr(lang, Tr::TestNotification))
+                .on_click(move |_, _, cx| app.read(cx).test_notification(&settings::get(cx))),
+        )
 }
 
 fn update_check_row(lang: Language, app: Entity<AppView>, cx: &App) -> impl IntoElement {

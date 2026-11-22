@@ -39,6 +39,10 @@ pub struct AppSettings {
     pub orch_unattended_workers: bool,
     /// Closing the window hides it to the system tray instead of quitting.
     pub close_to_tray: bool,
+    pub notifications_enabled: bool,
+    pub notify_agent_needs_input: bool,
+    pub notify_agent_done: bool,
+    pub notify_sound: bool,
     pub resume_agents_on_restore: bool,
     /// Periodically check GitHub Releases for a newer version (official builds only).
     pub check_updates: bool,
@@ -65,6 +69,10 @@ impl Default for AppSettings {
             orchestration_skill: true,
             orch_unattended_workers: true,
             close_to_tray: true,
+            notifications_enabled: true,
+            notify_agent_needs_input: true,
+            notify_agent_done: true,
+            notify_sound: true,
             resume_agents_on_restore: true,
             check_updates: true,
             diff_mode: DiffMode::default(),
@@ -228,6 +236,39 @@ pub fn set_orch_auto_close_workers(enabled: bool, cx: &mut App) {
         s.orch_auto_close_workers = enabled;
         store(s, cx);
         cx.refresh_windows();
+    }
+}
+
+pub fn set_notifications_enabled(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.notifications_enabled != enabled {
+        s.notifications_enabled = enabled;
+        store(s, cx);
+        cx.refresh_windows();
+    }
+}
+
+pub fn set_notify_agent_needs_input(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.notify_agent_needs_input != enabled {
+        s.notify_agent_needs_input = enabled;
+        store(s, cx);
+    }
+}
+
+pub fn set_notify_agent_done(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.notify_agent_done != enabled {
+        s.notify_agent_done = enabled;
+        store(s, cx);
+    }
+}
+
+pub fn set_notify_sound(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.notify_sound != enabled {
+        s.notify_sound = enabled;
+        store(s, cx);
     }
 }
 
@@ -432,6 +473,29 @@ mod tests {
         let off = AppSettings { orch_auto_close_workers: false, ..Default::default() };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
         assert!(!back.orch_auto_close_workers);
+    }
+
+    #[test]
+    fn notification_settings_default_to_true_and_round_trip() {
+        let old: AppSettings = serde_json::from_str(r#"{"close_to_tray":false}"#).unwrap();
+        for s in [&old, &AppSettings::default()] {
+            assert!(s.notifications_enabled);
+            assert!(s.notify_agent_needs_input);
+            assert!(s.notify_agent_done);
+            assert!(s.notify_sound);
+        }
+        let off = AppSettings {
+            notifications_enabled: false,
+            notify_agent_needs_input: false,
+            notify_agent_done: false,
+            notify_sound: false,
+            ..old
+        };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.notifications_enabled);
+        assert!(!back.notify_agent_needs_input);
+        assert!(!back.notify_agent_done);
+        assert!(!back.notify_sound);
     }
 
     #[test]
