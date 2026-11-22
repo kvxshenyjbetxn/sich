@@ -1,6 +1,7 @@
 //! Configurable shell commands and the lifetime of temporary command terminals.
 
-use gpui_kit::{Context, Div, Styled as _};
+use gpui_kit::component::{ActiveTheme as _, v_flex};
+use gpui_kit::{App, Context, Div, FontWeight, ParentElement as _, SharedString, Styled as _, div};
 use serde::{Deserialize, Serialize};
 use sich_orch::auto_close::{AUTO_CLOSE_DELAY_MS, AutoClose};
 use sich_proto::TermId;
@@ -11,6 +12,7 @@ use crate::{orch_banner, settings};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuickCommand {
+    #[serde(default)]
     pub name: String,
     pub command: String,
 }
@@ -18,10 +20,43 @@ pub struct QuickCommand {
 pub fn clean(name: &str, command: &str) -> Option<QuickCommand> {
     let name = name.trim();
     let command = command.trim();
-    (!name.is_empty() && !command.is_empty()).then(|| QuickCommand {
+    (!command.is_empty()).then(|| QuickCommand {
         name: name.to_owned(),
         command: command.to_owned(),
     })
+}
+
+pub(crate) struct CommandPreview {
+    name: Option<SharedString>,
+    command: SharedString,
+}
+
+impl CommandPreview {
+    pub(crate) fn new(command: &QuickCommand) -> Self {
+        let name = command.name.trim();
+        Self {
+            name: (!name.is_empty()).then(|| first_line(name)),
+            command: first_line(&command.command),
+        }
+    }
+
+    pub(crate) fn render(&self, cx: &App) -> Div {
+        let command = div().w_full().truncate().child(self.command.clone());
+        let row = v_flex().min_w_0().py_1().text_left();
+        match &self.name {
+            Some(name) => row
+                .child(div().w_full().truncate().font_weight(FontWeight::MEDIUM).child(name.clone()))
+                .child(command.text_xs().text_color(cx.theme().muted_foreground)),
+            None => row.child(command),
+        }
+    }
+}
+
+fn first_line(value: &str) -> SharedString {
+    match value.split_once(['\r', '\n']) {
+        Some((line, _)) => format!("{line}…").into(),
+        None => value.into(),
+    }
 }
 
 pub fn requires_temporary(has_agent: bool, exited: bool) -> bool {
@@ -109,13 +144,38 @@ mod tests {
     use sich_orch::auto_close::due_for_close;
 
     #[test]
-    fn validation_trims_and_rejects_empty_fields() {
+    fn validation_trims_fields_and_rejects_empty_commands() {
         assert_eq!(clean("  Tests  ", "  cargo test  "), Some(QuickCommand {
             name: "Tests".into(),
             command: "cargo test".into(),
         }));
-        assert_eq!(clean(" ", "cargo test"), None);
         assert_eq!(clean("Tests", "\n"), None);
+    }
+
+    #[test]
+    fn unnamed_commands_can_be_saved_and_loaded_without_a_name() {
+        let saved = clean("  ", "  Write-Output hello  ").unwrap();
+        let loaded: QuickCommand =
+            serde_json::from_str(r#"{"command":"Write-Output hello"}"#).unwrap();
+        assert!(saved.name.is_empty());
+        assert_eq!(saved, loaded);
+    }
+
+    #[test]
+    fn preview_keeps_the_name_separate_and_hides_later_command_lines() {
+        let command = clean("Перевірка", "Write-Output first\r\nWrite-Output second").unwrap();
+        let preview = CommandPreview::new(&command);
+        assert_eq!(preview.name.as_deref(), Some("Перевірка"));
+        assert_eq!(preview.command.as_ref(), "Write-Output first…");
+        assert_eq!(command_input(&command.command), b"Write-Output first\r\nWrite-Output second\r");
+    }
+
+    #[test]
+    fn preview_of_an_unnamed_command_has_no_title_row() {
+        let command = clean("", "Write-Output hello").unwrap();
+        let preview = CommandPreview::new(&command);
+        assert!(preview.name.is_none());
+        assert_eq!(preview.command.as_ref(), "Write-Output hello");
     }
 
     #[test]

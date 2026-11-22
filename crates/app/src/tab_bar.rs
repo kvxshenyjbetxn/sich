@@ -19,6 +19,7 @@ use crate::daemon_client::{Snapshot, TermEntry};
 use crate::diff_view::{source_label, split_file_label};
 use crate::i18n::{self, Language, Tr, tr};
 use crate::pane_chrome::terminal_menu;
+use crate::quick_commands::CommandPreview;
 use crate::split_drag::{DragGhost, TerminalDrag};
 
 pub const TAB_BAR_H: f32 = 34.;
@@ -282,20 +283,24 @@ impl AppView {
                     Button::new("quick-commands")
                         .ghost()
                         .xsmall()
-                        .label(tr(lang, Tr::QuickCommands))
+                        .icon(Icon::new(Ic::Play))
+                        .label(tr(lang, Tr::QuickCommandCommand))
                         .tooltip(tr(lang, Tr::QuickCommands))
                         .disabled(active.is_none())
                         .dropdown_menu(move |mut menu, _, cx| {
                             let commands = crate::settings::get(cx).quick_commands;
                             for command in commands {
-                                let label = format!("{} — {}", command.name, command.command);
+                                let preview = CommandPreview::new(&command);
                                 let app = quick_app.clone();
-                                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                                    if let Some(id) = active {
-                                        let command = command.clone();
-                                        app.update(cx, |this, cx| this.run_quick_command(id, command, window, cx));
-                                    }
-                                }));
+                                menu = menu.item(
+                                    PopupMenuItem::element(move |_, cx| preview.render(cx).w(px(328.)))
+                                        .on_click(move |_, window, cx| {
+                                            if let Some(id) = active {
+                                                let command = command.clone();
+                                                app.update(cx, |this, cx| this.run_quick_command(id, command, window, cx));
+                                            }
+                                        }),
+                                );
                             }
                             menu.separator().item(
                                 PopupMenuItem::new(tr(lang, Tr::QuickCommandManage))

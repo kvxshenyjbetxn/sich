@@ -951,9 +951,9 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             En => "No commands yet. Add the first command.",
         },
         Tr::QuickCommandName => match lang {
-            Uk => "Назва",
-            Ru => "Название",
-            En => "Name",
+            Uk => "Назва (необов’язково)",
+            Ru => "Название (необязательно)",
+            En => "Name (optional)",
         },
         Tr::QuickCommandCommand => match lang {
             Uk => "Команда",

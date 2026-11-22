@@ -13,6 +13,7 @@ use gpui_kit::{
 };
 
 use crate::i18n::{Tr, tr};
+use crate::quick_commands::CommandPreview;
 use crate::{quick_commands, settings};
 
 pub(crate) fn open_manager(window: &mut Window, cx: &mut App) {
@@ -26,9 +27,10 @@ pub(crate) fn open_manager(window: &mut Window, cx: &mut App) {
             let edit = Button::new(("quick-command-edit", index))
                 .ghost()
                 .small()
+                .h_auto()
                 .flex_1()
                 .min_w_0()
-                .label(format!("{} — {}", command.name, command.command))
+                .child(CommandPreview::new(command).render(cx).flex_1())
                 .tooltip(tr(lang, Tr::QuickCommandEdit))
                 .on_click(move |_, window, cx| {
                     window.close_dialog(cx);
