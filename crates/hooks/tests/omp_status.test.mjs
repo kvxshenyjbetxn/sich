@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import extension from "../src/omp_status.js";
+import extension, { progressModel } from "../src/omp_status.js";
 
 function bind() {
     const handlers = new Map();
@@ -310,4 +310,83 @@ test("omp extension tracks root and nested runs, preserves waits, and drains shu
     seen = rows.length - 1;
     assert.equal(rows.at(-1).state, "exited", "shutdown waits for delivery");
     assert.equal((await next("exited")).session_id, "second");
+});
+
+test("progressModel derives a short model name from the progress item", () => {
+    assert.equal(progressModel({ resolvedModelIdentity: "openai-codex/gpt-6.2-sol", resolvedModel: "x/y:high" }), "gpt-6.2-sol");
+    assert.equal(progressModel({ resolvedModel: "openai-codex/gpt-6.2-sol:high" }), "gpt-6.2-sol");
+    assert.equal(progressModel({ resolvedModel: "gpt-6.2-sol:xhigh" }), "gpt-6.2-sol");
+    assert.equal(progressModel({ resolvedModel: "openai/gpt-5:custom" }), "gpt-5:custom", "unknown suffixes are kept");
+    assert.equal(progressModel({ resolvedModelIdentity: "openrouter/anthropic/claude-sonnet-4.5" }), "claude-sonnet-4.5");
+    assert.equal(progressModel({ resolvedModelIdentity: "  ", resolvedModel: "a/b:low" }), "b");
+    for (const item of [undefined, null, {}, { resolvedModelIdentity: "" }, { resolvedModel: 5 }, { resolvedModel: "p/" }]) {
+        assert.equal(progressModel(item), undefined);
+    }
+});
+
+test("omp extension reports the subagent model from progress items", async (t) => {
+    const dir = await mkdtemp(join(tmpdir(), "sich-omp-model-"));
+    const cwd = process.cwd();
+    const env = { ...process.env };
+    t.after(async () => {
+        process.chdir(cwd);
+        process.env = env;
+        await rm(dir, { recursive: true, force: true });
+    });
+    process.chdir(dir);
+    await writeFile("hook", String.raw`
+        let body = "";
+        process.stdin.setEncoding("utf8");
+        process.stdin.on("data", (chunk) => { body += chunk; });
+        process.stdin.on("end", () => require("node:fs").appendFileSync("events", body + "\n"));
+    `);
+    Object.assign(process.env, { SICH_TERM_ID: "2", SICH_SOCKET: "fixture", SICH_OMP_HOOK: process.execPath });
+    const { handlers, bus } = bind();
+    const ctx = { mode: "tui", agent: { kind: "main" }, model: { id: "model-1" }, sessionManager: { getSessionId: () => "s" } };
+    let seen = 0;
+    const events = async () => {
+        try { return (await readFile("events", "utf8")).split("\n").slice(0, -1).map(JSON.parse); } catch (e) {
+            if (e.code !== "ENOENT") throw e;
+            return [];
+        }
+    };
+    async function next() {
+        const until = Date.now() + 5000;
+        do {
+            const rows = await events();
+            if (rows.length > seen) return rows[seen++];
+            await delay(15);
+        } while (Date.now() < until);
+        assert.fail("missing snapshot");
+    }
+    handlers.get("session_start")({}, ctx);
+    await next();
+    const run = { id: "Scout", agent: "scout", sessionFile: "s/Scout.jsonl", parentToolCallId: "c1" };
+    bus.get("task:subagent:lifecycle")({ ...run, status: "started" });
+    assert.equal((await next()).subagents[0].model, undefined);
+    const progress = (item) => bus.get("task:subagent:progress")({ ...run, progress: { id: "Scout", ...item } });
+
+    progress({ description: "Look", resolvedModelIdentity: "openai-codex/gpt-6.2-sol", resolvedModel: "openai-codex/gpt-6.2-sol:high" });
+    assert.equal((await next()).subagents[0].model, "gpt-6.2-sol");
+    // Model-only change: same description and tool still publishes.
+    progress({ description: "Look", resolvedModel: "openrouter/anthropic/claude-sonnet-4.5:high" });
+    const changed = await next();
+    assert.equal(changed.subagents[0].model, "claude-sonnet-4.5");
+    assert.equal(changed.subagents[0].description, "Look");
+    // Missing or empty model fields never clear it and never crash.
+    progress({ description: "Look again", resolvedModelIdentity: "", resolvedModel: undefined });
+    const kept = await next();
+    assert.equal(kept.subagents[0].description, "Look again");
+    assert.equal(kept.subagents[0].model, "claude-sonnet-4.5");
+    // Unchanged progress publishes nothing; unknown or stale runs are ignored.
+    progress({ description: "Look again", resolvedModelIdentity: "openrouter/anthropic/claude-sonnet-4.5" });
+    bus.get("task:subagent:progress")({ ...run, id: "Ghost", progress: { id: "Ghost", resolvedModelIdentity: "p/ghost" } });
+    bus.get("task:subagent:progress")({ ...run, parentToolCallId: "old", progress: { id: "Scout", resolvedModelIdentity: "p/stale" } });
+    bus.get("task:subagent:progress")({});
+    await delay(200);
+    assert.equal((await events()).length, seen, "no extra snapshots");
+    await handlers.get("session_shutdown")({}, ctx);
+    const rows = await events();
+    assert.equal(rows.at(-1).state, "exited");
+    assert.ok(!JSON.stringify(rows).includes("ghost") && !JSON.stringify(rows).includes("stale"));
 });

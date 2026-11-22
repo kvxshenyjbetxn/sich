@@ -26,6 +26,21 @@ function activityText(content) {
     return text.toWellFormed().replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "").trim() || undefined;
 }
 
+const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+// omp 19.x reports the subagent's model on its progress item. Prefer the resolved
+// identity (provider/model); fall back to the selector minus a thinking-level suffix,
+// then keep only the model name after the last "/".
+export function progressModel(item) {
+    let model = typeof item?.resolvedModelIdentity === "string" ? item.resolvedModelIdentity.trim() : "";
+    if (!model && typeof item?.resolvedModel === "string") {
+        model = item.resolvedModel.trim();
+        const colon = model.lastIndexOf(":");
+        if (colon >= 0 && THINKING_LEVELS.has(model.slice(colon + 1))) model = model.slice(0, colon);
+    }
+    return label(model.slice(model.lastIndexOf("/") + 1));
+}
+
 export default function sichStatus(pi) {
     const { SICH_OMP_HOOK: exe, SICH_SOCKET: socket, SICH_TERM_ID: term } = process.env;
     if (!exe || !socket || !term) return;
@@ -103,9 +118,11 @@ export default function sichStatus(pi) {
                 const description = frame.description ?? run.description;
                 // Progress clears currentTool between calls; the last action is still useful.
                 const tool = frame.detail ?? run.tool;
-                if (description === run.description && tool === run.tool) return;
+                const model = frame.model ?? run.model;
+                if (description === run.description && tool === run.tool && model === run.model) return;
                 run.description = description;
                 run.tool = tool;
+                run.model = model;
             } else {
                 record(id, run, status);
                 roster.delete(id);
@@ -137,7 +154,7 @@ export default function sichStatus(pi) {
         if (!item) return;
         observe({
             kind: "progress", id: item.id, description: label(item.description), detail: label(item.currentTool),
-            file: event.sessionFile, call: event.parentToolCallId,
+            model: progressModel(item), file: event.sessionFile, call: event.parentToolCallId,
         });
     });
     pi.events.on("task:subagent:event", (payload) => {
