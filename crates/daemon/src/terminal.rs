@@ -13,6 +13,7 @@ use sich_proto::{AgentKind, MAX_OUTPUT_CHUNK, ServerMsg, SubagentActivity, Subag
 
 use crate::agent::{self, AgentTracker};
 use crate::codex_rollout;
+use crate::model_probe;
 use crate::hub::{ConnHandle, ConnId, Hub};
 use crate::osc::{OscEvent, OscScanner};
 use crate::ring::{DEFAULT_CAPACITY, RingBuffer};
@@ -214,7 +215,14 @@ impl Terminal {
                     tracing::debug!(id = self.shared.id, "ignoring unparsable hook payload");
                     return;
                 };
-                self.shared.update_agent(|a| a.on_claude_hook(&hook, now));
+                // A subagent's model comes from its meta file: decide under the lock, read outside
+                // of it, then apply it right after the hook (which puts a new subagent on the roster).
+                let plan = self.shared.state.lock().agent.claude_model_plan(&hook, now);
+                let model = plan.as_ref().map(model_probe::execute);
+                self.shared.update_agent(|a| {
+                    let changed = a.on_claude_hook(&hook, now);
+                    changed | model.is_some_and(|m| a.apply_model(m, now))
+                });
             }
             AgentKind::Codex => {
                 let Some(hook) = agent::parse_codex_payload(payload) else {
@@ -223,9 +231,16 @@ impl Terminal {
                 };
                 // A child hook may need its rollout's first line (identity). Decide under the lock,
                 // read the small file outside of it, then apply both together.
-                let plan = self.shared.state.lock().agent.identity_plan(&hook, now);
+                let (plan, model_plan) = {
+                    let st = self.shared.state.lock();
+                    (st.agent.identity_plan(&hook, now), st.agent.codex_model_plan(&hook, now))
+                };
                 let ident = plan.as_ref().and_then(codex_rollout::execute);
-                self.shared.update_agent(|a| a.on_codex_hook_with(&hook, now, ident));
+                let model = model_plan.as_ref().map(model_probe::execute);
+                self.shared.update_agent(|a| {
+                    let changed = a.on_codex_hook_with(&hook, now, ident);
+                    changed | model.is_some_and(|m| a.apply_model(m, now))
+                });
             }
             AgentKind::Omp => self.shared.update_agent(|a| a.on_omp_hook(payload, now)),
             // Other agents have no hook integration yet.

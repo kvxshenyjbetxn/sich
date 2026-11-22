@@ -468,6 +468,98 @@ async fn codex_subagent_label_comes_from_rollout_first_line() {
     stop(a, d).await;
 }
 
+/// Next status update of `id` for a client that opted into the subagent model sidecar.
+async fn next_models(c: &mut Conn, id: TermId) -> (AgentStatus, Vec<sich_proto::SubagentModel>) {
+    loop {
+        match recv(c).await {
+            ServerMsg::AgentStatusWithSubagentModels { id: sid, status: s, models } if sid == id => {
+                return (s, models);
+            }
+            ServerMsg::AgentStatusChanged { id: sid, status: Some(s) } if sid == id => return (s, Vec::new()),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_subagent_model_comes_from_its_meta_file() {
+    use sich_proto::{SUBAGENT_MODELS_CLIENT_SUFFIX, SubagentModel};
+
+    let d = start_daemon("claude-sub-model");
+    let mut a = named_client(&d.name, &format!("viewer{SUBAGENT_MODELS_CLIENT_SUFFIX}")).await;
+    let (shell, args) = idle_shell();
+    let id = create(&mut a, shell, &args).await;
+
+    // <projects dir>/<session>.jsonl plus <projects dir>/<session>/subagents/agent-<id>.meta.json
+    let dir = std::env::temp_dir().join(format!("sich-claude-meta-{}", std::process::id()));
+    let subs = dir.join("sess-1").join("subagents");
+    std::fs::create_dir_all(&subs).unwrap();
+    std::fs::write(
+        subs.join("agent-a1.meta.json"),
+        r#"{"agentType":"scout","model":"claude-haiku-5-5","pickedEffortModel":"claude-opus-5-5","finished":false}"#,
+    )
+    .unwrap();
+    // A subagent whose meta file does not exist (yet) simply has no model.
+    let path = serde_json::Value::String(dir.join("sess-1.jsonl").display().to_string()).to_string();
+    let with_path = |name: &str, extra: &str| event(name, &format!(r#","transcript_path":{path}{extra}"#));
+
+    send(&mut a, hook(id, &with_path("SessionStart", ""))).await;
+    let (s, _) = next_models(&mut a, id).await;
+    assert_eq!((s.kind, s.subagents.len()), (AgentKind::Claude, 0));
+
+    send(&mut a, hook(id, &with_path("SubagentStart", r#","agent_id":"a1","agent_type":"scout""#))).await;
+    let (s, models) = next_models(&mut a, id).await;
+    assert_eq!(s.subagents.len(), 1);
+    assert_eq!(models, vec![SubagentModel { id: "a1".into(), model: "claude-haiku-5-5".into() }]);
+
+    // A child tool event keeps the model and does not read again.
+    std::fs::write(subs.join("agent-a1.meta.json"), r#"{"model":"changed"}"#).unwrap();
+    send(&mut a, hook(id, &with_path("PreToolUse", r#","agent_id":"a1","tool_name":"Bash","tool_input":{"command":"ls"}"#))).await;
+    let (s, models) = next_models(&mut a, id).await;
+    assert_eq!(s.subagents[0].detail.as_deref(), Some("Bash: ls"));
+    assert_eq!(models, vec![SubagentModel { id: "a1".into(), model: "claude-haiku-5-5".into() }]);
+
+    // No meta file: the subagent is listed without a model.
+    send(&mut a, hook(id, &with_path("SubagentStart", r#","agent_id":"b2","agent_type":"scout""#))).await;
+    let (s, models) = next_models(&mut a, id).await;
+    assert_eq!(s.subagents.len(), 2);
+    assert_eq!(models, vec![SubagentModel { id: "a1".into(), model: "claude-haiku-5-5".into() }]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    stop(a, d).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_child_model_comes_from_its_rollout() {
+    use sich_proto::{SUBAGENT_MODELS_CLIENT_SUFFIX, SubagentModel};
+
+    let d = start_daemon("codex-child-rollout-model");
+    let mut a = named_client(&d.name, &format!("viewer{SUBAGENT_MODELS_CLIENT_SUFFIX}")).await;
+    let (shell, args) = idle_shell();
+    let id = create(&mut a, shell, &args).await;
+
+    let dir = std::env::temp_dir().join(format!("sich-codex-model-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rollout = dir.join("child.jsonl");
+    std::fs::write(
+        &rollout,
+        "{\"type\":\"session_meta\",\"payload\":{\"id\":\"child-1\",\"agent_path\":\"root/explorer\"}}\n{\"type\":\"turn_context\",\"payload\":{\"model\":\"gpt-6.2-sol\"}}\n",
+    )
+    .unwrap();
+    let path = serde_json::Value::String(rollout.display().to_string()).to_string();
+
+    send(&mut a, codex_hook(id, &event("SessionStart", ""))).await;
+    next_models(&mut a, id).await;
+    let start = event("SubagentStart", &format!(r#","agent_id":"child-1","transcript_path":{path}"#));
+    send(&mut a, codex_hook(id, &start)).await;
+    let (s, models) = next_models(&mut a, id).await;
+    assert_eq!(s.subagents[0].description.as_deref(), Some("explorer"));
+    assert_eq!(models, vec![SubagentModel { id: "child-1".into(), model: "gpt-6.2-sol".into() }]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    stop(a, d).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn omp_snapshots_follow_turns_and_old_clients_keep_decoding() {
     let daemon = start_daemon("omp");

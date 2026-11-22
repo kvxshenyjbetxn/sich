@@ -113,6 +113,44 @@ pub fn read_subagent_label(path: &Path, agent_id: &str) -> IdentityRead {
     }
 }
 
+/// The model of a rollout: `session_meta.payload.model`, else the first `turn_context.payload.model`
+/// in `buf`. Lines that are not JSON (e.g. the last one cut by the read bound) are skipped. A
+/// `session_meta` for another agent id means the file is not ours: no model.
+pub fn parse_rollout_model(buf: &[u8], agent_id: &str) -> Option<String> {
+    for line in buf.split(|&b| b == b'\n') {
+        let wants = |t: &[u8]| line.windows(t.len()).any(|w| w == t);
+        if !wants(b"\"session_meta\"") && !wants(b"\"turn_context\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else { continue };
+        let Some(payload) = v.get("payload") else { continue };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("session_meta") => {
+                if text(Some(payload), "id").is_some_and(|id| id != agent_id) {
+                    return None;
+                }
+                if let Some(m) = nonempty(text(Some(payload), "model")) {
+                    return Some(m);
+                }
+            }
+            Some("turn_context") => {
+                if let Some(m) = nonempty(text(Some(payload), "model")) {
+                    return Some(m);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Reads at most [`MAX_FIRST_LINE_BYTES`] of the rollout and extracts its model. Any error: `None`.
+pub fn read_rollout_model(path: &Path, agent_id: &str) -> Option<String> {
+    let mut buf = Vec::new();
+    File::open(path).ok()?.take(MAX_FIRST_LINE_BYTES).read_to_end(&mut buf).ok()?;
+    parse_rollout_model(&buf, agent_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +281,66 @@ mod tests {
     fn directory_is_unreadable() {
         let d = tmp();
         assert_eq!(read_subagent_label(&d, "a1"), IdentityRead::Unreadable);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn lines(parts: &[&str]) -> Vec<u8> {
+        parts.join("\n").into_bytes()
+    }
+
+    #[test]
+    fn model_from_session_meta_wins() {
+        let b = lines(&[
+            &meta(r#"{"id":"a1","model":" gpt-6.2-sol "}"#),
+            r#"{"type":"turn_context","payload":{"model":"other"}}"#,
+        ]);
+        assert_eq!(parse_rollout_model(&b, "a1").as_deref(), Some("gpt-6.2-sol"));
+    }
+
+    #[test]
+    fn model_from_first_turn_context_when_meta_has_none() {
+        let b = lines(&[
+            &meta(r#"{"id":"a1","model_provider":"openai"}"#),
+            r#"{"type":"event_msg","payload":{"model":"nope"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-6.2-sol"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"later"}}"#,
+        ]);
+        assert_eq!(parse_rollout_model(&b, "a1").as_deref(), Some("gpt-6.2-sol"));
+        let only_ctx = lines(&[r#"{"type":"turn_context","payload":{"model":"m"}}"#]);
+        assert_eq!(parse_rollout_model(&only_ctx, "a1").as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn model_absent_malformed_or_foreign() {
+        assert_eq!(parse_rollout_model(&lines(&[&meta(r#"{"id":"a1"}"#)]), "a1"), None);
+        assert_eq!(parse_rollout_model(b"", "a1"), None);
+        assert_eq!(parse_rollout_model(b"garbage\n\xff\xfe\n", "a1"), None);
+        // Bad lines are skipped, later good ones still count; a cut last line is ignored.
+        let b = lines(&["{not json session_meta", r#"{"type":"turn_context","payload":{"model":"m"}}"#, r#"{"type":"turn_context","payload":{"mod"#]);
+        assert_eq!(parse_rollout_model(&b, "a1").as_deref(), Some("m"));
+        for bad in [r#"{"model":5}"#, r#"{"model":"  "}"#, r#"{"model":null}"#] {
+            let b = lines(&[&format!(r#"{{"type":"turn_context","payload":{bad}}}"#)]);
+            assert_eq!(parse_rollout_model(&b, "a1"), None, "{bad}");
+        }
+        // A rollout of another agent is not ours.
+        let foreign = lines(&[&meta(r#"{"id":"zzz","model":"m"}"#), r#"{"type":"turn_context","payload":{"model":"m"}}"#]);
+        assert_eq!(parse_rollout_model(&foreign, "a1"), None);
+    }
+
+    #[test]
+    fn rollout_model_read_is_bounded_and_fail_soft() {
+        let d = tmp();
+        let p = temp_file(&d, "m.jsonl", &lines(&[&meta(r#"{"id":"a1"}"#), r#"{"type":"turn_context","payload":{"model":"m"}}"#, ""]));
+        assert_eq!(read_rollout_model(&p, "a1").as_deref(), Some("m"));
+        assert_eq!(read_rollout_model(&d.join("nope.jsonl"), "a1"), None);
+        assert_eq!(read_rollout_model(&d, "a1"), None);
+        // A turn_context beyond the read bound is not seen.
+        let mut big = lines(&[&meta(r#"{"id":"a1"}"#)]);
+        big.push(b'\n');
+        big.extend(std::iter::repeat_n(b' ', MAX_FIRST_LINE_BYTES as usize));
+        big.extend_from_slice(b"\n{\"type\":\"turn_context\",\"payload\":{\"model\":\"m\"}}\n");
+        let p = temp_file(&d, "big.jsonl", &big);
+        assert_eq!(read_rollout_model(&p, "a1"), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
