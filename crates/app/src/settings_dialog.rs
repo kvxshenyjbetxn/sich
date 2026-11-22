@@ -50,6 +50,22 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                         section(tr(lang, Tr::Notifications), notification_controls(lang, app.clone(), &prefs), cx)
                     }))
                     .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Switch::new("github-prs")
+                                    .checked(prefs.github_prs)
+                                    .label(tr(lang, Tr::GithubPrs))
+                                    .on_click(|checked, _, cx| settings::set_github_prs(*checked, cx)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(tr(lang, Tr::GithubPrsDesc)),
+                            ),
+                    )
+                    .child(
                         Switch::new("usage-limits")
                             .checked(prefs.usage_limits)
                             .label(tr(lang, Tr::UsageLimits))

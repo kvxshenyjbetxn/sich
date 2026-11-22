@@ -27,7 +27,11 @@ gpui_kit::assets::icon_assets!(ExtraIcons, [
     CircleAlert,
     CircleCheck,
     CircleX,
+    Archive,
+    ArchiveRestore,
+    Circle,
     Timer,
+    Download,
 ]);
 
 /// Agent icons (single-color SVGs, tinted at render time): `(asset path, bytes)`.

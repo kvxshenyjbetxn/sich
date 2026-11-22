@@ -96,17 +96,17 @@ impl GitPanel {
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let busy = self.active_operation();
-        let button = commit_action(status, self.draft(), busy.is_some());
-        let commit_label = if status.staged.is_empty() && !status.unstaged.is_empty() {
-            Tr::GitCommitAll
-        } else {
-            Tr::GitCommit
-        };
+        let banner = self.in_progress_banner(status, busy, lang, cx);
+        let pr_section = self.pr_section(status, busy, lang, cx);
+        let commit_button = self.commit_split_button(status, busy, lang, cx);
+        let stashes = self.stash_section(busy, lang, cx);
         v_flex()
             .flex_1()
             .min_h_0()
             .child(self.branch_header(status, busy, lang, cx))
             .child(self.error_notice(lang, cx))
+            .children(banner)
+            .children(pr_section)
             .child(
                 v_flex()
                     .flex_shrink_0()
@@ -117,19 +117,7 @@ impl GitPanel {
                             .small()
                             .aria_label(tr(lang, Tr::GitCommitMessage)),
                     )
-                    .child(
-                        Button::new("git-commit")
-                            .small()
-                            .primary()
-                            .label(tr(lang, commit_label))
-                            .disabled(button == CommitAction::Disabled)
-                            .loading(busy == Some(Operation::Commit))
-                            .on_click(
-                                cx.listener(|panel, _, window, cx| {
-                                    panel.commit_message(window, cx)
-                                }),
-                            ),
-                    ),
+                    .child(commit_button),
             )
             .child(
                 div()
@@ -164,7 +152,8 @@ impl GitPanel {
                                 .text_color(theme.muted_foreground)
                                 .child(tr(lang, Tr::GitNoChanges))
                         }),
-                    ),
+                    )
+                    .children(stashes),
             )
             .child(self.history_section(lang, cx))
     }
@@ -220,9 +209,13 @@ impl GitPanel {
             }))
             .child(
                 tool_button("git-refresh", Ic::RefreshCw, tr(lang, Tr::Refresh))
-                    .loading(self.refreshing)
-                    .on_click(cx.listener(|panel, _, _, cx| panel.refresh(cx))),
+                    .loading(self.refreshing || self.pr_fetching())
+                    .on_click(cx.listener(|panel, _, _, cx| {
+                        panel.refresh(cx);
+                        panel.pr_manual(cx);
+                    })),
             )
+            .child(self.header_menu(status, busy, self.pr_section_visible(status, cx), lang, cx))
     }
 
     fn error_notice(&self, lang: Language, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -299,6 +292,14 @@ impl GitPanel {
                                 cx.stop_propagation();
                             })),
                     )
+                    .children((section == Section::Changes).then(|| {
+                        tool_button("git-stash-section", Ic::Archive, tr(lang, Tr::GitStashChanges))
+                            .disabled(busy.is_some())
+                            .on_click(cx.listener(move |panel, _, window, cx| {
+                                panel.mutate(Mutation::StashPush, window, cx);
+                                cx.stop_propagation();
+                            }))
+                    }))
                     .children((section == Section::Changes).then(|| {
                         tool_button(
                             "git-discard-section",
@@ -391,7 +392,7 @@ impl GitPanel {
             }))
     }
 
-    fn file_row(
+    pub(super) fn file_row(
         &self,
         file: &FileChange,
         source: CompareSource,
@@ -427,6 +428,9 @@ impl GitPanel {
             source,
         };
         let selected = self.active_diff.as_ref() == Some(&key);
+        // Untracked files inside a stash have no first-parent version to compare against.
+        let clickable = !(file.status == ChangeKind::Untracked
+            && matches!(key.source, CompareSource::Commit(_)));
         v_flex()
             .id(SharedString::from(format!("{group}-row")))
             .w_full()
@@ -438,7 +442,7 @@ impl GitPanel {
                     .min_w_0()
                     .gap_1()
                     .px_2()
-                    .cursor_pointer()
+                    .when(clickable, |row| row.cursor_pointer())
                     .bg(if selected {
                         theme.list_active
                     } else {
@@ -456,9 +460,11 @@ impl GitPanel {
                             Tooltip::new(tooltip.clone()).build(window, cx)
                         })
                     })
-                    .on_click(cx.listener(move |panel, _, _, cx| {
-                        panel.open_diff(key.clone(), original.clone(), cx);
-                    }))
+                    .when(clickable, |row| {
+                        row.on_click(cx.listener(move |panel, _, _, cx| {
+                            panel.open_diff(key.clone(), original.clone(), cx);
+                        }))
+                    })
                     .child(
                         div()
                             .w(px(14.))
@@ -762,7 +768,7 @@ impl GitPanel {
     }
 }
 
-fn tool_button(id: impl Into<ElementId>, icon: Ic, label: &'static str) -> Button {
+pub(super) fn tool_button(id: impl Into<ElementId>, icon: Ic, label: &'static str) -> Button {
     Button::new(id)
         .ghost()
         .xsmall()
@@ -770,7 +776,7 @@ fn tool_button(id: impl Into<ElementId>, icon: Ic, label: &'static str) -> Butto
         .tooltip(label)
 }
 
-fn chevron(expanded: bool) -> Icon {
+pub(super) fn chevron(expanded: bool) -> Icon {
     Icon::new(if expanded {
         Ic::ChevronDown
     } else {
@@ -780,7 +786,7 @@ fn chevron(expanded: bool) -> Icon {
     .flex_shrink_0()
 }
 
-fn tiny(value: impl Into<SharedString>, cx: &Context<GitPanel>) -> AnyElement {
+pub(super) fn tiny(value: impl Into<SharedString>, cx: &Context<GitPanel>) -> AnyElement {
     div()
         .px_2()
         .py_1()

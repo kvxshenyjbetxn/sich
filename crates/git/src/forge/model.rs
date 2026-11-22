@@ -166,6 +166,59 @@ struct RawCheck {
     state: Option<String>,
     #[serde(rename = "targetUrl")]
     target_url: Option<String>,
+    #[serde(rename = "__typename")]
+    typename: Option<String>,
+    #[serde(rename = "startedAt")]
+    started_at: Option<String>,
+    #[serde(rename = "completedAt")]
+    completed_at: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
+}
+
+impl RawCheck {
+    fn is_status_context(&self) -> bool {
+        self.context.is_some() && self.name.is_none()
+    }
+
+    /// Identity of a check across re-runs.
+    fn key(&self) -> (String, String, String) {
+        let name = if self.is_status_context() { &self.context } else { &self.name };
+        (
+            self.typename.clone().unwrap_or_default(),
+            self.workflow_name.clone().unwrap_or_default(),
+            name.clone().unwrap_or_default(),
+        )
+    }
+
+    /// ISO-8601 timestamps compare correctly as strings.
+    fn timestamp(&self) -> Option<&str> {
+        let pick = if self.is_status_context() {
+            self.created_at.as_deref().or(self.started_at.as_deref())
+        } else {
+            self.started_at.as_deref().or(self.completed_at.as_deref())
+        };
+        pick.filter(|t| !t.is_empty())
+    }
+}
+
+/// `statusCheckRollup` lists every run, including re-runs: keep the newest per check, in
+/// first-appearance order. Missing or equal timestamps: the later entry wins.
+fn dedupe_checks(raw: Vec<RawCheck>) -> Vec<RawCheck> {
+    let mut out: Vec<((String, String, String), RawCheck)> = Vec::new();
+    for item in raw {
+        let key = item.key();
+        match out.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, existing)) => {
+                let older = matches!((item.timestamp(), existing.timestamp()), (Some(new), Some(old)) if new < old);
+                if !older {
+                    *existing = item;
+                }
+            }
+            None => out.push((key, item)),
+        }
+    }
+    out.into_iter().map(|(_, item)| item).collect()
 }
 
 pub fn parse_pr_json(json: &str) -> Result<PullRequest, ForgeError> {
@@ -199,9 +252,7 @@ pub fn parse_pr_json(json: &str) -> Result<PullRequest, ForgeError> {
         "REVIEW_REQUIRED" => Some(ReviewDecision::ReviewRequired),
         _ => None,
     };
-    let checks = raw
-        .status_check_rollup
-        .unwrap_or_default()
+    let checks = dedupe_checks(raw.status_check_rollup.unwrap_or_default())
         .into_iter()
         .map(convert_check)
         .collect();
@@ -401,6 +452,73 @@ mod tests {
         }
         let pr = parse_pr_json(r#"{"mergeable":"CONFLICTING"}"#).unwrap();
         assert_eq!(pr.mergeable, Mergeable::Conflicting);
+    }
+
+    fn run(name: &str, conclusion: &str, started: Option<&str>) -> String {
+        let started = started.map(|s| format!(r#","startedAt":"{s}""#)).unwrap_or_default();
+        format!(
+            r#"{{"__typename":"CheckRun","name":"{name}","workflowName":"PR description","status":"COMPLETED","conclusion":"{conclusion}"{started}}}"#
+        )
+    }
+
+    fn rollup(items: &[String]) -> PullRequest {
+        parse_pr_json(&format!(r#"{{"statusCheckRollup":[{}]}}"#, items.join(","))).unwrap()
+    }
+
+    #[test]
+    fn rerun_failure_then_success_resolves_to_success() {
+        let pr = rollup(&[
+            run("Performance section", "FAILURE", Some("2026-11-22T10:00:00Z")),
+            run("other", "SUCCESS", Some("2026-11-22T10:00:00Z")),
+            run("Performance section", "SUCCESS", Some("2026-11-22T10:05:00Z")),
+            run("Performance section", "SUCCESS", Some("2026-11-22T10:09:00Z")),
+        ]);
+        assert_eq!(pr.checks.len(), 2);
+        assert_eq!(pr.checks[0].name, "Performance section", "first-appearance order");
+        assert_eq!(pr.checks[1].name, "other");
+        assert_eq!(pr.checks[0].state, CheckState::Success);
+        let summary = pr.summary();
+        assert_eq!((summary.total, summary.passed, summary.failed), (2, 2, 0));
+        assert_eq!(summary.overall(), Some(CheckState::Success));
+    }
+
+    #[test]
+    fn newest_timestamp_wins_even_when_it_appears_earlier() {
+        let pr = rollup(&[
+            run("a", "SUCCESS", Some("2026-11-22T10:09:00Z")),
+            run("a", "FAILURE", Some("2026-11-22T10:00:00Z")),
+        ]);
+        assert_eq!(pr.checks.len(), 1);
+        assert_eq!(pr.checks[0].state, CheckState::Success);
+    }
+
+    #[test]
+    fn missing_or_equal_timestamps_let_the_later_entry_win() {
+        let pr = rollup(&[run("a", "FAILURE", None), run("a", "SUCCESS", None)]);
+        assert_eq!((pr.checks.len(), pr.checks[0].state), (1, CheckState::Success));
+        let pr = rollup(&[run("a", "SUCCESS", None), run("a", "FAILURE", None)]);
+        assert_eq!(pr.checks[0].state, CheckState::Failure);
+        let t = Some("2026-11-22T10:00:00Z");
+        let pr = rollup(&[run("a", "FAILURE", t), run("a", "SUCCESS", t)]);
+        assert_eq!(pr.checks[0].state, CheckState::Success);
+        let pr = rollup(&[run("a", "SUCCESS", t), run("a", "FAILURE", None)]);
+        assert_eq!(pr.checks[0].state, CheckState::Failure);
+    }
+
+    #[test]
+    fn same_name_in_different_workflows_or_types_is_not_merged() {
+        let pr = parse_pr_json(
+            r#"{"statusCheckRollup":[
+                {"__typename":"CheckRun","name":"build","workflowName":"A","status":"COMPLETED","conclusion":"FAILURE"},
+                {"__typename":"CheckRun","name":"build","workflowName":"B","status":"COMPLETED","conclusion":"SUCCESS"},
+                {"__typename":"StatusContext","context":"build","state":"SUCCESS","createdAt":"2026-11-22T10:00:00Z"},
+                {"__typename":"StatusContext","context":"build","state":"FAILURE","createdAt":"2026-11-22T09:00:00Z"}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(pr.checks.len(), 3);
+        assert_eq!(pr.checks[2].state, CheckState::Success, "newest status context wins");
+        assert_eq!(pr.summary().failed, 1);
     }
 
     #[test]

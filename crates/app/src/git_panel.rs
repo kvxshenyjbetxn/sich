@@ -1,7 +1,12 @@
 //! Worktree-scoped Git state. The UI schedules work and applies generation-checked results.
 
 mod branch_picker;
+mod ops_menu;
+mod pr;
+mod pr_card;
+mod pr_dialog;
 mod render;
+mod stash_section;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -19,7 +24,10 @@ use gpui_kit::{
 use sich_git::compare::{CompareKey, CompareSource};
 use sich_git::scheduler::Scheduler;
 use sich_git::watch::{self, WatchSignal};
-use sich_git::{Branch, ChangeKind, Commit, FileChange, GitError, HISTORY_PAGE_SIZE, Repo, RepoStatus};
+use sich_git::{
+    Branch, ChangeKind, Commit, FileChange, GitError, HISTORY_PAGE_SIZE, InProgress, Repo, RepoStatus,
+    Stash,
+};
 
 use crate::i18n::{Language, Tr, tr};
 use crate::worktree_dialogs;
@@ -110,6 +118,38 @@ enum Operation {
     Discard,
     Commit,
     SwitchBranch,
+    PullRebase,
+    ForcePush,
+    CommitPush,
+    Amend,
+    Undo,
+    Stash,
+    Continue,
+    Abort,
+}
+
+impl Operation {
+    /// Operations that move HEAD or refs: history and the pull request must be re-read.
+    fn changes_history(self) -> bool {
+        !matches!(
+            self,
+            Self::Stage | Self::Unstage | Self::Discard | Self::Stash
+        )
+    }
+
+    /// Operations after which the remote state of the branch may differ.
+    fn affects_pr(self) -> bool {
+        matches!(
+            self,
+            Self::Push
+                | Self::PullRebase
+                | Self::ForcePush
+                | Self::CommitPush
+                | Self::Amend
+                | Self::Undo
+                | Self::Continue
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -126,9 +166,43 @@ enum Mutation {
     Commit { message: String, all: bool },
     SwitchBranch(Branch),
     CreateBranch(String),
+    PullRebase,
+    ForcePush,
+    /// Commit (staging everything first when `all`), then push, as one operation.
+    CommitPush { message: String, all: bool },
+    /// Reword HEAD with the given message; staged changes are included, nothing new is staged.
+    Amend(String),
+    /// Soft reset of HEAD; changes return to Staged.
+    Undo,
+    StashPush,
+    StashApply(Stash),
+    StashPop(Stash),
+    StashDrop(Stash),
+    Continue(InProgress),
+    Abort(InProgress),
 }
 
 impl Mutation {
+    /// Commit message this mutation consumes from the draft on success.
+    fn draft_message(&self) -> Option<&str> {
+        match self {
+            Self::Commit { message, .. } | Self::CommitPush { message, .. } | Self::Amend(message) => {
+                Some(message)
+            }
+            _ => None,
+        }
+    }
+
+    /// Runs the mutation; `Some(message)` is the commit message that `Undo` took off HEAD.
+    fn run_full(self, repo: &Repo) -> Result<Option<String>, GitError> {
+        let undone = if matches!(self, Self::Undo) {
+            repo.last_commit_message().ok().flatten()
+        } else {
+            None
+        };
+        self.run(repo).map(|()| undone)
+    }
+
     fn operation(&self) -> Operation {
         match self {
             Self::Fetch => Operation::Fetch,
@@ -139,6 +213,16 @@ impl Mutation {
             Self::Discard(_) | Self::DiscardAll => Operation::Discard,
             Self::Commit { .. } => Operation::Commit,
             Self::SwitchBranch(_) | Self::CreateBranch(_) => Operation::SwitchBranch,
+            Self::PullRebase => Operation::PullRebase,
+            Self::ForcePush => Operation::ForcePush,
+            Self::CommitPush { .. } => Operation::CommitPush,
+            Self::Amend(_) => Operation::Amend,
+            Self::Undo => Operation::Undo,
+            Self::StashPush | Self::StashApply(_) | Self::StashPop(_) | Self::StashDrop(_) => {
+                Operation::Stash
+            }
+            Self::Continue(_) => Operation::Continue,
+            Self::Abort(_) => Operation::Abort,
         }
     }
 
@@ -164,6 +248,23 @@ impl Mutation {
             }
             Self::SwitchBranch(branch) => repo.switch_branch(&branch),
             Self::CreateBranch(name) => repo.create_branch(&name),
+            Self::PullRebase => repo.pull_rebase(),
+            Self::ForcePush => repo.push_force_with_lease(),
+            Self::CommitPush { message, all } => {
+                if all {
+                    repo.stage_all()?;
+                }
+                repo.commit(&message)?;
+                repo.push()
+            }
+            Self::Amend(message) => repo.commit_amend(&message),
+            Self::Undo => repo.undo_last_commit(),
+            Self::StashPush => repo.stash_push(None, true),
+            Self::StashApply(stash) => repo.stash_apply(&stash),
+            Self::StashPop(stash) => repo.stash_pop(&stash),
+            Self::StashDrop(stash) => repo.stash_drop(&stash),
+            Self::Continue(op) => repo.continue_in_progress(op),
+            Self::Abort(op) => repo.abort_in_progress(op),
         }
     }
 }
@@ -264,6 +365,11 @@ pub(crate) struct GitPanel {
     scheduler: Scheduler,
     wake: Option<Sender<()>>,
     watch_task: Option<Task<()>>,
+    stashes: Vec<Stash>,
+    stash_open: HashMap<String, Expansion<Vec<FileChange>>>,
+    stashes_collapsed: bool,
+    pr: HashMap<PathBuf, pr::PrEntry>,
+    pr_task: Option<Task<()>>,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -293,6 +399,11 @@ impl GitPanel {
             scheduler: Scheduler::default(),
             wake: None,
             watch_task: None,
+            stashes: Vec::new(),
+            stash_open: HashMap::new(),
+            stashes_collapsed: false,
+            pr: HashMap::new(),
+            pr_task: None,
         }
     }
 
@@ -310,7 +421,12 @@ impl GitPanel {
         }
         self.generation.advance();
         self.watch_task = None;
+        self.pr_task = None;
         self.wake = None;
+        self.pr_reset_in_flight();
+        self.stashes.clear();
+        self.stash_open.clear();
+        self.stashes_collapsed = false;
         self.worktree = worktree.map(Path::to_path_buf);
         self.repo = None;
         self.status = None;
@@ -332,6 +448,7 @@ impl GitPanel {
             self.watch_task = Some(cx.spawn(async move |panel, cx| {
                 refresh_loop(panel, cx, generation, path, rx, tx).await;
             }));
+            self.start_pr_timer(cx);
         }
         cx.notify();
     }
@@ -401,6 +518,7 @@ impl GitPanel {
                 if let Some(worktree) = &self.worktree {
                     cx.emit(GitPanelEvent::Refreshed(worktree.clone()));
                 }
+                self.pr_sync(true, cx);
             }
             Err(error @ (GitError::NotRepository | GitError::GitMissing)) => {
                 self.repo = None;
@@ -428,6 +546,18 @@ impl GitPanel {
         cx.notify();
     }
 
+    fn finish_stashes(&mut self, result: Result<Vec<Stash>, GitError>, cx: &mut Context<Self>) {
+        // A failed read keeps the list we already have; status reports repository problems.
+        if let Ok(stashes) = result {
+            self.stash_open
+                .retain(|oid, _| stashes.iter().any(|stash| &stash.oid == oid));
+            if self.stashes != stashes {
+                self.stashes = stashes;
+                cx.notify();
+            }
+        }
+    }
+
     fn active_operation(&self) -> Option<Operation> {
         self.worktree
             .as_ref()
@@ -435,10 +565,11 @@ impl GitPanel {
     }
 
     fn draft(&self) -> &str {
-        self.worktree
-            .as_ref()
-            .and_then(|path| self.drafts.get(path))
-            .map_or("", String::as_str)
+        self.worktree.as_deref().map_or("", |path| self.draft_of(path))
+    }
+
+    fn draft_of(&self, path: &Path) -> &str {
+        self.drafts.get(path).map_or("", String::as_str)
     }
 
     fn message_input(
@@ -549,11 +680,8 @@ impl GitPanel {
             self.error = None;
         }
         let generation = self.generation;
-        let message = match &mutation {
-            Mutation::Commit { message, .. } => Some(message.clone()),
-            _ => None,
-        };
-        let run = cx.background_spawn(async move { mutation.run(&repo) });
+        let message = mutation.draft_message().map(str::to_owned);
+        let run = cx.background_spawn(async move { mutation.run_full(&repo) });
         cx.spawn_in(window, async move |panel, cx| {
             let result = run.await;
             let _ = panel.update_in(cx, |panel, window, cx| {
@@ -572,6 +700,17 @@ impl GitPanel {
                         }
                     }
                 }
+                // Undo hands the removed commit message back for editing.
+                if let Ok(Some(undone)) = &result
+                    && panel.draft_of(&path).trim().is_empty()
+                {
+                    panel.drafts.insert(path.clone(), undone.clone());
+                    if panel.worktree.as_ref() == Some(&path) {
+                        if let Some(input) = &panel.input {
+                            input.state.update(cx, |input, cx| input.set_value(undone.clone(), window, cx));
+                        }
+                    }
+                }
                 let error = result.err().map(|error| error.to_string());
                 if operation == Operation::SwitchBranch && let Some(error) = &error {
                     crate::notifications::show_error(error.clone(), window, cx);
@@ -581,18 +720,18 @@ impl GitPanel {
                         .generation
                         .apply(generation, || panel.error = error.clone());
                 }
+                let succeeded = error.is_none();
                 cx.emit(GitPanelEvent::Mutated {
                     worktree: path.clone(),
                     diff_tab,
-                    branch_switched: operation == Operation::SwitchBranch && error.is_none(),
+                    branch_switched: operation == Operation::SwitchBranch && succeeded,
                     error,
                 });
                 if panel.worktree.as_ref() == Some(&path) {
-                    let history = matches!(
-                        operation,
-                        Operation::Fetch | Operation::Pull | Operation::Push | Operation::Commit | Operation::SwitchBranch
-                    );
-                    panel.request_refresh(history);
+                    panel.request_refresh(operation.changes_history());
+                    if operation.affects_pr() && succeeded {
+                        panel.pr_request(pr::PrTrigger::Action, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -822,6 +961,8 @@ async fn refresh_loop(
         let opened = repo.clone().expect("opened repository");
         let status_repo = opened.clone();
         let status = cx.background_spawn(async move { status_repo.status() });
+        let stash_repo = opened.clone();
+        let stashes = cx.background_spawn(async move { stash_repo.stashes() });
         let history = plan.map(|count| {
             let repo = opened.clone();
             (
@@ -848,6 +989,12 @@ async fn refresh_loop(
                     .apply(generation, || panel.finish_history(result, count, cx));
             });
         }
+        let stash_result = stashes.await;
+        let _ = panel.update(cx, |panel, cx| {
+            panel
+                .generation
+                .apply(generation, || panel.finish_stashes(stash_result, cx));
+        });
         let _ = panel.update(cx, |panel, cx| {
             panel
                 .generation

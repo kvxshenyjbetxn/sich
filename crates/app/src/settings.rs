@@ -17,6 +17,27 @@ pub(crate) enum DiffMode {
     Inline,
 }
 
+/// How the Merge button of a pull request merges. Unknown stored values fall back to squash.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PrMergeMethod {
+    #[default]
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl<'de> Deserialize<'de> for PrMergeMethod {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("merge") => Self::Merge,
+            Some("rebase") => Self::Rebase,
+            _ => Self::Squash,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -52,6 +73,9 @@ pub struct AppSettings {
     pub orch_auto_close_workers: bool,
     pub orch_cleanup_worktrees: bool,
     pub quick_commands: Vec<QuickCommand>,
+    /// Show and create GitHub pull requests through the user's own `gh` CLI.
+    pub github_prs: bool,
+    pub(crate) pr_merge_method: PrMergeMethod,
 }
 
 impl Default for AppSettings {
@@ -80,6 +104,8 @@ impl Default for AppSettings {
             orch_auto_close_workers: true,
             orch_cleanup_worktrees: true,
             quick_commands: Vec::new(),
+            github_prs: true,
+            pr_merge_method: PrMergeMethod::default(),
         }
     }
 }
@@ -342,6 +368,24 @@ pub(crate) fn set_diff_wrap_lines(wrap: bool, cx: &mut App) {
     }
 }
 
+pub fn set_github_prs(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.github_prs != enabled {
+        s.github_prs = enabled;
+        store(s, cx);
+        cx.refresh_windows();
+    }
+}
+
+pub(crate) fn set_pr_merge_method(method: PrMergeMethod, cx: &mut App) {
+    let mut s = get(cx);
+    if s.pr_merge_method != method {
+        s.pr_merge_method = method;
+        store(s, cx);
+        cx.refresh_windows();
+    }
+}
+
 pub fn set_theme(kind: ThemeKind, cx: &mut App) {
     let mut s = get(cx);
     if s.theme == kind {
@@ -565,6 +609,39 @@ mod tests {
     fn config_file_lives_under_sich_dir() {
         if let Some(p) = config_file("session.json") {
             assert!(p.ends_with(std::path::Path::new("sich").join("session.json")));
+        }
+    }
+
+    #[test]
+    fn github_prs_defaults_to_true_and_round_trips() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(old.github_prs);
+        assert!(AppSettings::default().github_prs);
+        let off = AppSettings { github_prs: false, ..old };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.github_prs);
+    }
+
+    #[test]
+    fn pr_merge_method_defaults_to_squash_and_round_trips() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.pr_merge_method, PrMergeMethod::Squash);
+        for method in [PrMergeMethod::Squash, PrMergeMethod::Merge, PrMergeMethod::Rebase] {
+            let saved = AppSettings { pr_merge_method: method, ..Default::default() };
+            let json = serde_json::to_string(&saved).unwrap();
+            assert_eq!(serde_json::from_str::<AppSettings>(&json).unwrap().pr_merge_method, method);
+        }
+        let parsed: AppSettings = serde_json::from_str(r#"{"pr_merge_method":"rebase"}"#).unwrap();
+        assert_eq!(parsed.pr_merge_method, PrMergeMethod::Rebase);
+    }
+
+    #[test]
+    fn unknown_pr_merge_method_falls_back_without_dropping_other_settings() {
+        for raw in [r#""fast-forward""#, "42", "null", r#""""#] {
+            let json = format!(r#"{{"theme":"amoled","pr_merge_method":{raw}}}"#);
+            let parsed: AppSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.pr_merge_method, PrMergeMethod::Squash);
+            assert_eq!(parsed.theme, ThemeKind::Amoled);
         }
     }
 
