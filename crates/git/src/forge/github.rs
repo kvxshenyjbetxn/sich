@@ -121,8 +121,8 @@ impl<E: GhExec> GitHub<E> {
         if req.base.trim().is_empty() || req.head.trim().is_empty() {
             return invalid("Base and head branches are required");
         }
-        if req.base.starts_with('-') || req.head.starts_with('-') || req.title.starts_with('-') {
-            return invalid("Invalid branch or title");
+        if req.base.starts_with('-') || req.head.starts_with('-') {
+            return invalid("Invalid branch name");
         }
         if req.base == req.head {
             return invalid("Base and head branches must differ");
@@ -137,6 +137,7 @@ impl<E: GhExec> GitHub<E> {
             .map_err(|error| ForgeError::Failed(format!("Failed to write PR body: {error}")))?;
         // Close our handle (the path guard still deletes the file on drop).
         let path = file.into_temp_path();
+        let title = format!("--title={}", req.title);
         let mut argv = args(&[
             "pr",
             "create",
@@ -146,8 +147,7 @@ impl<E: GhExec> GitHub<E> {
             &req.base,
             "--head",
             &req.head,
-            "--title",
-            &req.title,
+            &title,
             "--body-file",
         ]);
         argv.push(path.to_string_lossy().into_owned());
@@ -380,13 +380,23 @@ mod tests {
         assert!(!path.exists());
         let call = &exec.calls()[0];
         assert_eq!(
-            call[..11],
+            call[..10],
             v(&[
-                "pr", "create", "--repo", "o/r", "--base", "main", "--head", "feature", "--title",
-                "Title", "--body-file"
+                "pr", "create", "--repo", "o/r", "--base", "main", "--head", "feature",
+                "--title=Title", "--body-file"
             ])[..]
         );
-        assert_eq!(call.len(), 12);
+        assert_eq!(call.len(), 11);
+    }
+
+    #[test]
+    fn create_pr_keeps_titles_that_start_with_a_dash() {
+        let exec = FakeExec::with(vec![ok("https://github.com/o/r/pull/9")]);
+        let gh = github(&exec);
+        let mut req = request();
+        req.title = "- fix typo".into();
+        gh.create_pr(&req).unwrap();
+        assert_eq!(exec.calls()[0][8], "--title=- fix typo");
     }
 
     #[test]
