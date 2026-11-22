@@ -6233,6 +6233,8 @@ version = "0.1.26"
 dependencies = [
  "dunce",
  "notify",
+ "serde",
+ "serde_json",
  "similar",
  "tempfile",
 ]
