@@ -55,6 +55,10 @@ The app will grow a lot of features. Tests are what keep old features from break
 
 The main model, after merging, runs the full `cargo test --workspace` again. For UI changes it also launches the app and verifies with screenshots before telling the user it's done.
 
+## Updates and releases — user's call only
+- Never update the user's running Sich yourself: do not launch a new `sich.exe` to take over the GUI and do not restart the daemon. The user updates Sich themselves. Verify UI changes only in an isolated test instance (own `SICH_SOCKET`).
+- Never cut a release (`scripts/release.ps1`, tags, `gh release`) unless the user explicitly asks for one in the current request.
+
 ## Practical notes
 - Rebuilding Sich works while Sich runs: both the GUI and the daemon run from copies in `<data>/sich/daemon-host/<build_id>/`, so `target\release\sich.exe` is not locked. No need to stop the daemon. To update, launch the new executable and it takes over the old GUI. If daemon code changed (same PROTO_VERSION), the new GUI starts a new daemon generation (`<base>-<daemon_build_id>`, registry in `<data>/sich/daemons/`) next to the old one: old terminals keep running on the old daemon, new ones go to the new daemon, and the old daemon exits once it has no terminals. Only a PROTO_VERSION bump asks for a daemon restart. `SICH_NO_RELOCATE=1` runs the GUI in place (then it locks the exe).
 - Avoid protocol changes when a UI-only change will do. Every PROTO_VERSION bump forces a daemon restart for users.
