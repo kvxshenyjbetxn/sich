@@ -1,7 +1,7 @@
 //! Connection task: owns the daemon connection, routes server messages to sessions and
 //! reconnects forever with backoff.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -188,6 +188,7 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
 
     let incarnation = Arc::new(());
     let mut restores: HashMap<u64, RestoreData> = HashMap::new();
+    let mut discarded_restores = HashSet::new();
     let mut resumes = HashMap::new();
     let mut next_restore = 0_u64;
     let mut markers = ReplayMarkers::default();
@@ -196,7 +197,7 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
         tokio::select! {
             frame = stream.next() => {
                 let frame = frame.context("daemon closed the connection")?.context("read frame")?;
-                let msg: ServerMsg = decode(&frame).context("decode server message")?;
+                let mut msg: ServerMsg = decode(&frame).context("decode server message")?;
                 if let Some(status) = classify_incompatible(&msg, *welcomed) {
                     conn.state.lock().status = status;
                     (conn.wake)();
@@ -205,24 +206,45 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
                 if matches!(msg, ServerMsg::Welcome { .. }) {
                     *welcomed = true;
                 }
+                // The daemon broadcasts creation after acknowledging a restore. A late
+                // replacement may also appear in an inventory before its removal arrives.
+                match &mut msg {
+                    ServerMsg::TerminalCreated(info) if discarded_restores.contains(&info.id) => continue,
+                    ServerMsg::Terminals(terminals) | ServerMsg::TerminalsWithSubagentModels { terminals, .. } => {
+                        terminals.retain(|info| !discarded_restores.contains(&info.id));
+                    }
+                    ServerMsg::TerminalRemoved { id } => { discarded_restores.remove(id); }
+                    _ => {}
+                }
                 match msg {
                     ServerMsg::TerminalRestored { request_id, terminal } => {
                         if let Some(mut data) = restores.remove(&request_id) {
                             let mut migration = data.migration.take();
+                            if migration.as_ref().is_some_and(|migration| migration.is_abandoned()) {
+                                if let Some(info) = terminal {
+                                    discarded_restores.insert(info.id);
+                                    send(&mut stream, &ClientMsg::KillTerminal { id: info.id }).await?;
+                                }
+                                continue;
+                            }
                             if let Some(info) = terminal {
                                 let id = info.id;
                                 let exited = info.exited.is_some();
                                 let protect_resume = data.protect_resume;
                                 let history = migration.as_mut().map(|m| &*m.history.make_contiguous());
-                                let command = conn.restore_terminal(info, data, history);
-                                // The replacement is visible now. Don't resume an agent while
-                                // its old shell is still open.
-                                let can_resume = match migration {
-                                    Some(migration) if !migration.done.is_closed() => migration.close_source().await,
-                                    Some(_) => false,
-                                    None => true,
-                                };
-                                if let Some(command) = command.filter(|_| !exited && can_resume) {
+                                let command = conn.restore_terminal(info, data, history).filter(|_| !exited);
+                                if let Some(migration) = migration {
+                                    let cmd_tx = conn.cmd_tx.clone();
+                                    let incarnation = incarnation.clone();
+                                    tokio::spawn(async move {
+                                        // Only schedule an agent resume after the old shell closes.
+                                        if migration.close_source().await && let Some(bytes) = command {
+                                            let _ = cmd_tx.send(Cmd::ScheduleResume {
+                                                incarnation, id, bytes, protect: protect_resume,
+                                            });
+                                        }
+                                    });
+                                } else if let Some(command) = command {
                                     resumes.insert(id, (tokio::time::Instant::now() + RESUME_DELAY, command, protect_resume));
                                 }
                                 let sub = ClientMsg::Subscribe { id, resume_from_seq: None };
@@ -286,7 +308,7 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
                 let msg = match cmd {
                     Cmd::Restart(request) => return Ok(End::Restart(request)),
                     Cmd::Restore { worktree, cwd, cols, rows, data } => {
-                        if data.migration.as_ref().is_some_and(|migration| migration.done.is_closed()) {
+                        if data.migration.as_ref().is_some_and(|migration| migration.is_abandoned()) {
                             continue;
                         }
                         let request_id = next_restore;
@@ -330,6 +352,14 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
                         ClientMsg::Input { id, bytes }
                     }
                     Cmd::Resume(..) => continue,
+                    Cmd::ScheduleResume { incarnation: connection, id, bytes, protect } => {
+                        if !legacy && Arc::ptr_eq(&connection, &incarnation)
+                            && conn.state.lock().terminals.iter().any(|entry| entry.info.id == id && entry.info.exited.is_none())
+                        {
+                            resumes.insert(id, (tokio::time::Instant::now() + RESUME_DELAY, bytes, protect));
+                        }
+                        continue;
+                    }
                     Cmd::Resize(id, cols, rows) => ClientMsg::Resize { id, cols, rows },
                 };
                 markers.on_sent(&msg);
@@ -823,13 +853,96 @@ mod tests {
         }
     }
 
-    async fn recv_client(peer: &mut Stream<tokio::io::DuplexStream>) -> ClientMsg {
+    async fn recv_client<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut Stream<S>) -> ClientMsg {
         let frame = tokio::time::timeout(Duration::from_secs(3), peer.next()).await.unwrap().unwrap().unwrap();
         decode(&frame).unwrap()
     }
 
-    async fn send_server(peer: &mut Stream<tokio::io::DuplexStream>, msg: ServerMsg) {
+    async fn send_server<S: AsyncRead + AsyncWrite + Unpin>(peer: &mut Stream<S>, msg: ServerMsg) {
         peer.send(encode(&msg).unwrap()).await.unwrap();
+    }
+
+    fn test_terminal(id: TermId) -> TerminalInfo {
+        TerminalInfo {
+            id, title: String::new(), cwd: Default::default(), cols: 80, rows: 24,
+            exited: None, created_unix_ms: id, worktree: None, agent: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn abandoned_migration_kills_the_replacement_without_publishing_it() {
+        let (conn, mut commands) = test_conn_with_rx(&Handle::current(), false);
+        let state = conn.state.clone();
+        let tx = conn.cmd_tx.clone();
+        let (local, peer) = tokio::io::duplex(8192);
+        let mut peer = Framed::new(peer, frame_codec());
+        let task = tokio::spawn(async move {
+            session_on(&conn, Framed::new(local, frame_codec()), &mut commands, &mut false, false).await
+        });
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Hello { .. }));
+        send_server(&mut peer, welcome(PROTO_VERSION)).await;
+        for _ in 0..3 { recv_client(&mut peer).await; }
+
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let (migration, _source) = crate::terminal_migration::Migration::test_pair(1, done).await;
+        tx.send(Cmd::Restore {
+            worktree: None, cwd: None, cols: 80, rows: 24,
+            data: RestoreData { migration: Some(migration), ..RestoreData::fresh_terminal(42) },
+        }).unwrap();
+        let ClientMsg::RestoreTerminal { request_id, .. } = recv_client(&mut peer).await else { panic!("expected restore request") };
+        drop(finished);
+
+        let replacement = test_terminal(2);
+        send_server(&mut peer, ServerMsg::TerminalRestored {
+            request_id, terminal: Some(replacement.clone()),
+        }).await;
+        assert_eq!(recv_client(&mut peer).await, ClientMsg::KillTerminal { id: 2 });
+        // The real daemon broadcasts creation after replying to the restore request.
+        send_server(&mut peer, ServerMsg::TerminalCreated(replacement.clone())).await;
+        send_server(&mut peer, ServerMsg::Terminals(vec![replacement])).await;
+        send_server(&mut peer, ServerMsg::TerminalCreated(test_terminal(3))).await;
+        assert_eq!(recv_client(&mut peer).await, ClientMsg::Subscribe { id: 3, resume_from_seq: None });
+        assert_eq!(state.lock().terminals.iter().map(|entry| entry.info.id).collect::<Vec<_>>(), [3]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn migration_keeps_processing_output_while_waiting_to_resume_the_agent() {
+        let (conn, mut commands) = test_conn_with_rx(&Handle::current(), false);
+        let tx = conn.cmd_tx.clone();
+        let (local, peer) = tokio::io::duplex(8192);
+        let mut peer = Framed::new(peer, frame_codec());
+        let task = tokio::spawn(async move {
+            session_on(&conn, Framed::new(local, frame_codec()), &mut commands, &mut false, false).await
+        });
+        assert!(matches!(recv_client(&mut peer).await, ClientMsg::Hello { .. }));
+        send_server(&mut peer, welcome(PROTO_VERSION)).await;
+        for _ in 0..3 { recv_client(&mut peer).await; }
+
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let (migration, mut source) = crate::terminal_migration::Migration::test_pair(1, done).await;
+        tx.send(Cmd::Restore {
+            worktree: None, cwd: None, cols: 80, rows: 24,
+            data: RestoreData {
+                resume: Some("codex resume abcdef12".into()),
+                migration: Some(migration),
+                ..RestoreData::fresh_terminal(42)
+            },
+        }).unwrap();
+        let ClientMsg::RestoreTerminal { request_id, .. } = recv_client(&mut peer).await else { panic!("expected restore request") };
+        send_server(&mut peer, ServerMsg::TerminalRestored { request_id, terminal: Some(test_terminal(2)) }).await;
+        assert_eq!(recv_client(&mut source).await, ClientMsg::KillTerminal { id: 1 });
+        assert_eq!(recv_client(&mut peer).await, ClientMsg::Subscribe { id: 2, resume_from_seq: None });
+        send_server(&mut peer, ServerMsg::Output { id: 2, seq: 0, bytes: b"\x1b[6n".to_vec() }).await;
+        // The cursor row depends on the replayed history and separator; only the reply matters.
+        let ClientMsg::Input { id: 2, bytes } = recv_client(&mut peer).await else { panic!("expected cursor reply") };
+        assert!(bytes.starts_with(b"\x1b[") && bytes.ends_with(b"R"), "unexpected reply {bytes:?}");
+        assert!(tokio::time::timeout(Duration::from_millis(50), recv_client(&mut peer)).await.is_err());
+
+        send_server(&mut source, ServerMsg::TerminalRemoved { id: 1 }).await;
+        tokio::time::timeout(Duration::from_secs(3), finished).await.unwrap().unwrap().unwrap();
+        assert_eq!(recv_client(&mut peer).await, ClientMsg::Input { id: 2, bytes: b"codex resume abcdef12\r".to_vec() });
+        task.abort();
     }
 
     async fn exercise_resume(first_output: bool, protected: bool) {

@@ -1,5 +1,6 @@
 //! Left sidebar: Home and the project/worktree tree.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use gpui_kit::assets::IconName as Ic;
@@ -344,6 +345,14 @@ fn dropped_directories(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths
 }
 
+fn expand_group_for_drop(
+    collapsed_groups: &mut HashSet<GroupId>,
+    group: Option<GroupId>,
+    directories: &[PathBuf],
+) -> bool {
+    !directories.is_empty() && group.is_some_and(|id| collapsed_groups.remove(&id))
+}
+
 impl AppView {
     /// Opens the native folder picker and adds the chosen folder as a project (into `group`).
     pub(crate) fn pick_project(&mut self, group: Option<GroupId>, cx: &mut Context<Self>) {
@@ -363,15 +372,18 @@ impl AppView {
         .detach();
     }
 
-    fn add_dropped_projects(&mut self, paths: &ExternalPaths, cx: &mut Context<Self>) {
+    fn add_dropped_projects(&mut self, paths: &ExternalPaths, group: Option<GroupId>, cx: &mut Context<Self>) {
         let paths = paths.paths().to_vec();
         // Checking a folder (e.g. on a network drive) must not block the UI thread.
         let directories = cx.background_executor().spawn(async move { dropped_directories(paths) });
         cx.spawn(async move |this, cx| {
             let directories = directories.await;
-            let _ = this.update(cx, |this, _| {
+            let _ = this.update(cx, |this, cx| {
+                if expand_group_for_drop(&mut this.collapsed_groups, group, &directories) {
+                    cx.notify();
+                }
                 for path in directories {
-                    this.client.add_project(path, None);
+                    this.client.add_project(path, group);
                 }
             });
         })
@@ -506,7 +518,7 @@ impl AppView {
             .bg(theme.sidebar)
             .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
-                this.add_dropped_projects(paths, cx);
+                this.add_dropped_projects(paths, None, cx);
             }))
             .text_color(theme.sidebar_foreground)
             .border_r_1()
@@ -578,6 +590,11 @@ impl AppView {
                 if this.collapsed_groups.remove(&gid) {
                     cx.notify();
                 }
+            }))
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_bg))
+            .on_drop(cx.listener(move |this, paths: &ExternalPaths, _, cx| {
+                cx.stop_propagation();
+                this.add_dropped_projects(paths, Some(gid), cx);
             }))
             .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
                 if !this.collapsed_groups.remove(&gid) {
@@ -1112,6 +1129,16 @@ mod tests {
             dropped_directories(vec![first.clone(), file, scratch.path().join("missing"), second.clone()]),
             [first, second],
         );
+    }
+
+    #[test]
+    fn a_folder_drop_expands_only_its_target_group() {
+        let mut collapsed = HashSet::from([1, 2]);
+        let directories = [PathBuf::from("project")];
+        assert!(!expand_group_for_drop(&mut collapsed, None, &directories));
+        assert!(!expand_group_for_drop(&mut collapsed, Some(2), &[]));
+        assert!(expand_group_for_drop(&mut collapsed, Some(2), &directories));
+        assert_eq!(collapsed, HashSet::from([1]));
     }
 
     #[test]

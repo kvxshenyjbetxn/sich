@@ -129,6 +129,7 @@ pub struct AppView {
     pending_terminal_opens: Vec<PendingTerminalOpen>,
     pending_terminal_restarts: HashMap<TermId, u64>,
     pub(crate) quick_terminals: HashMap<TermId, TemporaryCommand>,
+    quick_return: HashMap<WorkspaceKey, TermId>,
     seen_projects_rev: u64,
     shown_error: Option<Instant>,
     /// Terminal that last received keyboard focus.
@@ -319,6 +320,7 @@ impl AppView {
             pending_terminal_opens: Vec::new(),
             pending_terminal_restarts: HashMap::new(),
             quick_terminals: HashMap::new(),
+            quick_return: HashMap::new(),
             seen_projects_rev: 0,
             shown_error: None,
             focused: None,
@@ -824,6 +826,7 @@ impl AppView {
             self.pending_creates.clear();
             self.pending_terminal_opens.clear();
             self.quick_terminals.clear();
+            self.quick_return.clear();
             self.views.clear();
             self.terminal_layouts.clear();
             self.ws.prune(&[]);
@@ -1039,17 +1042,23 @@ impl AppView {
 
     fn select_terminal(&mut self, id: TermId, put_in_layout: bool, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.ws.selected.clone();
-        if put_in_layout {
-            if let Some(layout) = self.terminal_layouts.get_mut(&key) {
-                let ids: Vec<_> = self.client.snapshot().terminals.iter()
-                    .filter(|entry| key.contains(entry.info.worktree.as_deref()))
-                    .map(|entry| entry.info.id).collect();
-                let previous = self.ws.active_in(&key, &ids)
-                    .map_or_else(|| layout.first_leaf(), |id| visible_active(layout, id));
-                layout.replace(previous, id);
-            } else {
-                self.terminal_layouts.insert(key.clone(), Layout::Leaf(id));
+        if let Some(layout) = self.terminal_layouts.get_mut(&key) {
+            let ids: Vec<_> = self.client.snapshot().terminals.iter()
+                .filter(|entry| key.contains(entry.info.worktree.as_deref()))
+                .map(|entry| entry.info.id).collect();
+            let previous = self.ws.active_in(&key, &ids);
+            if put_in_layout {
+                let previous_is_standalone = previous.is_some_and(|id| {
+                    is_standalone_quick_tab(Some(layout), id, self.quick_terminals.contains_key(&id))
+                });
+                let remembered = self.quick_return.remove(&key);
+                let pane = pane_to_replace(layout, previous, previous_is_standalone, remembered);
+                layout.replace(pane, id);
+            } else if let Some(pane) = previous.filter(|&id| layout.contains(id)) {
+                self.quick_return.insert(key.clone(), pane);
             }
+        } else if put_in_layout {
+            self.terminal_layouts.insert(key.clone(), Layout::Leaf(id));
         }
         for target in &mut self.restore_targets {
             if target.key == key {
@@ -1242,29 +1251,31 @@ impl AppView {
     }
 
     pub(crate) fn restart_legacy_terminal(&mut self, id: TermId, window: &mut Window, cx: &mut Context<Self>) {
-        self.restart_terminals(std::iter::once(id), false, window, cx);
+        self.restart_terminals(Some(id), window, cx);
     }
 
     fn restart_all_legacy_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let snap = self.client.snapshot();
-        if self.restarting_daemon || !matches!(snap.status, ConnStatus::Connected { .. })
-            || !self.pending_terminal_restarts.is_empty()
-        {
+        if !self.pending_terminal_restarts.is_empty() {
             return;
         }
-        self.restart_terminals(
-            legacy_restart_ids(snap.terminals.iter().map(|entry| (entry.info.id, entry.legacy))),
-            true, window, cx,
-        );
+        self.restart_terminals(None, window, cx);
     }
 
     fn restart_terminals(
         &mut self,
-        ids: impl IntoIterator<Item = TermId>,
-        batch: bool,
+        single: Option<TermId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let snap = self.client.snapshot();
+        if !can_restart_terminals(self.restarting_daemon, snap.status) {
+            return;
+        }
+        let ids = match single {
+            Some(id) => vec![id],
+            None => legacy_restart_ids(snap.terminals.iter().map(|entry| (entry.info.id, entry.legacy))).collect(),
+        };
+        let batch = single.is_none();
         let mut targets = Vec::new();
         for id in ids {
             if self.terminal_restarting(id) {
@@ -1289,16 +1300,23 @@ impl AppView {
                 let result = rt.spawn(async move {
                     client.migrate_terminal(id, token, resume, tr(lang, Tr::RestoredScrollback), tr(lang, Tr::AgentInterrupted)).await
                 }).await.map_err(anyhow::Error::from).and_then(|result| result);
-                if let Err(err) = result {
-                    failed = true;
-                    tracing::warn!(id, "could not complete terminal migration: {err:#}");
-                }
-                if this.update_in(cx, |this, _, cx| {
-                    this.map_restarted_terminals(&this.client.snapshot());
+                let Ok(completed) = this.update_in(cx, |this, _, cx| {
+                    let snap = this.client.snapshot();
+                    let completed = if result.is_err() {
+                        this.recover_terminal_restart(&snap, id, token)
+                    } else {
+                        this.map_restarted_terminals(&snap);
+                        true
+                    };
                     this.pending_terminal_restarts.remove(&id);
                     cx.notify();
-                }).is_err() {
+                    completed
+                }) else {
                     return;
+                };
+                if let Err(err) = result && !completed {
+                    failed = true;
+                    tracing::warn!(id, "could not complete terminal migration: {err:#}");
                 }
             }
             if failed {
@@ -1309,6 +1327,28 @@ impl AppView {
             }
         }).detach();
         cx.notify();
+    }
+
+    /// Restore the old pane before removing the pending entry so the next sync leaves it in place.
+    fn recover_terminal_restart(&mut self, snap: &Snapshot, old: TermId, token: u64) -> bool {
+        let replacement = snap.terminals.iter().find(|entry| !entry.legacy && entry.restore_token == Some(token));
+        let old_exists = snap.terminals.iter().any(|entry| entry.legacy && entry.info.id == old);
+        match migration_recovery(old_exists, replacement.map(|entry| entry.info.id)) {
+            MigrationRecovery::KeepReplacement => {
+                self.map_restarted_terminals(snap);
+                true
+            }
+            MigrationRecovery::Revert(new) => {
+                let key = WorkspaceKey::of(replacement.unwrap().info.worktree.as_deref());
+                if let Some(layout) = self.terminal_layouts.get_mut(&key) {
+                    layout.replace(new, old);
+                }
+                self.ws.replace_active(&key, new, old);
+                self.client.kill_terminal(new);
+                false
+            }
+            MigrationRecovery::Nothing => false,
+        }
     }
 
     /// Adopt only the replacement returned for this request, not a concurrent new terminal.
@@ -1432,6 +1472,9 @@ impl AppView {
         self.finish_restore_targets(snap);
         self.terminal_layouts.retain(|key, layout| {
             layout.retain_where(|id| infos.iter().any(|info| info.id == id && key.contains(info.worktree.as_deref())))
+        });
+        self.quick_return.retain(|key, id| {
+            self.terminal_layouts.get(key).is_some_and(|layout| layout.contains(*id))
         });
         self.finish_pending_terminal_opens(snap, window, cx);
         let key = self.ws.selected.clone();
@@ -1958,6 +2001,25 @@ fn legacy_restart_ids(terminals: impl IntoIterator<Item = (TermId, bool)>) -> im
     terminals.into_iter().filter_map(|(id, legacy)| legacy.then_some(id))
 }
 
+fn can_restart_terminals(restarting_daemon: bool, status: ConnStatus) -> bool {
+    !restarting_daemon && matches!(status, ConnStatus::Connected { .. })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MigrationRecovery {
+    KeepReplacement,
+    Revert(TermId),
+    Nothing,
+}
+
+fn migration_recovery(old_exists: bool, replacement: Option<TermId>) -> MigrationRecovery {
+    match (old_exists, replacement) {
+        (true, Some(new)) => MigrationRecovery::Revert(new),
+        (false, Some(_)) => MigrationRecovery::KeepReplacement,
+        (_, None) => MigrationRecovery::Nothing,
+    }
+}
+
 /// Blocking release lookup; run it on the background executor.
 async fn fetch_latest_now() -> anyhow::Result<Option<updater::Release>> {
     updater::fetch_latest(&updater::current_version())
@@ -2210,6 +2272,16 @@ fn is_standalone_quick_tab(layout: Option<&Layout<TermId>>, id: TermId, is_quick
     is_quick && !layout.is_some_and(|layout| layout.contains(id))
 }
 
+fn pane_to_replace(
+    layout: &Layout<TermId>,
+    active: Option<TermId>,
+    active_is_standalone: bool,
+    remembered: Option<TermId>,
+) -> TermId {
+    let pane = if active_is_standalone { remembered } else { active };
+    pane.map_or_else(|| layout.first_leaf(), |id| visible_active(layout, id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2231,12 +2303,40 @@ mod tests {
         assert!(!is_standalone_quick_tab(Some(&layout), 3, true));
     }
 
+    #[test]
+    fn selecting_from_a_quick_tab_replaces_the_previously_focused_pane() {
+        let layout = Layout::Leaf(1).split(2, 1, Edge::Right).split(3, 2, Edge::Bottom);
+        assert_eq!(pane_to_replace(&layout, Some(4), true, Some(3)), 3);
+        assert_eq!(pane_to_replace(&layout.remove(3).unwrap(), Some(4), true, Some(3)), 1);
+        let layout = Layout::Leaf(1).split(2, 1, Edge::Right);
+        assert_eq!(pane_to_replace(&layout, Some(2), false, Some(1)), 2);
+        assert_eq!(pane_to_replace(&layout, None, false, None), 1);
+    }
+
+    #[test]
+    fn a_failed_terminal_migration_reverts_only_if_both_terminals_exist() {
+        use MigrationRecovery::*;
+
+        assert_eq!(migration_recovery(true, Some(7)), Revert(7));
+        assert_eq!(migration_recovery(false, Some(7)), KeepReplacement);
+        assert_eq!(migration_recovery(true, None), Nothing);
+        assert_eq!(migration_recovery(false, None), Nothing);
+    }
+
     const LANG: i18n::Language = i18n::Language::En;
     const CONNECTED: ConnStatus = ConnStatus::Connected { pid: 12345 };
     const INCOMPATIBLE: ConnStatus = ConnStatus::Incompatible {
         pid: None,
         version: None,
     };
+
+    #[test]
+    fn terminal_restarts_require_a_connected_daemon_that_is_not_restarting() {
+        assert!(can_restart_terminals(false, CONNECTED));
+        assert!(!can_restart_terminals(true, CONNECTED));
+        assert!(!can_restart_terminals(false, ConnStatus::Reconnecting));
+        assert!(!can_restart_terminals(false, INCOMPATIBLE));
+    }
 
     #[test]
     fn activity_selects_one_tab_per_run_and_closes_back_to_a_diff_or_terminal() {

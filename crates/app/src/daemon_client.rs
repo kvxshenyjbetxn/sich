@@ -73,7 +73,7 @@ pub(crate) struct ClientState {
     pub failed_terminal_opens: Vec<u64>,
 }
 
-/// Commands from the UI to the connection task.
+/// Commands for the connection task.
 pub(crate) enum Cmd {
     Restart(daemon_restart::Request),
     Restore { worktree: Option<PathBuf>, cwd: Option<PathBuf>, cols: u16, rows: u16, data: RestoreData },
@@ -91,6 +91,7 @@ pub(crate) enum Cmd {
     MarkSeen(TermId),
     Input(TermId, Vec<u8>),
     Resume(Arc<()>, TermId, Vec<u8>),
+    ScheduleResume { incarnation: Arc<()>, id: TermId, bytes: Vec<u8>, protect: bool },
     Resize(TermId, u16, u16),
 }
 
@@ -428,6 +429,7 @@ impl DaemonPool {
         let owner = self.owner(key).context("terminal owner changed")?;
         let (done, finished) = tokio::sync::oneshot::channel();
         let (migration, info) = Migration::capture(&owner, entry.session.last_seq(), done).await?;
+        let finished_by = migration.deadline + terminal_migration::IPC_TIMEOUT + Duration::from_secs(2);
         let cwd = [Some(info.cwd), info.worktree.clone()].into_iter().flatten().find(|path| path.is_dir());
         let agent = info.agent.as_ref();
         let data = RestoreData {
@@ -440,7 +442,7 @@ impl DaemonPool {
             self.send_restore(info.worktree, cwd, entry.session.size(), data),
             "could not request replacement from the current daemon",
         );
-        tokio::time::timeout(terminal_migration::RESTORE_TIMEOUT, finished).await
+        tokio::time::timeout_at(finished_by, finished).await
             .context("timed out waiting for the replacement terminal")?
             .context("current daemon disconnected during terminal migration")?
     }
