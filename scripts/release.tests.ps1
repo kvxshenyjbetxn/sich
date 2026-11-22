@@ -36,4 +36,11 @@ Assert-Throws { Set-WorkspaceVersion "[package]`nversion = `"1.0.0`"`n" '2.0.0' 
 
 Assert-Equal (Format-Sha256Line 'ABCDEF01' 'x.zip') 'abcdef01  x.zip' 'sha line'
 
+$gen = @(Get-ReleaseNotesArgs '')
+Assert-Equal $gen.Count 1 'generate-notes is one argument'
+Assert-Equal $gen[0] '--generate-notes' 'generate-notes flag'
+$own = @(Get-ReleaseNotesArgs 'Fix things')
+Assert-Equal $own.Count 2 'notes are two arguments'
+Assert-Equal ($own -join '|') '--notes|Fix things' 'notes flag and text'
+
 Write-Host 'release.tests.ps1: all checks passed'

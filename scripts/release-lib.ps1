@@ -52,6 +52,14 @@ function Set-WorkspaceVersion([string]$Toml, [string]$Version) {
     return ($parts -join '')
 }
 
+# Release-notes arguments for `gh release create`. Callers must wrap the call in @(...): a
+# one-element array returned from a function unrolls to a plain string, and splatting a string
+# passes its characters one by one (gh then fails with "no matches found for `-`").
+function Get-ReleaseNotesArgs([string]$Notes) {
+    if ($Notes) { return @('--notes', $Notes) }
+    return @('--generate-notes')
+}
+
 # sha256sum format line (without trailing newline).
 function Format-Sha256Line([string]$Hash, [string]$FileName) {
     return "$($Hash.ToLowerInvariant())  $FileName"

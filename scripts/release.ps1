@@ -89,7 +89,7 @@ try {
         Invoke-Native 'git tag' { git tag $tag }
         Invoke-Native 'git push master' { git push origin master }
         Invoke-Native 'git push tag' { git push origin $tag }
-        $notesArgs = if ($Notes) { @('--notes', $Notes) } else { @('--generate-notes') }
+        $notesArgs = @(Get-ReleaseNotesArgs $Notes)
         # GitHub sometimes fails right after the tag push; retry a few times.
         foreach ($attempt in 1..3) {
             gh release create $tag $zip $shaFile --title "Sich v$Version" @notesArgs
