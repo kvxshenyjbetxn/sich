@@ -98,7 +98,7 @@ fn parse_log(bytes: &[u8]) -> Vec<Commit> {
         .collect()
 }
 
-fn parse_name_status(bytes: &[u8]) -> Vec<FileChange> {
+pub(crate) fn parse_name_status(bytes: &[u8]) -> Vec<FileChange> {
     let mut records = bytes.split(|&b| b == 0);
     let mut files = Vec::new();
     while let Some(code) = records.next().and_then(|s| s.first()) {

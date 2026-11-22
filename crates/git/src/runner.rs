@@ -93,6 +93,21 @@ impl Repo {
     pub(crate) fn write(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<(), GitError> {
         run(&self.root, &self.env, args, false, stdin, None).map(|_| ())
     }
+
+    /// Mutating command that returns stdout and may set extra environment variables.
+    pub(crate) fn write_output(
+        &self,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Vec<u8>, GitError> {
+        let mut env = self.env.clone();
+        env.extend(
+            extra_env
+                .iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v))),
+        );
+        run(&self.root, &env, args, false, None, None).map(|(bytes, _)| bytes)
+    }
 }
 
 fn retry_index_lock<T>(
@@ -321,6 +336,10 @@ pub(crate) mod test_repo {
                     .unwrap()
                     .0,
             )
+        }
+
+        pub fn try_git(&self, args: &[&str]) -> Result<String, GitError> {
+            run(&self.dir, &self.env, args, false, None, None).map(|(bytes, _)| text(&bytes))
         }
 
         pub fn open(&self) -> Repo {

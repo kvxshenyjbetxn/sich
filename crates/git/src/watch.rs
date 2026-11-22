@@ -82,12 +82,19 @@ impl WatchRoots {
 }
 
 fn git_signal(path: &Path) -> WatchSignal {
-    if path.starts_with("refs") || path == Path::new("logs/HEAD") {
+    if path.starts_with("refs")
+        || path == Path::new("logs/HEAD")
+        || path == Path::new("logs/refs/stash")
+        || path == Path::new("rebase-merge")
+        || path == Path::new("rebase-apply")
+    {
         return WatchSignal::REFS;
     }
     match path.to_str() {
         Some("HEAD" | "packed-refs") => WatchSignal::REFS,
-        Some("index" | "FETCH_HEAD" | "MERGE_HEAD") => WatchSignal::FILES,
+        Some("index" | "FETCH_HEAD" | "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD") => {
+            WatchSignal::FILES
+        }
         _ => WatchSignal::default(),
     }
 }
@@ -160,6 +167,10 @@ mod tests {
             "meta/worktrees/work/logs/HEAD",
             "meta/refs/remotes/origin/main",
             "meta/packed-refs",
+            "meta/refs/stash",
+            "meta/logs/refs/stash",
+            "meta/worktrees/work/rebase-merge",
+            "meta/worktrees/work/rebase-apply",
         ] {
             assert_eq!(
                 roots.path_signal(Path::new(path)),
@@ -170,6 +181,8 @@ mod tests {
         for path in [
             "meta/worktrees/work/index",
             "meta/worktrees/work/MERGE_HEAD",
+            "meta/worktrees/work/CHERRY_PICK_HEAD",
+            "meta/worktrees/work/REVERT_HEAD",
             "meta/worktrees/work/FETCH_HEAD",
             "work/src/main.rs",
             "work/src/build/mod.rs",
@@ -188,6 +201,7 @@ mod tests {
             "work/.venv/file",
             "meta/objects/id",
             "meta/logs/refs/main",
+            "meta/worktrees/work/rebase-merge/done",
             "meta/worktrees/work/index.lock",
             "work/cargo.lock",
             "something-else",

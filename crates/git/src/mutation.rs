@@ -76,22 +76,66 @@ impl Repo {
     }
 
     pub fn push(&self) -> Result<(), GitError> {
+        self.push_with(&["push"])
+    }
+
+    pub fn push_force_with_lease(&self) -> Result<(), GitError> {
+        self.push_with(&["push", "--force-with-lease"])
+    }
+
+    pub fn pull_rebase(&self) -> Result<(), GitError> {
+        self.write(&["pull", "--rebase"], None)
+    }
+
+    pub fn commit_amend(&self, message: &str) -> Result<(), GitError> {
+        if message.trim().is_empty() {
+            return Err(GitError::Failed("Commit message is empty".into()));
+        }
+        self.write(&["commit", "--amend", "-F", "-"], Some(message.as_bytes()))
+    }
+
+    pub fn last_commit_message(&self) -> Result<Option<String>, GitError> {
+        if !self.has_head()? {
+            return Ok(None);
+        }
+        let output = self.read(&["log", "-1", "--format=%B"])?;
+        Ok(Some(text(&output).trim_end().to_owned()))
+    }
+
+    pub fn undo_last_commit(&self) -> Result<(), GitError> {
+        if !self.has_head()? {
+            return Err(GitError::Failed("No commits to undo".into()));
+        }
+        match self.read(&["rev-parse", "--verify", "--quiet", "HEAD~1"]) {
+            Ok(_) => {}
+            Err(GitError::Failed(_)) => {
+                return Err(GitError::Failed("Cannot undo the initial commit".into()));
+            }
+            Err(error) => return Err(error),
+        }
+        self.write(&["reset", "--soft", "HEAD~1"], None)
+    }
+
+    /// Runs `base` (`push` or `push --force-with-lease`), adding the upstream when missing.
+    fn push_with(&self, base: &[&str]) -> Result<(), GitError> {
         let branch = match self.read(&["symbolic-ref", "HEAD"]) {
             Ok(branch) => text(&branch),
             Err(GitError::Failed(error)) if error.contains("not a symbolic ref") => {
-                return self.write(&["push"], None);
+                return self.write(base, None);
             }
             Err(error) => return Err(error),
         };
         let upstream = self.read(&["for-each-ref", "--format=%(upstream)", branch.trim_end()])?;
         if upstream.trim_ascii().is_empty() {
-            self.write(&["push", "--set-upstream", "origin", "HEAD"], None)
+            let mut args = base.to_vec();
+            args.extend(["--set-upstream", "origin", "HEAD"]);
+            self.write(&args, None)
         } else {
-            self.write(&["push"], None)
+            self.write(base, None)
         }
     }
 
-    fn has_head(&self) -> Result<bool, GitError> {
+    pub(crate) fn has_head(&self) -> Result<bool, GitError> {
         match self.read(&["rev-parse", "--verify", "HEAD"]) {
             Ok(_) => Ok(true),
             Err(GitError::Failed(error)) if error.contains("Needed a single revision") => Ok(false),

@@ -67,12 +67,14 @@ pub struct RepoStatus {
     pub unstaged: Vec<FileChange>,
     pub conflicted: Vec<FileChange>,
     pub truncated: bool,
+    pub in_progress: Option<crate::InProgress>,
 }
 
 impl Repo {
     pub fn status(&self) -> Result<RepoStatus, GitError> {
         let output = self.status_output()?;
         let mut status = parse_status(&output, STATUS_LIMIT);
+        status.in_progress = self.in_progress();
         if !status.truncated {
             let tracked = status
                 .unstaged
