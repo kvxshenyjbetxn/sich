@@ -35,6 +35,13 @@ sich-hooks = { path = "crates/hooks" }
 sich-git = { path = "crates/git" }
 sich-orch = { path = "crates/orch" }
 
+# Smaller debug builds: line numbers in our code, no debug info for dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
