@@ -21,11 +21,13 @@ pub enum CompareSource {
     Staged,
     Commit(String),
     Conflict,
+    /// Two fixed commits: `base` (the merge base) against `head` (a pull request's head).
+    Range { base: String, head: String },
 }
 
 impl CompareSource {
     pub fn is_live(&self) -> bool {
-        !matches!(self, Self::Commit(_))
+        !matches!(self, Self::Commit(_) | Self::Range { .. })
     }
 }
 
@@ -99,6 +101,10 @@ impl Repo {
                 };
                 (old, self.blob(&format!("{oid}:{path}"))?)
             }
+            CompareSource::Range { base, head } => (
+                self.blob(&format!("{base}:{}", original.unwrap_or(path)))?,
+                self.blob(&format!("{head}:{path}"))?,
+            ),
             CompareSource::Conflict => (
                 self.blob(&format!(":2:{path}"))?,
                 self.blob(&format!(":3:{path}"))?,
@@ -113,6 +119,33 @@ impl Repo {
                 old.into_text(),
                 new.into_text(),
             )))
+        }
+    }
+
+    /// The `(merge_base, head)` pair GitHub's "Files changed" compares, when `head_oid` exists
+    /// locally and shares history with `base_ref`; `None` otherwise (for example the branch has
+    /// not been fetched yet).
+    pub fn pr_range(
+        &self,
+        base_ref: &str,
+        head_oid: &str,
+    ) -> Result<Option<(String, String)>, GitError> {
+        let hex = !head_oid.is_empty() && head_oid.chars().all(|c| c.is_ascii_hexdigit());
+        if !hex || base_ref.is_empty() || base_ref.starts_with('-') {
+            return Err(GitError::Failed(format!(
+                "Invalid revision: {base_ref:?} {head_oid:?}"
+            )));
+        }
+        let commit = format!("{head_oid}^{{commit}}");
+        if self.read(&["cat-file", "-e", &commit]).is_err() {
+            return Ok(None);
+        }
+        match self.read(&["merge-base", base_ref, head_oid]) {
+            Ok(bytes) => {
+                let base = text(&bytes).trim().to_owned();
+                Ok((!base.is_empty()).then(|| (base, head_oid.to_owned())))
+            }
+            Err(_) => Ok(None),
         }
     }
 

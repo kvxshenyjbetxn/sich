@@ -2,6 +2,8 @@
 //!
 //! Sich never reads gh credentials or tokens: every call is a plain `gh` invocation.
 mod agent_prompt;
+mod details;
+mod files;
 mod gh;
 mod github;
 mod model;
@@ -15,6 +17,8 @@ pub use agent_prompt::{
     KEEP_REPORTS, LOG_TAIL_BYTES, LOG_TAIL_LINES, agent_prompt, agent_prompt_line, log_tail, prune_reports,
     write_report,
 };
+pub use details::{DetailsEdit, Label, PrDetails, RepoUser, Reviewer, is_valid_login, parse_details};
+pub use files::{FileStatus, MAX_FILES, PrFile, ViewedState, totals as files_totals, viewed_count};
 pub use gh::{GhCli, GhExec, GhOutput};
 pub use github::{CreatePr, CreatedPr, GitHub, HeadRef, MergeMethod};
 pub use model::{

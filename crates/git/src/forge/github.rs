@@ -99,12 +99,12 @@ impl<E: GhExec> GitHub<E> {
         &self.repo
     }
 
-    fn run(&self, args: &[String], timeout: Duration) -> Result<GhOutput, ForgeError> {
+    pub(super) fn run(&self, args: &[String], timeout: Duration) -> Result<GhOutput, ForgeError> {
         self.exec.run(&self.dir, args, timeout)
     }
 
     /// Runs gh and turns any non-zero exit into an error.
-    fn run_ok(&self, args: &[String], timeout: Duration) -> Result<GhOutput, ForgeError> {
+    pub(super) fn run_ok(&self, args: &[String], timeout: Duration) -> Result<GhOutput, ForgeError> {
         let output = self.run(args, timeout)?;
         if output.code == Some(0) {
             Ok(output)

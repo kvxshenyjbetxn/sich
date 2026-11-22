@@ -403,3 +403,47 @@ fn longest_line_measures_both_sides_after_tab_expansion_and_control_filtering() 
         5000
     );
 }
+
+#[test]
+fn compares_a_pull_request_range_against_the_merge_base() {
+    let fixture = TestRepo::new();
+    let repo = fixture.open();
+    fixture.file("modified", "one\n");
+    fixture.file("deleted", "gone soon\n");
+    fixture.file("old_name", "same\n");
+    fixture.commit("initial");
+    let fork_point = fixture.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    fixture.git(&["checkout", "-q", "-b", "feature"]);
+    fixture.file("modified", "one\ntwo\n");
+    fixture.file("added", "new\n");
+    fs::remove_file(fixture.dir.join("deleted")).unwrap();
+    fixture.git(&["mv", "old_name", "new_name"]);
+    fixture.commit("feature work");
+    let head = fixture.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    fixture.git(&["checkout", "-q", "main"]);
+    // The base branch moves on; GitHub still compares against the merge base.
+    fixture.file("modified", "changed on main\n");
+    fixture.commit("main moves on");
+
+    let (base, tip) = repo.pr_range("main", &head).unwrap().expect("range");
+    assert_eq!((base.as_str(), tip.as_str()), (fork_point.as_str(), head.as_str()));
+    let range = CompareSource::Range { base, head: tip };
+    assert!(!range.is_live());
+    assert_versions(&repo, key("modified", range.clone()), None, "one\n", "one\ntwo\n");
+    assert_versions(&repo, key("added", range.clone()), None, "", "new\n");
+    assert_versions(&repo, key("deleted", range.clone()), None, "gone soon\n", "");
+    assert_versions(&repo, key("new_name", range), Some("old_name"), "same\n", "same\n");
+}
+
+#[test]
+fn pr_range_is_none_for_an_unknown_head_and_rejects_bad_input() {
+    let fixture = TestRepo::new();
+    let repo = fixture.open();
+    fixture.file("a", "a\n");
+    fixture.commit("initial");
+    let missing = "0123456789abcdef0123456789abcdef01234567";
+    assert_eq!(repo.pr_range("main", missing).unwrap(), None);
+    assert!(repo.pr_range("main", "--all").is_err());
+    assert!(repo.pr_range("--all", missing).is_err());
+    assert!(repo.pr_range("main", "").is_err());
+}

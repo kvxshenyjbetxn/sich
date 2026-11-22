@@ -365,6 +365,46 @@ pub enum Tr {
     WorktreeLocSiblingDesc,
     WorktreeLocInsideDesc,
     WorktreeLocSharedDesc,
+    // ---- comments keys: append below ----
+    // ---- end comments ----
+
+    // ---- checks keys: append below ----
+    // ---- end checks ----
+
+    // ---- details keys: append below ----
+    DetTitle,
+    DetOpenedBy,
+    DetNoDescription,
+    DetShowMore,
+    DetShowLess,
+    DetEdit,
+    DetReviewers,
+    DetLabels,
+    DetAssignees,
+    DetAdd,
+    DetRemove,
+    DetNone,
+    DetLoading,
+    DetReviewApproved,
+    DetReviewChanges,
+    DetReviewCommented,
+    DetReviewPending,
+    DetEditTitle,
+    DetSave,
+    DetPickReviewer,
+    DetPickLabel,
+    DetPickAssignee,
+    DetPickerFilter,
+    DetPickerCustom,
+    DetPickerNoMatches,
+    FilesTitle,
+    FilesViewed,
+    FilesFilter,
+    FilesFetchHint,
+    FilesLoading,
+    FilesNone,
+    FilesMarkViewed,
+    // ---- end details ----
 }
 
 impl Tr {
@@ -693,6 +733,46 @@ impl Tr {
         Tr::WorktreeLocSiblingDesc,
         Tr::WorktreeLocInsideDesc,
         Tr::WorktreeLocSharedDesc,
+        // ---- comments keys: append below ----
+        // ---- end comments ----
+
+        // ---- checks keys: append below ----
+        // ---- end checks ----
+
+        // ---- details keys: append below ----
+        Tr::DetTitle,
+        Tr::DetOpenedBy,
+        Tr::DetNoDescription,
+        Tr::DetShowMore,
+        Tr::DetShowLess,
+        Tr::DetEdit,
+        Tr::DetReviewers,
+        Tr::DetLabels,
+        Tr::DetAssignees,
+        Tr::DetAdd,
+        Tr::DetRemove,
+        Tr::DetNone,
+        Tr::DetLoading,
+        Tr::DetReviewApproved,
+        Tr::DetReviewChanges,
+        Tr::DetReviewCommented,
+        Tr::DetReviewPending,
+        Tr::DetEditTitle,
+        Tr::DetSave,
+        Tr::DetPickReviewer,
+        Tr::DetPickLabel,
+        Tr::DetPickAssignee,
+        Tr::DetPickerFilter,
+        Tr::DetPickerCustom,
+        Tr::DetPickerNoMatches,
+        Tr::FilesTitle,
+        Tr::FilesViewed,
+        Tr::FilesFilter,
+        Tr::FilesFetchHint,
+        Tr::FilesLoading,
+        Tr::FilesNone,
+        Tr::FilesMarkViewed,
+        // ---- end details ----
     ];
 }
 
@@ -2308,6 +2388,174 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "работает",
             En => "working",
         },
+        // ---- comments keys: append below ----
+        // ---- end comments ----
+
+        // ---- checks keys: append below ----
+        // ---- end checks ----
+
+        // ---- details keys: append below ----
+        Tr::DetTitle => match lang {
+            Uk => "Деталі",
+            Ru => "Детали",
+            En => "Details",
+        },
+        Tr::DetOpenedBy => match lang {
+            Uk => "відкрив @{user} · {when}",
+            Ru => "открыл @{user} · {when}",
+            En => "opened by @{user} · {when}",
+        },
+        Tr::DetNoDescription => match lang {
+            Uk => "Без опису",
+            Ru => "Без описания",
+            En => "No description",
+        },
+        Tr::DetShowMore => match lang {
+            Uk => "Показати більше",
+            Ru => "Показать больше",
+            En => "Show more",
+        },
+        Tr::DetShowLess => match lang {
+            Uk => "Показати менше",
+            Ru => "Показать меньше",
+            En => "Show less",
+        },
+        Tr::DetEdit => match lang {
+            Uk => "Редагувати",
+            Ru => "Редактировать",
+            En => "Edit",
+        },
+        Tr::DetReviewers => match lang {
+            Uk => "Рецензенти",
+            Ru => "Ревьюеры",
+            En => "Reviewers",
+        },
+        Tr::DetLabels => match lang {
+            Uk => "Мітки",
+            Ru => "Метки",
+            En => "Labels",
+        },
+        Tr::DetAssignees => match lang {
+            Uk => "Виконавці",
+            Ru => "Исполнители",
+            En => "Assignees",
+        },
+        Tr::DetAdd => match lang {
+            Uk => "Додати",
+            Ru => "Добавить",
+            En => "Add",
+        },
+        Tr::DetRemove => match lang {
+            Uk => "Прибрати",
+            Ru => "Убрать",
+            En => "Remove",
+        },
+        Tr::DetNone => match lang {
+            Uk => "Немає",
+            Ru => "Нет",
+            En => "None",
+        },
+        Tr::DetLoading => match lang {
+            Uk => "Завантаження…",
+            Ru => "Загрузка…",
+            En => "Loading…",
+        },
+        Tr::DetReviewApproved => match lang {
+            Uk => "Схвалено",
+            Ru => "Одобрено",
+            En => "Approved",
+        },
+        Tr::DetReviewChanges => match lang {
+            Uk => "Запросив зміни",
+            Ru => "Запросил изменения",
+            En => "Changes requested",
+        },
+        Tr::DetReviewCommented => match lang {
+            Uk => "Залишив коментар",
+            Ru => "Оставил комментарий",
+            En => "Commented",
+        },
+        Tr::DetReviewPending => match lang {
+            Uk => "Очікує рев'ю",
+            Ru => "Ожидает ревью",
+            En => "Review pending",
+        },
+        Tr::DetEditTitle => match lang {
+            Uk => "Редагувати pull request",
+            Ru => "Редактировать pull request",
+            En => "Edit pull request",
+        },
+        Tr::DetSave => match lang {
+            Uk => "Зберегти",
+            Ru => "Сохранить",
+            En => "Save",
+        },
+        Tr::DetPickReviewer => match lang {
+            Uk => "Додати рецензента",
+            Ru => "Добавить ревьюера",
+            En => "Add reviewer",
+        },
+        Tr::DetPickLabel => match lang {
+            Uk => "Додати мітку",
+            Ru => "Добавить метку",
+            En => "Add label",
+        },
+        Tr::DetPickAssignee => match lang {
+            Uk => "Додати виконавця",
+            Ru => "Добавить исполнителя",
+            En => "Add assignee",
+        },
+        Tr::DetPickerFilter => match lang {
+            Uk => "Фільтр або ім'я",
+            Ru => "Фильтр или имя",
+            En => "Filter or type a name",
+        },
+        Tr::DetPickerCustom => match lang {
+            Uk => "Додати «{name}»",
+            Ru => "Добавить «{name}»",
+            En => "Add «{name}»",
+        },
+        Tr::DetPickerNoMatches => match lang {
+            Uk => "Нічого не знайдено",
+            Ru => "Ничего не найдено",
+            En => "No matches",
+        },
+        Tr::FilesTitle => match lang {
+            Uk => "Змінені файли",
+            Ru => "Изменённые файлы",
+            En => "Files changed",
+        },
+        Tr::FilesViewed => match lang {
+            Uk => "Переглянуто {k}/{n}",
+            Ru => "Просмотрено {k}/{n}",
+            En => "Viewed {k}/{n}",
+        },
+        Tr::FilesFilter => match lang {
+            Uk => "Фільтр файлів",
+            Ru => "Фильтр файлов",
+            En => "Filter files",
+        },
+        Tr::FilesFetchHint => match lang {
+            Uk => "Отримайте гілку (fetch), щоб бачити різницю",
+            Ru => "Получите ветку (fetch), чтобы видеть diff",
+            En => "Fetch the branch to view diffs",
+        },
+        Tr::FilesLoading => match lang {
+            Uk => "Завантаження файлів…",
+            Ru => "Загрузка файлов…",
+            En => "Loading files…",
+        },
+        Tr::FilesNone => match lang {
+            Uk => "Немає змін",
+            Ru => "Нет изменений",
+            En => "No changed files",
+        },
+        Tr::FilesMarkViewed => match lang {
+            Uk => "Позначити переглянутим",
+            Ru => "Отметить просмотренным",
+            En => "Mark as viewed",
+        },
+        // ---- end details ----
     }
 }
 

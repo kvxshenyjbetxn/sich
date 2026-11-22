@@ -4,6 +4,10 @@ mod branch_picker;
 mod ops_menu;
 mod pr;
 mod pr_card;
+mod pr_comments;
+mod pr_details;
+mod pr_edit_dialog;
+mod pr_files;
 mod pr_dialog;
 mod render;
 mod stash_section;
@@ -380,6 +384,8 @@ pub(crate) struct GitPanel {
     store: Entity<PrStore>,
     /// Which of the two right-panel tabs this panel renders (set by the app).
     pane: RightTab,
+    /// State of the PR tab's details and files sections.
+    pr_extras: pr_details::PrExtras,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -424,6 +430,7 @@ impl GitPanel {
             stashes_collapsed: false,
             store,
             pane: RightTab::Git,
+            pr_extras: pr_details::PrExtras::default(),
             _subscriptions: subscriptions,
         }
     }
