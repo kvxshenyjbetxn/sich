@@ -218,8 +218,7 @@ pub(crate) fn plan_fetches(
 mod tests {
     use sich_git::forge::{CheckState, PullRequest};
 
-    use super::super::model::PrTarget;
-    use super::super::testutil::{check, pr, remote};
+    use super::super::testutil::{check, pr, target};
     use super::*;
 
     const SEC: fn(u64) -> Duration = Duration::from_secs;
@@ -344,7 +343,7 @@ mod tests {
 
     fn resolved(branch: &str, view: PrView) -> PrEntry {
         PrEntry {
-            target: Some(PrTarget { remote: "origin".into(), repo: remote(), base: Some("main".into()) }),
+            target: Some(target(Some("main"))),
             resolved_branch: Some(branch.into()),
             resolved_at: Some(Instant::now()),
             row_branch: Some(branch.into()),

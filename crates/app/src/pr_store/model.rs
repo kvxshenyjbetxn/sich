@@ -1,27 +1,116 @@
 //! Data model of the PR store: what a fetch depends on, what a worktree's PR looks like, and the
 //! blocking git/`gh` work (run on a background executor by the store).
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use sich_git::forge::{ForgeError, GhExec, GitHub, MergeMethod, PullRequest, RemoteRepo};
+use sich_git::forge::{ForgeError, GhExec, GitHub, HeadRef, MergeMethod, PullRequest, RemoteRepo};
 use sich_git::{Repo, RepoStatus};
 
 use super::schedule::FetchState;
 
-/// Where pull requests of a worktree live: the push remote, its GitHub repository and the
-/// branch pull requests normally target.
+/// Where pull requests of a worktree live. The branch is pushed to the push (head) remote, but
+/// the pull requests live in the base repository: the same repository for a plain clone, the
+/// upstream repository for a fork.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PrTarget {
+    /// The push (head) remote.
     pub remote: String,
+    /// The base repository: every `gh` call uses it as `--repo`.
     pub repo: RemoteRepo,
+    /// Owner of the head repository when it differs from the base (cross-repository PRs).
+    pub head_owner: Option<String>,
+    /// A local remote pointing at the base repository, if there is one.
+    pub base_remote: Option<String>,
+    /// The branch pull requests normally target.
     pub base: Option<String>,
+    /// The ref commits are counted against (`<remote>/<base>`), when it exists locally.
+    pub base_ref: Option<String>,
 }
 
 impl PrTarget {
-    /// `<remote>/<base>`, the ref commits are counted against.
-    pub(crate) fn base_ref(&self) -> Option<String> {
-        self.base.as_ref().map(|base| format!("{}/{base}", self.remote))
+    /// The head of a pull request opened from `branch`.
+    pub(crate) fn head_ref(&self, branch: &str) -> HeadRef {
+        HeadRef::new(self.head_owner.clone(), branch)
     }
+
+    /// The remote whose branches are offered as bases: the base remote, else the push remote.
+    pub(crate) fn branches_remote(&self) -> &str {
+        self.base_remote.as_deref().unwrap_or(&self.remote)
+    }
+}
+
+/// Outcome of choosing the base repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BaseResolution {
+    pub repo: RemoteRepo,
+    pub remote: Option<String>,
+    pub head_owner: Option<String>,
+    pub cross_repo: bool,
+}
+
+/// Picks the base repository: the one `gh repo set-default` marked, else the parent of a fork
+/// head repository (`fork_parent` is only called when needed), else the head repository itself.
+pub(crate) fn resolve_base(
+    remotes: &[(String, Option<RemoteRepo>)],
+    gh_resolved: Option<&str>,
+    push_remote: &str,
+    head: &RemoteRepo,
+    fork_parent: impl FnOnce() -> Option<RemoteRepo>,
+) -> BaseResolution {
+    let from_gh = gh_resolved
+        .and_then(|name| remotes.iter().find(|(n, _)| n == name))
+        .and_then(|(_, repo)| repo.clone())
+        .filter(RemoteRepo::is_github);
+    let repo = from_gh.or_else(fork_parent).unwrap_or_else(|| head.clone());
+    let cross_repo = !repo.same_repo(head);
+    let preferred = gh_resolved.into_iter().chain([push_remote]);
+    let remote = preferred
+        .chain(remotes.iter().map(|(name, _)| name.as_str()))
+        .find_map(|name| {
+            let (_, candidate) = remotes.iter().find(|(n, _)| n == name)?;
+            candidate.as_ref().filter(|c| c.same_repo(&repo)).map(|_| name.to_owned())
+        });
+    BaseResolution {
+        head_owner: cross_repo.then(|| head.owner.clone()),
+        repo,
+        remote,
+        cross_repo,
+    }
+}
+
+/// `<remote>/<base>`: the base remote's ref when there is a base remote, else the push remote's
+/// ref when it exists, else nothing (no divergence hint).
+pub(crate) fn choose_base_ref(
+    base_remote: Option<&str>,
+    push_remote: &str,
+    base: &str,
+    ref_exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if let Some(remote) = base_remote {
+        return Some(format!("{remote}/{base}"));
+    }
+    let candidate = format!("{push_remote}/{base}");
+    ref_exists(&format!("refs/remotes/{candidate}")).then_some(candidate)
+}
+
+/// Parent repositories of fork head repositories, cached for the app session. Errors are not cached.
+fn fork_parent_cache() -> &'static Mutex<HashMap<String, Option<RemoteRepo>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<RemoteRepo>>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+fn cached_fork_parent(dir: &std::path::Path, head: &RemoteRepo) -> Option<RemoteRepo> {
+    let key = head.web_url().to_ascii_lowercase();
+    if let Some(known) = fork_parent_cache().lock().ok()?.get(&key) {
+        return known.clone();
+    }
+    let parent = GitHub::new(dir.to_path_buf(), head.clone()).fork_parent().ok()?;
+    if let Ok(mut cache) = fork_parent_cache().lock() {
+        cache.insert(key, parent.clone());
+    }
+    parent
 }
 
 /// What a PR fetch depends on. When it changes after a status refresh, something moved the
@@ -112,8 +201,8 @@ pub(crate) fn merge_result(previous: &PrView, new: PrView) -> PrView {
     }
 }
 
-pub(crate) fn fetch_view<E: GhExec>(gh: &GitHub<E>, branch: &str) -> PrView {
-    view_from_result(gh.pr_for_branch(branch))
+pub(crate) fn fetch_view<E: GhExec>(gh: &GitHub<E>, head: &HeadRef) -> PrView {
+    view_from_result(gh.pr_for_branch(head))
 }
 
 /// Per-worktree pull request state, cached by worktree path.
@@ -180,12 +269,38 @@ pub(crate) fn result_is_current(entry_branch: Option<&str>, result_branch: &str)
 // Background work
 // ---------------------------------------------------------------------------------------------
 
-/// Finds the push remote and its GitHub repository (git only, no network).
+/// Finds the push (head) remote and the base repository where pull requests live. Mostly git;
+/// `gh` is asked (once per head repository) only for a fork's parent when `gh repo set-default`
+/// did not already say.
 pub(crate) fn resolve_target(repo: &Repo) -> Option<PrTarget> {
     let remote = repo.push_remote().ok().flatten()?;
-    let remote_repo = repo.remote_repo().ok().flatten().filter(RemoteRepo::is_github)?;
-    let base = repo.default_base(&remote).ok().flatten();
-    Some(PrTarget { remote, repo: remote_repo, base })
+    let head = repo.remote_repo().ok().flatten().filter(RemoteRepo::is_github)?;
+    let remotes = repo.remotes().unwrap_or_default();
+    let gh_resolved = repo.gh_resolved_base().ok().flatten();
+    let root = repo.root().to_path_buf();
+    let resolution = resolve_base(&remotes, gh_resolved.as_deref(), &remote, &head, || {
+        cached_fork_parent(&root, &head)
+    });
+    let base = match resolution.remote.as_deref() {
+        Some(base_remote) => repo.default_base(base_remote).ok().flatten(),
+        None => GitHub::new(root, resolution.repo.clone())
+            .default_branch()
+            .ok()
+            .or_else(|| repo.default_base(&remote).ok().flatten()),
+    };
+    let base_ref = base.as_deref().and_then(|base| {
+        choose_base_ref(resolution.remote.as_deref(), &remote, base, |full| {
+            repo.ref_exists(full).unwrap_or(false)
+        })
+    });
+    Some(PrTarget {
+        remote,
+        repo: resolution.repo,
+        head_owner: resolution.head_owner,
+        base_remote: resolution.remote,
+        base,
+        base_ref,
+    })
 }
 
 pub(crate) struct Fetched {
@@ -194,7 +309,7 @@ pub(crate) struct Fetched {
 }
 
 pub(crate) fn divergence(repo: &Repo, target: &PrTarget) -> Option<(u32, u32)> {
-    repo.base_divergence(&target.base_ref()?).ok()
+    repo.base_divergence(target.base_ref.as_deref()?).ok()
 }
 
 pub(crate) fn fetch_pr(repo: &Repo, target: &PrTarget, branch: &str) -> Fetched {
@@ -203,7 +318,7 @@ pub(crate) fn fetch_pr(repo: &Repo, target: &PrTarget, branch: &str) -> Fetched 
         PrView::NoPr
     } else {
         let gh = GitHub::new(repo.root().to_path_buf(), target.repo.clone());
-        fetch_view(&gh, branch)
+        fetch_view(&gh, &target.head_ref(branch))
     };
     Fetched { view, divergence }
 }
@@ -242,8 +357,116 @@ pub(crate) fn run_action(
 mod tests {
     use sich_git::forge::{GhOutput, PrState};
 
-    use super::super::testutil::{Scripted, pr, remote};
+    use super::super::testutil::{Scripted, pr, remote, target};
     use super::*;
+
+    fn rr(host: &str, owner: &str, name: &str) -> RemoteRepo {
+        RemoteRepo { host: host.into(), owner: owner.into(), name: name.into() }
+    }
+
+    fn fork() -> RemoteRepo {
+        rr("github.com", "kvx", "AE2")
+    }
+
+    fn upstream() -> RemoteRepo {
+        rr("github.com", "GTNH", "AE2")
+    }
+
+    fn fork_remotes() -> Vec<(String, Option<RemoteRepo>)> {
+        vec![("origin".into(), Some(fork())), ("upstream".into(), Some(upstream()))]
+    }
+
+    #[test]
+    fn fork_with_gh_default_targets_upstream_with_owner_qualified_head() {
+        let result = resolve_base(&fork_remotes(), Some("upstream"), "origin", &fork(), || {
+            panic!("gh must not be asked when set-default is known")
+        });
+        assert_eq!(result.repo, upstream());
+        assert_eq!(result.remote.as_deref(), Some("upstream"));
+        assert_eq!(result.head_owner.as_deref(), Some("kvx"));
+        assert!(result.cross_repo);
+    }
+
+    #[test]
+    fn fork_without_gh_default_uses_the_fork_parent() {
+        let result = resolve_base(&fork_remotes(), None, "origin", &fork(), || Some(upstream()));
+        assert_eq!((result.repo, result.remote.as_deref()), (upstream(), Some("upstream")));
+        assert_eq!(result.head_owner.as_deref(), Some("kvx"));
+        assert!(result.cross_repo);
+    }
+
+    #[test]
+    fn non_fork_targets_the_push_remote_itself() {
+        let remotes = vec![("origin".to_owned(), Some(fork()))];
+        let result = resolve_base(&remotes, None, "origin", &fork(), || None);
+        assert_eq!(result, BaseResolution {
+            repo: fork(),
+            remote: Some("origin".into()),
+            head_owner: None,
+            cross_repo: false,
+        });
+    }
+
+    #[test]
+    fn base_without_a_local_remote_has_no_remote_name() {
+        let remotes = vec![("origin".to_owned(), Some(fork()))];
+        let result = resolve_base(&remotes, None, "origin", &fork(), || Some(upstream()));
+        assert_eq!(result.repo, upstream());
+        assert_eq!(result.remote, None);
+        assert!(result.cross_repo);
+        // A set-default marker pointing at a remote we cannot parse falls through to the parent.
+        let unparsable = vec![("origin".to_owned(), Some(fork())), ("up".to_owned(), None)];
+        let result = resolve_base(&unparsable, Some("up"), "origin", &fork(), || Some(upstream()));
+        assert_eq!((result.repo, result.remote), (upstream(), None));
+    }
+
+    #[test]
+    fn repository_comparison_ignores_case() {
+        let remotes = vec![("origin".to_owned(), Some(rr("github.com", "KVX", "ae2")))];
+        let result = resolve_base(&remotes, None, "origin", &fork(), || Some(rr("GitHub.com", "Kvx", "AE2")));
+        assert!(!result.cross_repo);
+        assert_eq!(result.head_owner, None);
+        assert_eq!(result.remote.as_deref(), Some("origin"));
+    }
+
+    #[test]
+    fn failed_fork_lookup_falls_back_to_the_head_repository() {
+        let result = resolve_base(&fork_remotes(), None, "origin", &fork(), || None);
+        assert_eq!(result.repo, fork());
+        assert_eq!(result.remote.as_deref(), Some("origin"));
+        assert!(!result.cross_repo);
+    }
+
+    #[test]
+    fn base_ref_prefers_the_base_remote_then_an_existing_push_remote_ref() {
+        let never = |_: &str| -> bool { panic!("not needed") };
+        assert_eq!(choose_base_ref(Some("upstream"), "origin", "master", never).as_deref(), Some("upstream/master"));
+        let exists = |full: &str| full == "refs/remotes/origin/master";
+        assert_eq!(choose_base_ref(None, "origin", "master", exists).as_deref(), Some("origin/master"));
+        assert_eq!(choose_base_ref(None, "origin", "main", exists), None);
+    }
+
+    #[test]
+    fn target_head_ref_and_branch_remote() {
+        let mut t = target(Some("main"));
+        assert_eq!(t.head_ref("feat"), HeadRef::new(None, "feat"));
+        assert_eq!(t.branches_remote(), "origin");
+        t.head_owner = Some("kvx".into());
+        t.base_remote = Some("upstream".into());
+        assert_eq!(t.head_ref("feat"), HeadRef::new(Some("kvx".into()), "feat"));
+        assert_eq!(t.branches_remote(), "upstream");
+        t.base_remote = None;
+        assert_eq!(t.branches_remote(), "origin");
+    }
+
+    #[test]
+    fn a_pr_from_someone_elses_fork_is_not_shown() {
+        let json = r#"{"number":3,"headRepositoryOwner":{"login":"stranger"}}"#;
+        let output = GhOutput { code: Some(0), stdout: json.into(), stderr: String::new() };
+        let gh = GitHub::with_exec(Scripted(output), ".".into(), upstream());
+        let head = HeadRef::new(Some("kvx".into()), "feat");
+        assert_eq!(fetch_view(&gh, &head), PrView::NoPr);
+    }
 
     fn status(branch: Option<&str>) -> RepoStatus {
         RepoStatus {
@@ -256,7 +479,7 @@ mod tests {
 
     fn state_with(view: PrView, base: Option<&str>) -> PrEntry {
         PrEntry {
-            target: Some(PrTarget { remote: "origin".into(), repo: remote(), base: base.map(str::to_owned) }),
+            target: Some(target(base)),
             view,
             ..PrEntry::default()
         }
@@ -366,7 +589,7 @@ mod tests {
     fn fetch_view_classifies_gh_output() {
         let run = |code, stdout: &str, stderr: &str| {
             let output = GhOutput { code: Some(code), stdout: stdout.into(), stderr: stderr.into() };
-            fetch_view(&GitHub::with_exec(Scripted(output), ".".into(), remote()), "feat")
+            fetch_view(&GitHub::with_exec(Scripted(output), ".".into(), remote()), &HeadRef::new(None, "feat"))
         };
         assert_eq!(run(1, "", "no pull requests found for branch \"feat\""), PrView::NoPr);
         assert!(matches!(run(1, "", "boom"), PrView::Error(_) | PrView::NotAuthenticated));
@@ -376,8 +599,8 @@ mod tests {
     #[test]
     fn target_base_ref_joins_remote_and_base() {
         let state = state_with(PrView::NoPr, Some("main"));
-        assert_eq!(state.target.as_ref().unwrap().base_ref().as_deref(), Some("origin/main"));
+        assert_eq!(state.target.as_ref().unwrap().base_ref.as_deref(), Some("origin/main"));
         let state = state_with(PrView::NoPr, None);
-        assert_eq!(state.target.as_ref().unwrap().base_ref(), None);
+        assert_eq!(state.target.as_ref().unwrap().base_ref, None);
     }
 }

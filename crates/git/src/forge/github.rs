@@ -7,7 +7,7 @@ use super::model::{PullRequest, parse_pr_json};
 use super::remote::RemoteRepo;
 use super::ForgeError;
 
-const PR_FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStatus,reviewDecision,baseRefName,headRefName,headRefOid,statusCheckRollup,updatedAt";
+const PR_FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStatus,reviewDecision,baseRefName,headRefName,headRefOid,headRepositoryOwner,statusCheckRollup,updatedAt";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
 const VIEW_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -20,12 +20,51 @@ pub enum MergeMethod {
     Rebase,
 }
 
+/// The head of a pull request: a branch, qualified with the owner of the repository it lives
+/// in when that is not the repository the PR targets (a fork).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeadRef {
+    pub owner: Option<String>,
+    pub branch: String,
+}
+
+impl HeadRef {
+    pub fn new(owner: Option<String>, branch: &str) -> Self {
+        Self { owner, branch: branch.to_owned() }
+    }
+
+    /// `owner:branch` for a cross-repository head, else the plain branch name.
+    pub fn selector(&self) -> Result<String, ForgeError> {
+        if self.branch.trim().is_empty() {
+            return Err(ForgeError::NoBranch);
+        }
+        if self.branch.starts_with('-') {
+            return Err(ForgeError::Failed(format!("Invalid branch name: {:?}", self.branch)));
+        }
+        match &self.owner {
+            None => Ok(self.branch.clone()),
+            Some(owner) => {
+                if owner.is_empty()
+                    || owner.starts_with('-')
+                    || owner.contains(':')
+                    || owner.contains(char::is_whitespace)
+                {
+                    return Err(ForgeError::Failed(format!("Invalid repository owner: {owner:?}")));
+                }
+                Ok(format!("{owner}:{}", self.branch))
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatePr {
     pub title: String,
     pub body: String,
     pub base: String,
     pub head: String,
+    /// Owner of the fork the head branch lives in (cross-repository PR).
+    pub head_owner: Option<String>,
     pub draft: bool,
 }
 
@@ -86,18 +125,59 @@ impl<E: GhExec> GitHub<E> {
         }
     }
 
-    pub fn pr_for_branch(&self, branch: &str) -> Result<Option<PullRequest>, ForgeError> {
-        if branch.trim().is_empty() {
-            return Err(ForgeError::NoBranch);
+    /// The parent repository when this repository is a fork (`gh repo view --json isFork,parent`).
+    pub fn fork_parent(&self) -> Result<Option<RemoteRepo>, ForgeError> {
+        let output = self.run_ok(
+            &args(&["repo", "view", &self.repo.gh_repo_arg(), "--json", "isFork,parent"]),
+            VIEW_TIMEOUT,
+        )?;
+        let value: serde_json::Value = serde_json::from_str(&output.stdout)
+            .map_err(|error| ForgeError::Failed(format!("Invalid gh output: {error}")))?;
+        if value.get("isFork").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Ok(None);
         }
-        if branch.starts_with('-') {
-            return Err(ForgeError::Failed(format!("Invalid branch name: {branch:?}")));
+        let parent = value.get("parent");
+        let name = parent.and_then(|p| p.get("name")).and_then(serde_json::Value::as_str);
+        let owner = parent
+            .and_then(|p| p.get("owner"))
+            .and_then(|o| o.get("login"))
+            .and_then(serde_json::Value::as_str);
+        match (owner, name) {
+            (Some(owner), Some(name)) if !owner.is_empty() && !name.is_empty() => Ok(Some(RemoteRepo {
+                host: self.repo.host.clone(),
+                owner: owner.to_owned(),
+                name: name.to_owned(),
+            })),
+            _ => Ok(None),
         }
+    }
+
+    /// Name of the repository's default branch (`gh repo view --json defaultBranchRef`).
+    pub fn default_branch(&self) -> Result<String, ForgeError> {
+        let output = self.run_ok(
+            &args(&["repo", "view", &self.repo.gh_repo_arg(), "--json", "defaultBranchRef"]),
+            VIEW_TIMEOUT,
+        )?;
+        let value: serde_json::Value = serde_json::from_str(&output.stdout)
+            .map_err(|error| ForgeError::Failed(format!("Invalid gh output: {error}")))?;
+        value
+            .get("defaultBranchRef")
+            .and_then(|r| r.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| ForgeError::Failed("Repository has no default branch".to_owned()))
+    }
+
+    /// The pull request of `head` in this (base) repository. For a cross-repository head a PR
+    /// whose head lives in another fork (same branch name, different owner) does not count.
+    pub fn pr_for_branch(&self, head: &HeadRef) -> Result<Option<PullRequest>, ForgeError> {
+        let selector = head.selector()?;
         let output = self.run(
             &args(&[
                 "pr",
                 "view",
-                branch,
+                &selector,
                 "--repo",
                 &self.repo.gh_repo_arg(),
                 "--json",
@@ -106,7 +186,13 @@ impl<E: GhExec> GitHub<E> {
             VIEW_TIMEOUT,
         )?;
         if output.code == Some(0) {
-            return parse_pr_json(&output.stdout).map(Some);
+            let pr = parse_pr_json(&output.stdout)?;
+            if let (Some(expected), Some(actual)) = (&head.owner, &pr.head_owner) {
+                if !expected.eq_ignore_ascii_case(actual) {
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(pr));
         }
         if output.stderr.to_ascii_lowercase().contains("no pull requests found") {
             return Ok(None);
@@ -125,9 +211,11 @@ impl<E: GhExec> GitHub<E> {
         if req.base.starts_with('-') || req.head.starts_with('-') {
             return invalid("Invalid branch name");
         }
-        if req.base == req.head {
+        if req.base == req.head && req.head_owner.is_none() {
             return invalid("Base and head branches must differ");
         }
+        let head = HeadRef::new(req.head_owner.clone(), &req.head);
+        let head_selector = head.selector()?;
         let mut file = tempfile::Builder::new()
             .prefix("sich-pr-")
             .suffix(".md")
@@ -147,7 +235,7 @@ impl<E: GhExec> GitHub<E> {
             "--base",
             &req.base,
             "--head",
-            &req.head,
+            &head_selector,
             &title,
             "--body-file",
         ]);
@@ -171,7 +259,7 @@ impl<E: GhExec> GitHub<E> {
         } else if !output.stderr.to_ascii_lowercase().contains("already exists") {
             return Err(classify("pr", &output));
         }
-        match self.pr_for_branch(&req.head)? {
+        match self.pr_for_branch(&head)? {
             Some(pr) => Ok(CreatedPr::Existing(pr)),
             None => Err(ForgeError::Failed(
                 "gh pr create did not return a pull request URL".to_owned(),
@@ -332,8 +420,13 @@ mod tests {
             body: "Body\n\nmore ✓".into(),
             base: "main".into(),
             head: "feature".into(),
+            head_owner: None,
             draft: false,
         }
+    }
+
+    fn plain(branch: &str) -> HeadRef {
+        HeadRef::new(None, branch)
     }
 
     fn v(parts: &[&str]) -> Vec<String> {
@@ -360,10 +453,10 @@ mod tests {
             fail(4, "try authenticating with: gh auth login"),
         ]);
         let gh = github(&exec);
-        let pr = gh.pr_for_branch("feature").unwrap().unwrap();
+        let pr = gh.pr_for_branch(&plain("feature")).unwrap().unwrap();
         assert_eq!(pr.number, 7);
-        assert_eq!(gh.pr_for_branch("feature"), Ok(None));
-        assert_eq!(gh.pr_for_branch("feature"), Err(ForgeError::NotAuthenticated));
+        assert_eq!(gh.pr_for_branch(&plain("feature")), Ok(None));
+        assert_eq!(gh.pr_for_branch(&plain("feature")), Err(ForgeError::NotAuthenticated));
         assert_eq!(
             exec.calls()[0],
             v(&["pr", "view", "feature", "--repo", "o/r", "--json", PR_FIELDS])
@@ -374,9 +467,112 @@ mod tests {
     fn pr_for_branch_validates_without_running_gh() {
         let exec = FakeExec::default();
         let gh = github(&exec);
-        assert_eq!(gh.pr_for_branch(""), Err(ForgeError::NoBranch));
-        assert!(matches!(gh.pr_for_branch("--web"), Err(ForgeError::Failed(_))));
+        assert_eq!(gh.pr_for_branch(&plain("")), Err(ForgeError::NoBranch));
+        assert!(matches!(gh.pr_for_branch(&plain("--web")), Err(ForgeError::Failed(_))));
+        for owner in ["", "-x", "a:b", "a b"] {
+            let head = HeadRef::new(Some(owner.into()), "feature");
+            assert!(matches!(gh.pr_for_branch(&head), Err(ForgeError::Failed(_))), "{owner:?}");
+        }
         assert!(exec.calls().is_empty());
+    }
+
+    #[test]
+    fn pr_for_branch_cross_repo_uses_owner_selector_and_base_repo() {
+        let exec = FakeExec::with(vec![ok(r#"{"number":24,"headRefName":"feat/x","headRepositoryOwner":{"login":"kvx"}}"#)]);
+        let gh = github(&exec);
+        let pr = gh.pr_for_branch(&HeadRef::new(Some("kvx".into()), "feat/x")).unwrap().unwrap();
+        assert_eq!(pr.number, 24);
+        assert_eq!(
+            exec.calls()[0],
+            v(&["pr", "view", "kvx:feat/x", "--repo", "o/r", "--json", PR_FIELDS])
+        );
+    }
+
+    #[test]
+    fn pr_from_another_head_owner_is_not_ours() {
+        let exec = FakeExec::with(vec![
+            ok(r#"{"number":5,"headRepositoryOwner":{"login":"someone-else"}}"#),
+            ok(r#"{"number":6,"headRepositoryOwner":{"login":"KVX"}}"#),
+            ok(r#"{"number":7}"#),
+        ]);
+        let gh = github(&exec);
+        let head = HeadRef::new(Some("kvx".into()), "feat");
+        assert_eq!(gh.pr_for_branch(&head), Ok(None));
+        assert_eq!(gh.pr_for_branch(&head).unwrap().unwrap().number, 6, "case-insensitive");
+        assert_eq!(gh.pr_for_branch(&head).unwrap().unwrap().number, 7, "unknown owner is accepted");
+    }
+
+    #[test]
+    fn fork_parent_argv_and_parsing() {
+        let exec = FakeExec::with(vec![
+            ok(r#"{"isFork":true,"parent":{"name":"AE2","owner":{"login":"GTNH","id":"x"}}}"#),
+            ok(r#"{"isFork":false,"parent":null}"#),
+            ok(r#"{"isFork":true,"parent":null}"#),
+            ok(r#"{"isFork":true}"#),
+            ok("not json"),
+            fail(1, "Could not resolve to a Repository"),
+        ]);
+        let gh = ghe(&exec);
+        let parent = gh.fork_parent().unwrap().unwrap();
+        assert_eq!(
+            (parent.host.as_str(), parent.owner.as_str(), parent.name.as_str()),
+            ("github.acme.com", "GTNH", "AE2")
+        );
+        assert_eq!(gh.fork_parent(), Ok(None));
+        assert_eq!(gh.fork_parent(), Ok(None));
+        assert_eq!(gh.fork_parent(), Ok(None));
+        assert!(matches!(gh.fork_parent(), Err(ForgeError::Failed(_))));
+        assert!(matches!(gh.fork_parent(), Err(ForgeError::Failed(_))));
+        assert_eq!(
+            exec.calls()[0],
+            v(&["repo", "view", "github.acme.com/o/r", "--json", "isFork,parent"])
+        );
+    }
+
+    #[test]
+    fn default_branch_argv_and_parsing() {
+        let exec = FakeExec::with(vec![
+            ok(r#"{"defaultBranchRef":{"name":"master"}}"#),
+            ok(r#"{"defaultBranchRef":null}"#),
+            ok(r#"{"defaultBranchRef":{"name":""}}"#),
+            fail(4, "try authenticating with: gh auth login"),
+        ]);
+        let gh = github(&exec);
+        assert_eq!(gh.default_branch(), Ok("master".to_owned()));
+        assert!(matches!(gh.default_branch(), Err(ForgeError::Failed(_))));
+        assert!(matches!(gh.default_branch(), Err(ForgeError::Failed(_))));
+        assert_eq!(gh.default_branch(), Err(ForgeError::NotAuthenticated));
+        assert_eq!(
+            exec.calls()[0],
+            v(&["repo", "view", "o/r", "--json", "defaultBranchRef"])
+        );
+    }
+
+    #[test]
+    fn create_pr_cross_repo_uses_owner_qualified_head() {
+        let exec = FakeExec::with(vec![ok("https://github.com/o/r/pull/9")]);
+        let gh = github(&exec);
+        let mut req = request();
+        req.head_owner = Some("kvx".into());
+        gh.create_pr(&req).unwrap();
+        let call = &exec.calls()[0];
+        assert_eq!(call[2..8], v(&["--repo", "o/r", "--base", "main", "--head", "kvx:feature"])[..]);
+    }
+
+    #[test]
+    fn create_pr_cross_repo_allows_the_same_branch_name_and_rejects_bad_owner() {
+        let exec = FakeExec::with(vec![ok("https://github.com/o/r/pull/9")]);
+        let gh = github(&exec);
+        let mut req = request();
+        req.head = "main".into();
+        req.head_owner = Some("kvx".into());
+        gh.create_pr(&req).unwrap();
+        assert_eq!(exec.calls()[0][7], "kvx:main");
+        for owner in ["", "-x", "a:b", "a b"] {
+            req.head_owner = Some(owner.into());
+            assert!(matches!(gh.create_pr(&req), Err(ForgeError::Failed(_))), "{owner:?}");
+        }
+        assert_eq!(exec.calls().len(), 1);
     }
 
     #[test]
@@ -557,7 +753,7 @@ mod tests {
     fn exec_errors_propagate() {
         let exec = FakeExec::with(vec![Err(ForgeError::GhMissing), Err(ForgeError::TimedOut)]);
         let gh = github(&exec);
-        assert_eq!(gh.pr_for_branch("a"), Err(ForgeError::GhMissing));
+        assert_eq!(gh.pr_for_branch(&plain("a")), Err(ForgeError::GhMissing));
         assert_eq!(gh.close_pr(1), Err(ForgeError::TimedOut));
     }
 }

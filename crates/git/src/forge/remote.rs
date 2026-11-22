@@ -48,6 +48,13 @@ impl RemoteRepo {
         self.host == "github.com" || self.host.ends_with(".github.com") || self.host.contains("github")
     }
 
+    /// Same host, owner and name, ignoring case (GitHub names are case-insensitive).
+    pub fn same_repo(&self, other: &Self) -> bool {
+        self.host.eq_ignore_ascii_case(&other.host)
+            && self.owner.eq_ignore_ascii_case(&other.owner)
+            && self.name.eq_ignore_ascii_case(&other.name)
+    }
+
     pub fn gh_repo_arg(&self) -> String {
         if self.host == "github.com" {
             format!("{}/{}", self.owner, self.name)
@@ -136,6 +143,16 @@ mod tests {
         assert!(repo("github.acme.com", "o", "r").unwrap().is_github());
         assert!(!repo("gitlab.com", "o", "r").unwrap().is_github());
         assert!(!repo("bitbucket.org", "o", "r").unwrap().is_github());
+    }
+
+    #[test]
+    fn same_repo_ignores_case_but_not_identity() {
+        let a = repo("github.com", "GTNewHorizons", "Applied-Energistics-2-NH").unwrap();
+        let b = repo("GitHub.com", "gtnewhorizons", "applied-energistics-2-nh").unwrap();
+        assert!(a.same_repo(&b));
+        assert!(!a.same_repo(&repo("github.com", "kvx", "Applied-Energistics-2-NH").unwrap()));
+        assert!(!a.same_repo(&repo("github.acme.com", "GTNewHorizons", "Applied-Energistics-2-NH").unwrap()));
+        assert!(!a.same_repo(&repo("github.com", "GTNewHorizons", "other").unwrap()));
     }
 
     #[test]

@@ -102,6 +102,9 @@ pub struct PullRequest {
     pub base: String,
     pub head: String,
     pub head_oid: String,
+    /// Login of the owner of the repository the head branch lives in (differs from the base
+    /// repository's owner for PRs from forks).
+    pub head_owner: Option<String>,
     pub checks: Vec<Check>,
     pub updated_at: String,
 }
@@ -186,8 +189,15 @@ struct RawPr {
     base_ref_name: Option<String>,
     head_ref_name: Option<String>,
     head_ref_oid: Option<String>,
+    head_repository_owner: Option<RawOwner>,
     status_check_rollup: Option<Vec<RawCheck>>,
     updated_at: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawOwner {
+    login: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -306,6 +316,7 @@ pub fn parse_pr_json(json: &str) -> Result<PullRequest, ForgeError> {
         base: text(raw.base_ref_name),
         head: text(raw.head_ref_name),
         head_oid: text(raw.head_ref_oid),
+        head_owner: raw.head_repository_owner.and_then(|owner| non_empty(owner.login)),
         checks,
         updated_at: text(raw.updated_at),
     })
@@ -403,6 +414,15 @@ mod tests {
         assert_eq!(pr.checks[6].state, CheckState::Success);
         assert_eq!(pr.checks[7].state, CheckState::Pending);
         assert_eq!(pr.checks[8].state, CheckState::Failure);
+    }
+
+    #[test]
+    fn head_owner_is_read_from_head_repository_owner() {
+        let pr = parse_pr_json(r#"{"headRepositoryOwner":{"id":"x","login":"kvx"}}"#).unwrap();
+        assert_eq!(pr.head_owner.as_deref(), Some("kvx"));
+        for json in [r#"{}"#, r#"{"headRepositoryOwner":null}"#, r#"{"headRepositoryOwner":{"login":""}}"#] {
+            assert_eq!(parse_pr_json(json).unwrap().head_owner, None, "{json}");
+        }
     }
 
     #[test]

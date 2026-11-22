@@ -16,7 +16,7 @@ pub use agent_prompt::{
     write_report,
 };
 pub use gh::{GhCli, GhExec, GhOutput};
-pub use github::{CreatePr, CreatedPr, GitHub, MergeMethod};
+pub use github::{CreatePr, CreatedPr, GitHub, HeadRef, MergeMethod};
 pub use model::{
     Check, CheckState, ChecksSummary, FailedJob, MergeState, Mergeable, PrState, PullRequest, ReviewDecision,
     parse_pr_json,

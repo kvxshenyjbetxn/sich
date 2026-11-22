@@ -20,6 +20,7 @@ pub(crate) fn pr(state: PrState) -> PullRequest {
         base: "main".into(),
         head: "feat".into(),
         head_oid: "abc".into(),
+        head_owner: None,
         checks: Vec::new(),
         updated_at: String::new(),
     }
@@ -31,6 +32,17 @@ pub(crate) fn check(state: CheckState) -> Check {
 
 pub(crate) fn remote() -> RemoteRepo {
     RemoteRepo { host: "github.com".into(), owner: "o".into(), name: "r".into() }
+}
+
+pub(crate) fn target(base: Option<&str>) -> crate::pr_store::PrTarget {
+    crate::pr_store::PrTarget {
+        remote: "origin".into(),
+        repo: remote(),
+        head_owner: None,
+        base_remote: Some("origin".into()),
+        base: base.map(str::to_owned),
+        base_ref: base.map(|base| format!("origin/{base}")),
+    }
 }
 
 pub(crate) struct Scripted(pub GhOutput);

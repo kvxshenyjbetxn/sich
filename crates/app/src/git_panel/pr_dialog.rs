@@ -28,8 +28,12 @@ pub(super) struct DialogCtx {
     pub worktree: PathBuf,
     pub repo: Repo,
     pub branch: String,
+    /// The remote whose branches are offered as bases (the base remote, else the push remote).
     pub remote: String,
+    /// The base repository, where the PR is opened.
     pub gh_repo: RemoteRepo,
+    /// Owner of the fork the branch is pushed to, for a cross-repository PR.
+    pub head_owner: Option<String>,
     pub default_base: Option<String>,
     pub will_push: bool,
     pub uncommitted: usize,
@@ -198,6 +202,7 @@ impl PrDialog {
             body: self.body.read(cx).value().to_string(),
             base,
             head: self.ctx.branch.clone(),
+            head_owner: self.ctx.head_owner.clone(),
             draft: self.draft,
         };
         let repo = self.ctx.repo.clone();

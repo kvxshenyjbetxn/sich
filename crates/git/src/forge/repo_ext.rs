@@ -74,6 +74,32 @@ impl Repo {
         Ok(RemoteRepo::parse(url.trim()))
     }
 
+    /// Every remote with its parsed fetch URL (`None` when the URL is not one we understand).
+    pub fn remotes(&self) -> Result<Vec<(String, Option<RemoteRepo>)>, GitError> {
+        let names = text(&self.read(&["remote"])?);
+        let mut remotes = Vec::new();
+        for name in names.lines().map(str::trim).filter(|name| !name.is_empty()) {
+            let repo = self
+                .read(&["remote", "get-url", name])
+                .ok()
+                .and_then(|url| RemoteRepo::parse(text(&url).trim()));
+            remotes.push((name.to_owned(), repo));
+        }
+        Ok(remotes)
+    }
+
+    /// The remote marked as the default repository by `gh repo set-default`: gh stores
+    /// `remote.<name>.gh-resolved = base` in the git config. Read-only.
+    pub fn gh_resolved_base(&self) -> Result<Option<String>, GitError> {
+        let names = text(&self.read(&["remote"])?);
+        for name in names.lines().map(str::trim).filter(|name| !name.is_empty()) {
+            if self.config_get(&format!("remote.{name}.gh-resolved"))? == "base" {
+                return Ok(Some(name.to_owned()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Short name of the branch pull requests should target by default.
     pub fn default_base(&self, remote: &str) -> Result<Option<String>, GitError> {
         check_arg("remote", remote)?;
@@ -110,6 +136,13 @@ impl Repo {
             }
         }
         Ok(None)
+    }
+
+    /// Whether the fully qualified ref (for example `refs/remotes/origin/main`) exists.
+    pub fn ref_exists(&self, full_ref: &str) -> Result<bool, GitError> {
+        check_arg("ref", full_ref)?;
+        let output = text(&self.read(&["for-each-ref", "--format=%(refname)", full_ref])?);
+        Ok(output.lines().any(|line| line.trim() == full_ref))
     }
 
     /// `(ahead, behind)` of HEAD relative to `base_ref`.
@@ -253,6 +286,43 @@ mod tests {
         assert_eq!((remote.owner.as_str(), remote.name.as_str()), ("owner", "proj"));
         fixture.git(&["remote", "set-url", "origin", "/some/local/path"]);
         assert_eq!(fixture.open().remote_repo().unwrap(), None);
+    }
+
+    #[test]
+    fn remotes_lists_names_with_parsed_urls() {
+        let fixture = TestRepo::new();
+        assert!(fixture.open().remotes().unwrap().is_empty());
+        fixture.git(&["remote", "add", "origin", "https://github.com/me/proj.git"]);
+        fixture.git(&["remote", "add", "upstream", "git@github.com:Org/proj.git"]);
+        fixture.git(&["remote", "add", "local", "/some/path"]);
+        let remotes = fixture.open().remotes().unwrap();
+        assert_eq!(remotes.len(), 3);
+        let find = |name: &str| remotes.iter().find(|(n, _)| n == name).unwrap().1.clone();
+        assert_eq!(find("origin").unwrap().owner, "me");
+        assert_eq!(find("upstream").unwrap().owner, "Org");
+        assert_eq!(find("local"), None);
+    }
+
+    #[test]
+    fn gh_resolved_base_reads_the_set_default_marker() {
+        let fixture = TestRepo::new();
+        assert_eq!(fixture.open().gh_resolved_base().unwrap(), None);
+        with_remotes(&fixture, &["origin", "upstream"]);
+        assert_eq!(fixture.open().gh_resolved_base().unwrap(), None);
+        fixture.git(&["config", "remote.origin.gh-resolved", "other"]);
+        assert_eq!(fixture.open().gh_resolved_base().unwrap(), None);
+        fixture.git(&["config", "remote.upstream.gh-resolved", "base"]);
+        assert_eq!(fixture.open().gh_resolved_base().unwrap().as_deref(), Some("upstream"));
+    }
+
+    #[test]
+    fn ref_exists_checks_the_exact_ref() {
+        let fixture = with_bare_origin(&["main", "main2"]);
+        let repo = fixture.open();
+        assert!(repo.ref_exists("refs/remotes/origin/main").unwrap());
+        assert!(!repo.ref_exists("refs/remotes/origin/ma").unwrap());
+        assert!(!repo.ref_exists("refs/remotes/upstream/main").unwrap());
+        assert!(repo.ref_exists("--all").is_err());
     }
 
     /// A repo with an `origin` that is a local bare repository holding `branches`.
