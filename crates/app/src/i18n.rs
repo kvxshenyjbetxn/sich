@@ -467,6 +467,18 @@ pub enum Tr {
     FilesNone,
     FilesMarkViewed,
     // ---- end details ----
+
+    // ---- history keys: append below ----
+    // ---- end history ----
+
+    // ---- compare keys: append below ----
+    // ---- end compare ----
+
+    // ---- prwt keys: append below ----
+    // ---- end prwt ----
+
+    // ---- notes keys: append below ----
+    // ---- end notes ----
 }
 
 impl Tr {
@@ -897,6 +909,18 @@ impl Tr {
         Tr::FilesNone,
         Tr::FilesMarkViewed,
         // ---- end details ----
+
+        // ---- history keys: append below ----
+        // ---- end history ----
+
+        // ---- compare keys: append below ----
+        // ---- end compare ----
+
+        // ---- prwt keys: append below ----
+        // ---- end prwt ----
+
+        // ---- notes keys: append below ----
+        // ---- end notes ----
     ];
 }
 
@@ -2990,6 +3014,18 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             En => "Mark as viewed",
         },
         // ---- end details ----
+
+        // ---- history keys: append below ----
+        // ---- end history ----
+
+        // ---- compare keys: append below ----
+        // ---- end compare ----
+
+        // ---- prwt keys: append below ----
+        // ---- end prwt ----
+
+        // ---- notes keys: append below ----
+        // ---- end notes ----
     }
 }
 

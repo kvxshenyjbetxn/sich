@@ -111,6 +111,7 @@ impl GitPanel {
             .child(self.error_notice(lang, cx))
             .children(banner)
             .children(pr_row)
+            .children(self.branch_compare_row(status, lang, cx))
             .child(
                 v_flex()
                     .flex_shrink_0()
@@ -139,9 +140,7 @@ impl GitPanel {
                             .text_color(theme.warning)
                             .child(notice)
                     }))
-                    .children((!status.conflicted.is_empty()).then(|| {
-                        self.change_section(Section::Conflicts, &status.conflicted, busy, lang, cx)
-                    }))
+                    .children(self.conflicts_section(status, busy, lang, cx))
                     .child(self.change_section(Section::Staged, &status.staged, busy, lang, cx))
                     .child(self.change_section(Section::Changes, &status.unstaged, busy, lang, cx))
                     .children(
@@ -157,7 +156,9 @@ impl GitPanel {
                                 .child(tr(lang, Tr::GitNoChanges))
                         }),
                     )
-                    .children(stashes),
+                    .children(stashes)
+                    .children(self.branch_changes_section(status, lang, cx))
+                    .children(self.notes_section(lang, cx)),
             )
             .child(self.history_section(lang, cx))
     }
@@ -261,7 +262,7 @@ impl GitPanel {
             .fold(div(), |node, notice| node.child(notice))
     }
 
-    fn change_section(
+    pub(super) fn change_section(
         &self,
         section: Section,
         files: &[FileChange],

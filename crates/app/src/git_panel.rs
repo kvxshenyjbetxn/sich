@@ -1,6 +1,9 @@
 //! Worktree-scoped Git state. The UI schedules work and applies generation-checked results.
 
+mod branch_compare;
 mod branch_picker;
+mod conflicts;
+mod notes;
 mod ops_menu;
 mod pr;
 mod pr_card;
