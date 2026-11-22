@@ -350,6 +350,13 @@ pub enum Tr {
     PrUncommitted,
     GithubPrs,
     GithubPrsDesc,
+    WorktreeLocation,
+    WorktreeLocSibling,
+    WorktreeLocInside,
+    WorktreeLocShared,
+    WorktreeLocSiblingDesc,
+    WorktreeLocInsideDesc,
+    WorktreeLocSharedDesc,
 }
 
 impl Tr {
@@ -663,6 +670,13 @@ impl Tr {
         Tr::PrUncommitted,
         Tr::GithubPrs,
         Tr::GithubPrsDesc,
+        Tr::WorktreeLocation,
+        Tr::WorktreeLocSibling,
+        Tr::WorktreeLocInside,
+        Tr::WorktreeLocShared,
+        Tr::WorktreeLocSiblingDesc,
+        Tr::WorktreeLocInsideDesc,
+        Tr::WorktreeLocSharedDesc,
     ];
 }
 
@@ -1453,6 +1467,41 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Uk => "Використовує встановлений gh, щоб показувати й створювати pull request.",
             Ru => "Использует установленный gh для показа и создания pull request.",
             En => "Uses your installed gh to show and create pull requests.",
+        },
+        Tr::WorktreeLocation => match lang {
+            Uk => "Розташування worktree",
+            Ru => "Расположение worktree",
+            En => "Worktree location",
+        },
+        Tr::WorktreeLocSibling => match lang {
+            Uk => "Поруч із проєктом",
+            Ru => "Рядом с проектом",
+            En => "Next to the project",
+        },
+        Tr::WorktreeLocInside => match lang {
+            Uk => "Усередині проєкту (.worktrees)",
+            Ru => "Внутри проекта (.worktrees)",
+            En => "Inside the project (.worktrees)",
+        },
+        Tr::WorktreeLocShared => match lang {
+            Uk => "Спільна тека (~/sich/worktrees)",
+            Ru => "Общая папка (~/sich/worktrees)",
+            En => "Shared folder (~/sich/worktrees)",
+        },
+        Tr::WorktreeLocSiblingDesc => match lang {
+            Uk => "Застосовується до нових worktree. Приклад: E:\\dev\\game-feature-ui",
+            Ru => "Применяется к новым worktree. Пример: E:\\dev\\game-feature-ui",
+            En => "Applies to new worktrees. Example: E:\\dev\\game-feature-ui",
+        },
+        Tr::WorktreeLocInsideDesc => match lang {
+            Uk => "Застосовується до нових worktree. Приклад: E:\\dev\\game\\.worktrees\\feature\\ui (додається в .git/info/exclude)",
+            Ru => "Применяется к новым worktree. Пример: E:\\dev\\game\\.worktrees\\feature\\ui (добавляется в .git/info/exclude)",
+            En => "Applies to new worktrees. Example: E:\\dev\\game\\.worktrees\\feature\\ui (added to .git/info/exclude)",
+        },
+        Tr::WorktreeLocSharedDesc => match lang {
+            Uk => "Застосовується до нових worktree. Приклад: ~/sich/worktrees/game/feature/ui",
+            Ru => "Применяется к новым worktree. Пример: ~/sich/worktrees/game/feature/ui",
+            En => "Applies to new worktrees. Example: ~/sich/worktrees/game/feature/ui",
         },
         Tr::NewTerminal => match lang {
             Uk => "Новий термінал",

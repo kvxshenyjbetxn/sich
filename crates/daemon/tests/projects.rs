@@ -446,3 +446,67 @@ async fn legacy_projects_file_loads() {
     h.stop().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// Creates a worktree with `SICH_WORKTREE_ROOT` unset and the given `worktree_location`
+/// in the (temp) settings file. Returns (project dir, created worktree path).
+async fn create_with_location(tag: &str, location: Option<&str>, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let tmp = temp_dir(tag);
+    let parent = tmp.join("parent");
+    let cfg = tmp.join("cfg");
+    std::fs::create_dir_all(&parent).unwrap();
+    if let Some(location) = location {
+        std::fs::create_dir_all(cfg.join("sich")).unwrap();
+        std::fs::write(
+            cfg.join("sich").join("settings.json"),
+            format!(r#"{{"worktree_location":"{location}"}}"#),
+        )
+        .unwrap();
+    }
+    // SAFETY: callers hold SERIAL; no other thread in this process reads these concurrently.
+    unsafe {
+        std::env::set_var("SICH_CONFIG_DIR", &cfg);
+        std::env::remove_var("SICH_WORKTREE_ROOT");
+    }
+    let repo = init_repo(&parent);
+    let mut h = start(tag).await;
+    let c = &mut h.conn;
+    send(c, ClientMsg::AddProject { path: repo.clone(), group: None }).await;
+    let pid = expect_projects(c).await[0].id;
+    send(c, ClientMsg::CreateWorktree { project_id: pid, name: name.into(), base: None }).await;
+    let projects = expect_projects(c).await;
+    let wt = projects[0]
+        .worktrees
+        .iter()
+        .find(|w| w.branch.as_deref() == Some(name))
+        .expect("new worktree listed")
+        .path
+        .clone();
+    h.stop().await;
+    (repo, wt, tmp)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_location_sibling_is_next_to_project() {
+    let _guard = SERIAL.lock().await;
+    for setting in [Some("sibling"), None, Some("bogus")] {
+        let (repo, wt, tmp) = create_with_location("wt-sib", setting, "feat-ui").await;
+        assert!(wt.is_dir());
+        assert!(sich_path_eq(&wt, &repo.parent().unwrap().join("myrepo-feat-ui")), "{wt:?}");
+        assert!(wt.starts_with(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_location_inside_uses_dot_worktrees_and_excludes_it() {
+    let _guard = SERIAL.lock().await;
+    let (repo, wt, tmp) = create_with_location("wt-in", Some("inside"), "feat-in").await;
+    assert!(wt.is_dir());
+    assert!(sich_path_eq(&wt, &repo.join(".worktrees").join("feat-in")), "{wt:?}");
+    let exclude = std::fs::read_to_string(repo.join(".git").join("info").join("exclude")).unwrap();
+    assert_eq!(exclude.lines().filter(|l| *l == "/.worktrees/").count(), 1);
+    // The main worktree does not see .worktrees as untracked.
+    let out = Command::new("git").arg("-C").arg(&repo).args(["status", "--porcelain"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    let _ = std::fs::remove_dir_all(&tmp);
+}

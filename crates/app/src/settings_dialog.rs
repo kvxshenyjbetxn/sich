@@ -18,7 +18,7 @@ use crate::codex_hooks;
 use crate::i18n::{Language, Tr, tr};
 use crate::omp_hooks;
 use crate::orch_skill;
-use crate::settings;
+use crate::settings::{self, WorktreeLocation};
 use crate::theme::{self, ThemeKind};
 
 pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
@@ -45,6 +45,7 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                             .label(tr(lang, Tr::ShowExternalWorktrees))
                             .on_click(|checked, _, cx| settings::set_show_external_worktrees(*checked, cx)),
                     )
+                    .child(section(tr(lang, Tr::WorktreeLocation), worktree_location_picker(lang, cx), cx))
                     .child(section(tr(lang, Tr::AgentsSection), agents_section(lang, cx), cx))
                     .children(cfg!(windows).then(|| {
                         section(tr(lang, Tr::Notifications), notification_controls(lang, app.clone(), &prefs), cx)
@@ -297,6 +298,49 @@ fn language_picker(current: Language, cx: &App) -> impl IntoElement {
         );
     }
     row
+}
+
+fn worktree_location_picker(lang: Language, cx: &App) -> impl IntoElement {
+    let theme = cx.theme();
+    let current = settings::get(cx).worktree_location;
+    let mut row = h_flex()
+        .p_1()
+        .gap_1()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.background);
+    for loc in WorktreeLocation::ALL {
+        let (label, _) = worktree_location_texts(lang, loc);
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("worktree-loc-{loc:?}")))
+                .flex_1()
+                .py_1p5()
+                .px_1()
+                .rounded_sm()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .cursor_pointer()
+                .when_selected(loc == current, theme.primary, theme.primary_foreground, theme.list_hover)
+                .on_click(move |_, _, cx| settings::set_worktree_location(loc, cx))
+                .child(label),
+        );
+    }
+    v_flex().gap_1p5().child(row).child(
+        div().text_xs().text_color(theme.muted_foreground).child(worktree_location_texts(lang, current).1),
+    )
+}
+
+/// Option label and description for a worktree location.
+fn worktree_location_texts(lang: Language, loc: WorktreeLocation) -> (&'static str, &'static str) {
+    match loc {
+        WorktreeLocation::Sibling => (tr(lang, Tr::WorktreeLocSibling), tr(lang, Tr::WorktreeLocSiblingDesc)),
+        WorktreeLocation::Inside => (tr(lang, Tr::WorktreeLocInside), tr(lang, Tr::WorktreeLocInsideDesc)),
+        WorktreeLocation::Shared => (tr(lang, Tr::WorktreeLocShared), tr(lang, Tr::WorktreeLocSharedDesc)),
+    }
 }
 
 /// Small helper: selected -> filled with accent colors, otherwise transparent with hover.

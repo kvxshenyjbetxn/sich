@@ -61,13 +61,6 @@ pub struct Registry {
     state: Mutex<State>,
 }
 
-fn worktree_root() -> PathBuf {
-    match std::env::var_os("SICH_WORKTREE_ROOT") {
-        Some(d) if !d.is_empty() => PathBuf::from(d),
-        _ => dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("sich").join("worktrees"),
-    }
-}
-
 impl Registry {
     pub fn load() -> Self {
         let file =
@@ -326,7 +319,7 @@ pub async fn create_worktree(
     let Some(entry) = mgr.projects.get(project_id) else {
         return fail(conn, OP, "Unknown project");
     };
-    let root = worktree_root();
+    let location = crate::worktree_location::read_location();
     let owner = conn.worktree_owner.clone();
     if conn.worker_worktrees && owner.is_none() {
         return fail(conn, OP, "A worker dispatch is required");
@@ -344,12 +337,22 @@ pub async fn create_worktree(
         } else {
             git::validate_name(&entry.path, &name)?;
         }
-        let repo_name = entry.path.file_name().map(PathBuf::from).unwrap_or_else(|| "repo".into());
-        let target = root.join(repo_name).join(&name);
+        let env_root = crate::worktree_location::env_root();
+        let target = crate::worktree_location::worktree_target(
+            &entry.path,
+            &name,
+            location,
+            env_root.as_deref(),
+            &crate::worktree_location::home_dir(),
+        );
         match target.symlink_metadata() {
             Ok(_) => return Err(format!("Folder already exists: {}", target.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("check worktree folder: {e}")),
+        }
+        if env_root.is_none() && location == crate::worktree_location::WorktreeLocation::Inside {
+            let common = crate::worktree_location::git_common_dir(&entry.path)?;
+            crate::worktree_location::ensure_exclude(&common).map_err(|e| format!("update git exclude: {e}"))?;
         }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("create folder: {e}"))?;

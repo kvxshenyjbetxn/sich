@@ -38,6 +38,32 @@ impl<'de> Deserialize<'de> for PrMergeMethod {
     }
 }
 
+/// Where new worktrees are created. The daemon reads this key from the settings file itself.
+/// Unknown stored values fall back to `Sibling`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorktreeLocation {
+    #[default]
+    Sibling,
+    Inside,
+    Shared,
+}
+
+impl WorktreeLocation {
+    pub(crate) const ALL: [Self; 3] = [Self::Sibling, Self::Inside, Self::Shared];
+}
+
+impl<'de> Deserialize<'de> for WorktreeLocation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("inside") => Self::Inside,
+            Some("shared") => Self::Shared,
+            _ => Self::Sibling,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
@@ -76,6 +102,7 @@ pub struct AppSettings {
     /// Show and create GitHub pull requests through the user's own `gh` CLI.
     pub github_prs: bool,
     pub(crate) pr_merge_method: PrMergeMethod,
+    pub(crate) worktree_location: WorktreeLocation,
 }
 
 impl Default for AppSettings {
@@ -106,6 +133,7 @@ impl Default for AppSettings {
             quick_commands: Vec::new(),
             github_prs: true,
             pr_merge_method: PrMergeMethod::default(),
+            worktree_location: WorktreeLocation::default(),
         }
     }
 }
@@ -386,6 +414,15 @@ pub(crate) fn set_pr_merge_method(method: PrMergeMethod, cx: &mut App) {
     }
 }
 
+pub(crate) fn set_worktree_location(location: WorktreeLocation, cx: &mut App) {
+    let mut s = get(cx);
+    if s.worktree_location != location {
+        s.worktree_location = location;
+        store(s, cx);
+        cx.refresh_windows();
+    }
+}
+
 pub fn set_theme(kind: ThemeKind, cx: &mut App) {
     let mut s = get(cx);
     if s.theme == kind {
@@ -652,5 +689,29 @@ mod tests {
         let enabled = AppSettings { show_external_worktrees: true, ..old };
         let back: AppSettings = serde_json::from_str(&serde_json::to_string(&enabled).unwrap()).unwrap();
         assert!(back.show_external_worktrees);
+    }
+
+    #[test]
+    fn worktree_location_defaults_to_sibling_and_round_trips() {
+        let old: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.worktree_location, WorktreeLocation::Sibling);
+        for loc in WorktreeLocation::ALL {
+            let saved = AppSettings { worktree_location: loc, ..Default::default() };
+            let json = serde_json::to_string(&saved).unwrap();
+            assert_eq!(serde_json::from_str::<AppSettings>(&json).unwrap().worktree_location, loc);
+        }
+        assert!(serde_json::to_string(&WorktreeLocation::Inside).unwrap().contains("inside"));
+        let parsed: AppSettings = serde_json::from_str(r#"{"worktree_location":"shared"}"#).unwrap();
+        assert_eq!(parsed.worktree_location, WorktreeLocation::Shared);
+    }
+
+    #[test]
+    fn unknown_worktree_location_falls_back_without_dropping_other_settings() {
+        for raw in [r#""nowhere""#, "7", "null", r#""""#] {
+            let json = format!(r#"{{"theme":"amoled","worktree_location":{raw}}}"#);
+            let parsed: AppSettings = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.worktree_location, WorktreeLocation::Sibling);
+            assert_eq!(parsed.theme, ThemeKind::Amoled);
+        }
     }
 }

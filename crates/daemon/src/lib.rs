@@ -16,6 +16,7 @@ pub mod scrollback;
 mod server;
 mod shell;
 mod terminal;
+mod worktree_location;
 pub mod worker_worktree;
 
 use std::path::PathBuf;
