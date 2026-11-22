@@ -2,6 +2,7 @@
 
 mod agent;
 mod codex_rollout;
+mod model_probe;
 mod env;
 pub mod generation;
 mod git;

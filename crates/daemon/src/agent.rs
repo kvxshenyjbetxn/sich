@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use sich_proto::{AgentKind, AgentState, AgentStatus, SubagentActivity, SubagentActivityKey, SubagentStatus};
 
 use crate::codex_rollout::{IdentityPlan, IdentityRead, IdentityResult};
+use crate::model_probe::{self, ModelPlan, ModelResult, ModelSource};
 
 mod activity;
 mod omp;
@@ -84,6 +85,8 @@ pub struct ClaudeHook {
     pub spawn_tool_type: Option<String>,
     /// `Stop` / `SubagentStop` inventory: `None` when absent or not an array.
     pub background_tasks: Option<Vec<BgAgentTask>>,
+    /// Transcript of the agent that fired the event (a subagent's own for child events).
+    pub transcript_path: Option<String>,
     activity: Option<activity::Note>,
 }
 
@@ -270,6 +273,7 @@ pub fn parse_claude_payload(json: &str) -> Option<ClaudeHook> {
         session_title: get("session_title").and_then(|s| normalize_text(&s, false)),
         prompt: get("prompt").and_then(|s| normalize_text(&s, true)),
         last_assistant_message: get("last_assistant_message").and_then(|s| normalize_text(&s, false)),
+        transcript_path: get("transcript_path"),
         activity,
     })
 }
@@ -471,11 +475,13 @@ fn upsert_sub<'a>(list: &'a mut Vec<SubagentStatus>, id: &str, now: u64) -> Opti
     list.last_mut()
 }
 
-/// Syncs the roster with the `background_tasks` inventory (`None` = keep the roster).
-fn reconcile(list: &mut Vec<SubagentStatus>, bg: &Option<Vec<BgAgentTask>>, now: u64) {
+/// Syncs the roster with the `background_tasks` inventory (`None` = keep the roster). `exclude`
+/// is a subagent that just stopped: its task may still be listed as running, so it is never
+/// retained or re-added.
+fn reconcile(list: &mut Vec<SubagentStatus>, bg: &Option<Vec<BgAgentTask>>, now: u64, exclude: Option<&str>) {
     let Some(bg) = bg else { return };
-    list.retain(|s| bg.iter().any(|t| t.running && t.id == s.id));
-    for t in bg {
+    list.retain(|s| Some(s.id.as_str()) != exclude && bg.iter().any(|t| t.running && t.id == s.id));
+    for t in bg.iter().filter(|t| Some(t.id.as_str()) != exclude) {
         if let Some(s) = list.iter_mut().find(|s| s.id == t.id) {
             if let Some(a) = real_label(&t.agent_type) {
                 s.agent_type = Some(a);
@@ -595,7 +601,7 @@ fn apply_claude(
                 if let Some(id) = h.agent_id.as_deref() {
                     p.subagents.retain(|s| s.id != id);
                 }
-                reconcile(&mut p.subagents, &h.background_tasks, now);
+                reconcile(&mut p.subagents, &h.background_tasks, now, h.agent_id.as_deref());
             }
             return Some(p);
         }
@@ -637,7 +643,7 @@ fn apply_claude(
         s.subagents.clear();
     }
     if h.event == "Stop" || h.event == "StopFailure" {
-        reconcile(&mut s.subagents, &h.background_tasks, now);
+        reconcile(&mut s.subagents, &h.background_tasks, now, None);
     }
     if h.event == "SubagentStart" {
         if let Some(id) = h.agent_id.as_deref() {
@@ -860,8 +866,22 @@ pub struct AgentTracker {
     pending_spawns: VecDeque<SubagentSpawn>,
     /// Codex subagent rollout identity bookkeeping (agent_id -> state); roster members only.
     identities: HashMap<String, IdentityState>,
+    /// Subagent model read bookkeeping (agent_id -> attempts); roster members only.
+    model_probes: HashMap<String, ModelProbe>,
     activity: activity::Book,
 }
+
+/// How often the model of one subagent was looked up in its agent's files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ModelProbe {
+    tries: u8,
+    last_ms: u64,
+}
+
+/// A subagent's model file is read no more often than this ...
+const MODEL_PROBE_INTERVAL_MS: u64 = 2000;
+/// ... and never more than this many times.
+const MODEL_PROBE_MAX_TRIES: u8 = 4;
 
 /// Where the rollout identity read of one Codex subagent stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -913,7 +933,99 @@ impl AgentTracker {
             status.session_id.clone_from(&h.session_id);
         }
         self.record_hook(AgentKind::Claude, old.as_ref(), h.session_id.as_deref(), h.agent_id.as_deref(), h.activity.as_ref(), now);
+        self.prune_model_probes();
         self.status != old
+    }
+
+    fn prune_model_probes(&mut self) {
+        let roster: Vec<&str> =
+            self.status.as_ref().map(|s| s.subagents.iter().map(|x| x.id.as_str()).collect()).unwrap_or_default();
+        self.model_probes.retain(|id, _| roster.contains(&id.as_str()));
+    }
+
+    /// True when the subagent's model may be looked up now (attempt and interval limits).
+    fn model_probe_due(&self, id: &str, now: u64) -> bool {
+        self.model_probes.get(id).is_none_or(|p| {
+            p.tries < MODEL_PROBE_MAX_TRIES && now >= p.last_ms.saturating_add(MODEL_PROBE_INTERVAL_MS)
+        })
+    }
+
+    /// Whether `id` is known to already have a model (so nothing needs reading).
+    fn sub_has_model(&self, kind: AgentKind, id: &str) -> bool {
+        self.status
+            .as_ref()
+            .filter(|s| s.kind == kind)
+            .and_then(|s| s.subagents.iter().find(|x| x.id == id))
+            .is_some_and(|x| x.model.is_some())
+    }
+
+    /// The model file read (if any) a Claude child event needs. Cheap and pure: the caller reads
+    /// outside of any lock ([`model_probe::execute`]) and then calls [`Self::apply_model`] after
+    /// applying the hook (a `SubagentStart` only puts the subagent on the roster then).
+    pub fn claude_model_plan(&self, h: &ClaudeHook, now: u64) -> Option<ModelPlan> {
+        let id = h.agent_id.as_deref().filter(|id| !id.starts_with(HOOK_AGENT_PREFIX))?;
+        if !matches!(
+            h.event.as_str(),
+            "SubagentStart" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure" | "PermissionRequest"
+                | "Notification" | "Elicitation"
+        ) {
+            return None;
+        }
+        let path = model_probe::claude_meta_path(h.transcript_path.as_deref()?, id)?;
+        if self.sub_has_model(AgentKind::Claude, id) || !self.model_probe_due(id, now) {
+            return None;
+        }
+        Some(ModelPlan { agent_id: id.to_string(), session_id: h.session_id.clone(), source: ModelSource::ClaudeMeta, path })
+    }
+
+    /// The rollout read a Codex child hook needs for its model: only when the hook itself did not
+    /// carry one. Same shape as [`Self::claude_model_plan`].
+    pub fn codex_model_plan(&self, h: &CodexHook, now: u64) -> Option<ModelPlan> {
+        let id = h.agent_id.as_deref()?;
+        if h.model.is_some()
+            || !matches!(h.event.as_str(), "SubagentStart" | "PreToolUse" | "PostToolUse" | "PermissionRequest")
+        {
+            return None;
+        }
+        let path = h.transcript_path.as_deref().filter(|p| valid_rollout_path(p))?;
+        self.status.as_ref().filter(|s| s.kind == AgentKind::Codex)?;
+        if self.sub_has_model(AgentKind::Codex, id) || !self.model_probe_due(id, now) {
+            return None;
+        }
+        Some(ModelPlan {
+            agent_id: id.to_string(),
+            session_id: h.session_id.clone(),
+            source: ModelSource::CodexRollout,
+            path: path.into(),
+        })
+    }
+
+    /// Applies a model read. Never overwrites a model, and ignores results for another agent kind,
+    /// another session or a subagent that is no longer on the roster. True if the status changed.
+    pub fn apply_model(&mut self, r: ModelResult, now: u64) -> bool {
+        let kind = match r.source {
+            ModelSource::ClaudeMeta => AgentKind::Claude,
+            ModelSource::CodexRollout => AgentKind::Codex,
+        };
+        let changed = 'apply: {
+            let Some(status) = self.status.as_mut().filter(|s| s.kind == kind) else { break 'apply false };
+            if r.session_id.is_some() && status.session_id.is_some() && status.session_id != r.session_id {
+                break 'apply false;
+            }
+            let Some(sub) = status.subagents.iter_mut().find(|x| x.id == r.agent_id) else { break 'apply false };
+            let probe = self.model_probes.entry(r.agent_id).or_default();
+            probe.tries = probe.tries.saturating_add(1);
+            probe.last_ms = now;
+            match r.model.as_deref().map(clip).filter(|m| !m.is_empty()) {
+                Some(m) if sub.model.is_none() => {
+                    sub.model = Some(m);
+                    true
+                }
+                _ => false,
+            }
+        };
+        self.prune_model_probes();
+        changed
     }
 
     pub(crate) fn subagent_activity(&mut self, key: &SubagentActivityKey, after_seq: u64, now: u64) -> Option<SubagentActivity> {
@@ -960,6 +1072,7 @@ impl AgentTracker {
         self.status = status;
         self.pending_spawns.clear();
         self.identities.clear();
+        self.model_probes.clear();
         changed
     }
 
@@ -1007,6 +1120,7 @@ impl AgentTracker {
         let roster: Vec<&str> =
             self.status.as_ref().map(|s| s.subagents.iter().map(|x| x.id.as_str()).collect()).unwrap_or_default();
         self.identities.retain(|id, _| roster.contains(&id.as_str()));
+        self.prune_model_probes();
         changed
     }
 
@@ -1042,6 +1156,7 @@ impl AgentTracker {
         self.hooks_seen = false;
         self.pending_spawns.clear();
         self.identities.clear();
+        self.model_probes.clear();
         self.activity.sync(None, now);
         self.update(|prev| apply(prev, AgentInput::ProcessExit, 0))
     }
@@ -2081,6 +2196,174 @@ mod tests {
         assert_eq!(t.status().unwrap().subagents[0].description, None);
     }
 
+    // ---- Subagent model reads (Claude meta file, Codex rollout) ----
+
+    fn claude_child(event: &str, id: &str, path: &str) -> ClaudeHook {
+        hook(&format!(
+            r#"{{"session_id":"s1","hook_event_name":"{event}","agent_id":"{id}","transcript_path":{path}}}"#
+        ))
+    }
+
+    fn model_res(source: ModelSource, id: &str, session: Option<&str>, model: Option<&str>) -> ModelResult {
+        ModelResult {
+            agent_id: id.into(),
+            session_id: session.map(str::to_string),
+            source,
+            model: model.map(str::to_string),
+        }
+    }
+
+    fn claude_tracker() -> AgentTracker {
+        let mut t = AgentTracker::default();
+        t.on_claude_hook(&hook(r#"{"session_id":"s1","hook_event_name":"SessionStart","model":"main"}"#), T0);
+        t
+    }
+
+    fn sub_model(t: &AgentTracker, id: &str) -> Option<String> {
+        t.status().unwrap().subagents.iter().find(|s| s.id == id).and_then(|s| s.model.clone())
+    }
+
+    #[test]
+    fn claude_model_comes_from_meta_after_subagent_start() {
+        let p = abs_jsonl("sich-cm-a/sess.jsonl");
+        let mut t = claude_tracker();
+        let start = claude_child("SubagentStart", "a1", &p);
+        let plan = t.claude_model_plan(&start, T0 + 1).unwrap();
+        assert_eq!((plan.agent_id.as_str(), plan.source, plan.session_id.as_deref()), ("a1", ModelSource::ClaudeMeta, Some("s1")));
+        assert!(plan.path.ends_with(std::path::Path::new("sess").join("subagents").join("agent-a1.meta.json")));
+        // The hook is applied first (it puts the subagent on the roster), then the result.
+        assert!(t.on_claude_hook(&start, T0 + 1));
+        let r = model_res(ModelSource::ClaudeMeta, "a1", Some("s1"), Some(" claude-haiku-5-5 "));
+        assert!(t.apply_model(r, T0 + 1));
+        assert_eq!(sub_model(&t, "a1").as_deref(), Some("claude-haiku-5-5"));
+        // Done: no further reads, and a later result never overwrites it.
+        let tool = claude_child("PreToolUse", "a1", &p);
+        assert_eq!(t.claude_model_plan(&tool, T0 + 100_000), None);
+        assert!(!t.apply_model(model_res(ModelSource::ClaudeMeta, "a1", Some("s1"), Some("other")), T0 + 5));
+        assert_eq!(sub_model(&t, "a1").as_deref(), Some("claude-haiku-5-5"));
+    }
+
+    #[test]
+    fn claude_hook_model_is_not_overwritten_by_the_file() {
+        let p = abs_jsonl("sich-cm-b/sess.jsonl");
+        let mut t = claude_tracker();
+        t.on_claude_hook(&claude_child("SubagentStart", "a1", &p), T0 + 1);
+        let sw = hook(r#"{"session_id":"s1","hook_event_name":"PostModelSwitch","agent_id":"a1","to_model":"from-hook"}"#);
+        t.on_claude_hook(&sw, T0 + 2);
+        assert_eq!(sub_model(&t, "a1").as_deref(), Some("from-hook"));
+        assert_eq!(t.claude_model_plan(&claude_child("PreToolUse", "a1", &p), T0 + 9), None);
+        assert!(!t.apply_model(model_res(ModelSource::ClaudeMeta, "a1", Some("s1"), Some("from-file")), T0 + 9));
+        assert_eq!(sub_model(&t, "a1").as_deref(), Some("from-hook"));
+    }
+
+    #[test]
+    fn claude_model_probe_is_rate_and_count_limited() {
+        let p = abs_jsonl("sich-cm-c/sess.jsonl");
+        let mut t = claude_tracker();
+        let start = claude_child("SubagentStart", "a1", &p);
+        t.on_claude_hook(&start, T0);
+        let tool = claude_child("PreToolUse", "a1", &p);
+        let miss = || model_res(ModelSource::ClaudeMeta, "a1", Some("s1"), None);
+        let mut now = T0;
+        for _ in 0..MODEL_PROBE_MAX_TRIES {
+            assert!(t.claude_model_plan(&tool, now).is_some());
+            assert!(!t.apply_model(miss(), now));
+            assert_eq!(t.claude_model_plan(&tool, now + MODEL_PROBE_INTERVAL_MS - 1), None, "too soon");
+            now += MODEL_PROBE_INTERVAL_MS;
+        }
+        assert_eq!(t.claude_model_plan(&tool, now + 1_000_000), None, "gave up");
+        assert_eq!(sub_model(&t, "a1"), None);
+    }
+
+    #[test]
+    fn claude_model_plan_needs_a_child_event_a_valid_id_and_path() {
+        let p = abs_jsonl("sich-cm-d/sess.jsonl");
+        let t = claude_tracker();
+        assert!(t.claude_model_plan(&claude_child("PostToolUse", "a1", &p), T0).is_some());
+        // Main-level events, stop events, hook agents, unusable ids/paths: nothing to read.
+        assert_eq!(t.claude_model_plan(&hook(&payload("PreToolUse", "")), T0), None);
+        assert_eq!(t.claude_model_plan(&claude_child("SubagentStop", "a1", &p), T0), None);
+        assert_eq!(t.claude_model_plan(&claude_child("PreToolUse", "hook-agent-1", &p), T0), None);
+        assert_eq!(t.claude_model_plan(&claude_child("PreToolUse", "a/../b", &p), T0), None);
+        assert_eq!(t.claude_model_plan(&claude_child("PreToolUse", "a1", r#""rel/x.jsonl""#), T0), None);
+        assert_eq!(t.claude_model_plan(&claude_child("PreToolUse", "a1", &abs_jsonl("x.txt")), T0), None);
+        let no_path = hook(r#"{"session_id":"s1","hook_event_name":"PreToolUse","agent_id":"a1"}"#);
+        assert_eq!(t.claude_model_plan(&no_path, T0), None);
+    }
+
+    #[test]
+    fn model_result_for_another_session_or_subagent_is_ignored() {
+        let p = abs_jsonl("sich-cm-e/sess.jsonl");
+        let mut t = claude_tracker();
+        t.on_claude_hook(&claude_child("SubagentStart", "a1", &p), T0);
+        assert_eq!(t.status().unwrap().session_id.as_deref(), Some("s1"));
+        assert!(!t.apply_model(model_res(ModelSource::ClaudeMeta, "a1", Some("other-session"), Some("m")), T0 + 1));
+        assert!(!t.apply_model(model_res(ModelSource::ClaudeMeta, "ghost", Some("s1"), Some("m")), T0 + 1));
+        assert!(!t.apply_model(model_res(ModelSource::CodexRollout, "a1", Some("s1"), Some("m")), T0 + 1));
+        assert_eq!(sub_model(&t, "a1"), None);
+        assert!(t.model_probes.is_empty(), "ignored results leave no bookkeeping");
+        // Empty / blank models count as a miss.
+        assert!(!t.apply_model(model_res(ModelSource::ClaudeMeta, "a1", Some("s1"), Some("  ")), T0 + 2));
+        assert_eq!(sub_model(&t, "a1"), None);
+    }
+
+    #[test]
+    fn model_probe_bookkeeping_is_dropped_with_the_roster_entry() {
+        let p = abs_jsonl("sich-cm-f/sess.jsonl");
+        let mut t = claude_tracker();
+        t.on_claude_hook(&claude_child("SubagentStart", "a1", &p), T0);
+        t.apply_model(model_res(ModelSource::ClaudeMeta, "a1", Some("s1"), None), T0);
+        assert_eq!(t.model_probes.len(), 1);
+        t.on_claude_hook(&claude_child("SubagentStop", "a1", &p), T0 + 1);
+        assert!(t.model_probes.is_empty());
+        t.on_claude_hook(&claude_child("SubagentStart", "a1", &p), T0 + 2);
+        assert!(t.claude_model_plan(&claude_child("PreToolUse", "a1", &p), T0 + 2).is_some(), "fresh start, fresh budget");
+        t.apply_model(model_res(ModelSource::ClaudeMeta, "a1", Some("s1"), None), T0 + 2);
+        t.on_exit(T0 + 3);
+        assert!(t.model_probes.is_empty());
+    }
+
+    #[test]
+    fn codex_child_model_comes_from_the_rollout_on_the_right_child() {
+        let p = abs_jsonl("sich-cr-a.jsonl");
+        let mut t = AgentTracker::default();
+        t.on_codex_hook(&chook("UserPromptSubmit", ""), T0);
+        let start1 = cchild("SubagentStart", "a1", &format!(r#","transcript_path":{p}"#));
+        let start2 = cchild("SubagentStart", "a2", &format!(r#","transcript_path":{p}"#));
+        let plan = t.codex_model_plan(&start1, T0 + 1);
+        // No Codex roster yet is fine: the plan is made for the hook about to be applied, but only
+        // once a status exists.
+        assert!(plan.is_some());
+        t.on_codex_hook(&start1, T0 + 1);
+        t.on_codex_hook(&start2, T0 + 1);
+        let plan = t.codex_model_plan(&start1, T0 + 2).unwrap();
+        assert_eq!((plan.source, plan.agent_id.as_str()), (ModelSource::CodexRollout, "a1"));
+        assert!(t.apply_model(model_res(ModelSource::CodexRollout, "a1", Some("s1"), Some("gpt-6.2-sol")), T0 + 2));
+        assert_eq!(sub_model(&t, "a1").as_deref(), Some("gpt-6.2-sol"));
+        assert_eq!(sub_model(&t, "a2"), None, "the other child is untouched");
+        assert_eq!(t.codex_model_plan(&start1, T0 + 99_999), None, "a1 has its model");
+        assert!(t.codex_model_plan(&start2, T0 + 99_999).is_some());
+    }
+
+    #[test]
+    fn codex_hook_model_wins_over_the_rollout() {
+        let p = abs_jsonl("sich-cr-b.jsonl");
+        let mut t = AgentTracker::default();
+        t.on_codex_hook(&chook("UserPromptSubmit", ""), T0);
+        // A hook carrying a model needs no read; the hook value is kept even if a read lands later.
+        let with_model = cchild("SubagentStart", "a1", &format!(r#","model":"hook-model","transcript_path":{p}"#));
+        assert_eq!(t.codex_model_plan(&with_model, T0 + 1), None);
+        t.on_codex_hook(&with_model, T0 + 1);
+        assert!(!t.apply_model(model_res(ModelSource::CodexRollout, "a1", Some("s1"), Some("rollout-model")), T0 + 2));
+        assert_eq!(sub_model(&t, "a1").as_deref(), Some("hook-model"));
+        // Non-child events, stop events and bad paths get no plan.
+        let none = |h: CodexHook| assert_eq!(t.codex_model_plan(&h, T0 + 9), None);
+        none(chook("PreToolUse", &format!(r#","transcript_path":{p}"#)));
+        none(cchild("SubagentStop", "a1", &format!(r#","transcript_path":{p}"#)));
+        none(cchild("PreToolUse", "a2", r#","transcript_path":"rel/x.jsonl""#));
+        assert_eq!(AgentTracker::default().codex_model_plan(&cchild("SubagentStart", "a2", &format!(r#","transcript_path":{p}"#)), T0), None);
+    }
+
     #[test]
     fn working_to_done_sets_unread_via_hook_flow() {
         let w = run(None, "UserPromptSubmit", "", T0);
@@ -2394,6 +2677,25 @@ mod tests {
         let s = srun(Some(s), &mut q, "UserPromptSubmit", r#","prompt":"x""#, T0 + 8).unwrap();
         assert_eq!(s.subagents.len(), 1);
         assert_eq!(s.state, AgentState::Working);
+    }
+
+    #[test]
+    fn subagent_stop_is_not_resurrected_by_its_own_inventory_entry() {
+        let mut q = VecDeque::new();
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1);
+        let s = start(s, &mut q, "b1", "Plan", T0 + 2);
+        // Claude lists the stopping agent's task as still running at SubagentStop time.
+        let inv = r#","agent_id":"a1","background_tasks":[
+            {"id":"a1","type":"local_agent","status":"running","description":"Scan"},
+            {"id":"b1","type":"local_agent","status":"running"}]"#;
+        let s = srun(s, &mut q, "SubagentStop", inv, T0 + 3).unwrap();
+        let ids: Vec<&str> = s.subagents.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(ids, ["b1"]);
+        // Only the stopping agent in the inventory: the roster ends up empty.
+        let s = start(working(), &mut q, "a1", "Explore", T0 + 1);
+        let only = r#","agent_id":"a1","background_tasks":[{"id":"a1","type":"local_agent","status":"running"}]"#;
+        let s = srun(s, &mut q, "SubagentStop", only, T0 + 2).unwrap();
+        assert!(s.subagents.is_empty());
     }
 
     #[test]
