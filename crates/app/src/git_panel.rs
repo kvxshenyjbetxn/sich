@@ -3,6 +3,7 @@
 mod branch_compare;
 mod branch_picker;
 mod conflicts;
+mod history_graph;
 mod notes;
 mod ops_menu;
 mod pr;
@@ -33,9 +34,11 @@ use sich_git::compare::{CompareKey, CompareSource};
 use sich_git::scheduler::Scheduler;
 use sich_git::watch::{self, WatchSignal};
 use sich_git::{
-    Branch, ChangeKind, Commit, FileChange, GitError, HISTORY_PAGE_SIZE, InProgress, Repo, RepoStatus,
+    Branch, ChangeKind, Commit, CommitOpOutcome, FileChange, GitError, HISTORY_PAGE_SIZE, InProgress, Repo, RepoStatus,
     Stash,
 };
+use sich_git::forge::RemoteRepo;
+use sich_git::graph::{GraphBuilder, GraphRow};
 
 use crate::i18n::{Language, Tr, tr};
 use crate::pr_store::{PrStore, PrStoreEvent};
@@ -143,6 +146,8 @@ enum Operation {
     Stash,
     Continue,
     Abort,
+    CherryPick,
+    Revert,
 }
 
 impl Operation {
@@ -197,6 +202,8 @@ enum Mutation {
     StashDrop(Stash),
     Continue(InProgress),
     Abort(InProgress),
+    CherryPick(String),
+    Revert(String),
 }
 
 impl Mutation {
@@ -211,13 +218,23 @@ impl Mutation {
     }
 
     /// Runs the mutation; `Some(message)` is the commit message that `Undo` took off HEAD.
-    fn run_full(self, repo: &Repo) -> Result<Option<String>, GitError> {
+    fn run_full(self, repo: &Repo) -> Result<(Option<String>, bool), GitError> {
         let undone = if matches!(self, Self::Undo) {
             repo.last_commit_message().ok().flatten()
         } else {
             None
         };
-        self.run(repo).map(|()| undone)
+        let outcome = match &self {
+            Self::CherryPick(oid) => Some(repo.cherry_pick(oid)?),
+            Self::Revert(oid) => Some(repo.revert(oid)?),
+            _ => None,
+        };
+        match outcome {
+            Some(CommitOpOutcome::Refused(message)) => Err(GitError::Failed(message)),
+            // A conflict leaves the operation open: the in-progress banner takes over.
+            Some(outcome) => Ok((None, outcome == CommitOpOutcome::Empty)),
+            None => self.run(repo).map(|()| (undone, false)),
+        }
     }
 
     fn operation(&self) -> Operation {
@@ -240,6 +257,8 @@ impl Mutation {
             }
             Self::Continue(_) => Operation::Continue,
             Self::Abort(_) => Operation::Abort,
+            Self::CherryPick(_) => Operation::CherryPick,
+            Self::Revert(_) => Operation::Revert,
         }
     }
 
@@ -282,6 +301,8 @@ impl Mutation {
             Self::StashDrop(stash) => repo.stash_drop(&stash),
             Self::Continue(op) => repo.continue_in_progress(op),
             Self::Abort(op) => repo.abort_in_progress(op),
+            // Handled in `run_full`, which needs the outcome.
+            Self::CherryPick(_) | Self::Revert(_) => Ok(()),
         }
     }
 }
@@ -335,6 +356,10 @@ struct History {
     more: bool,
     loading_more: bool,
     revision: u64,
+    /// Lane layout of `commits`, one row each; extended as pages arrive.
+    rows: Vec<GraphRow>,
+    builder: GraphBuilder,
+    remote: Option<RemoteRepo>,
 }
 
 impl History {
@@ -347,8 +372,18 @@ impl History {
             self.commits = page;
             self.loading_more = false;
             self.revision = self.revision.wrapping_add(1);
+            self.rows.clear();
+            self.builder = GraphBuilder::new();
         } else {
             self.commits.extend(page);
+        }
+        self.extend_graph();
+    }
+
+    fn extend_graph(&mut self) {
+        for commit in &self.commits[self.rows.len()..] {
+            self.rows
+                .push(self.builder.push(&commit.oid, &commit.parents, commit.is_head()));
         }
     }
 }
@@ -593,13 +628,14 @@ impl GitPanel {
 
     fn finish_history(
         &mut self,
-        result: Result<Vec<Commit>, GitError>,
+        result: Result<(Vec<Commit>, Option<RemoteRepo>), GitError>,
         count: usize,
         cx: &mut Context<Self>,
     ) {
         match result {
-            Ok(commits) => {
+            Ok((commits, remote)) => {
                 self.history.apply(commits, count, true);
+                self.history.remote = remote;
             }
             Err(error) if self.status.is_some() => self.error = Some(error.to_string()),
             Err(_) => {}
@@ -762,7 +798,7 @@ impl GitPanel {
                     }
                 }
                 // Undo hands the removed commit message back for editing.
-                if let Ok(Some(undone)) = &result
+                if let Ok((Some(undone), _)) = &result
                     && panel.draft_of(&path).trim().is_empty()
                 {
                     panel.drafts.insert(path.clone(), undone.clone());
@@ -771,6 +807,9 @@ impl GitPanel {
                             input.state.update(cx, |input, cx| input.set_value(undone.clone(), window, cx));
                         }
                     }
+                }
+                if matches!(result, Ok((_, true))) {
+                    history_graph::show_info(tr(crate::settings::language(cx), Tr::GitNothingToApply), window, cx);
                 }
                 let error = result.err().map(|error| error.to_string());
                 if operation == Operation::SwitchBranch && let Some(error) = &error {
@@ -1028,7 +1067,11 @@ async fn refresh_loop(
             let repo = opened.clone();
             (
                 count,
-                cx.background_spawn(async move { repo.log(0, count + 1) }),
+                cx.background_spawn(async move {
+                    let commits = repo.log(0, count + 1)?;
+                    let remote = repo.remote_repo().ok().flatten();
+                    Ok((commits, remote))
+                }),
             )
         });
         let result = status.await;

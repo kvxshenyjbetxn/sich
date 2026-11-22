@@ -14,7 +14,9 @@ use gpui_kit::{
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Render,
     SharedString, StatefulInteractiveElement as _, Styled as _, Window, div, px, relative,
 };
+use gpui_kit::component::menu::ContextMenuExt as _;
 use sich_git::STATUS_LIMIT;
+use sich_git::graph::GraphRow;
 
 use super::*;
 use crate::diff_view::split_file_label;
@@ -613,12 +615,19 @@ impl GitPanel {
                         };
                         tiny(tr(lang, label), cx)
                     }))
-                    .children(
+                    .children({
+                        let columns = history_graph::lane_columns(&self.history.rows);
+                        let colors = history_graph::lane_colors(&theme);
                         self.history
                             .commits
                             .iter()
-                            .map(|commit| self.commit_row(commit, lang, cx)),
-                    )
+                            .enumerate()
+                            .map(|(index, commit)| {
+                                let row = self.history.rows.get(index);
+                                self.commit_row(commit, row, columns, colors, lang, cx)
+                            })
+                            .collect::<Vec<_>>()
+                    })
                     .children(self.history.more.then(|| {
                         div().p_1().child(
                             Button::new("git-load-more")
@@ -643,10 +652,22 @@ impl GitPanel {
     fn commit_row(
         &self,
         commit: &Commit,
+        graph: Option<&GraphRow>,
+        columns: usize,
+        colors: [Hsla; 5],
         lang: Language,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
+        let url = history_graph::commit_web_link(self.history.remote.as_ref(), &commit.oid);
+        let menu_panel = cx.weak_entity();
+        let menu_commit = commit.clone();
+        let busy = self.active_operation().is_some();
+        let graph_cell = graph
+            .map(|row| history_graph::graph_cell(row, columns, colors, theme.background));
+        let lane_lines = graph
+            .map(|row| history_graph::expansion_lines(row, &colors))
+            .unwrap_or_default();
         let oid = SharedString::from(commit.oid.clone());
         let expansion = self.history.expanded.get(&commit.oid);
         let (badges, more) = ref_badges(&commit.refs);
@@ -667,6 +688,17 @@ impl GitPanel {
                             panel.toggle_commit(oid.to_string(), cx)
                         }),
                     )
+                    .context_menu(move |menu, _, _| {
+                        history_graph::commit_menu(
+                            menu,
+                            menu_panel.clone(),
+                            &menu_commit,
+                            url.clone(),
+                            busy,
+                            lang,
+                        )
+                    })
+                    .children(graph_cell)
                     .child(chevron(expansion.is_some()))
                     .child(
                         div()
@@ -732,11 +764,13 @@ impl GitPanel {
                 let date = format_commit_date(commit.time_unix, &Local);
                 let metadata = format!("{} <{}> · {date}", commit.author, commit.email);
                 v_flex()
+                    .relative()
                     .w_full()
-                    .pl_3()
+                    .pl(px(history_graph::graph_width(columns) + 12.))
                     .pb_1()
                     .border_b_1()
                     .border_color(theme.border)
+                    .children(lane_lines)
                     .child(
                         div()
                             .px_2()

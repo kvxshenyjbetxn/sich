@@ -469,6 +469,14 @@ pub enum Tr {
     // ---- end details ----
 
     // ---- history keys: append below ----
+    GitCopySha,
+    GitCopyMessage,
+    GitOpenCommitOnGitHub,
+    GitCherryPick,
+    GitCherryPickConfirm,
+    GitRevert,
+    GitRevertConfirm,
+    GitNothingToApply,
     // ---- end history ----
 
     // ---- compare keys: append below ----
@@ -911,6 +919,14 @@ impl Tr {
         // ---- end details ----
 
         // ---- history keys: append below ----
+        Tr::GitCopySha,
+        Tr::GitCopyMessage,
+        Tr::GitOpenCommitOnGitHub,
+        Tr::GitCherryPick,
+        Tr::GitCherryPickConfirm,
+        Tr::GitRevert,
+        Tr::GitRevertConfirm,
+        Tr::GitNothingToApply,
         // ---- end history ----
 
         // ---- compare keys: append below ----
@@ -3016,6 +3032,46 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
         // ---- end details ----
 
         // ---- history keys: append below ----
+        Tr::GitCopySha => match lang {
+            Uk => "Копіювати SHA",
+            Ru => "Копировать SHA",
+            En => "Copy SHA",
+        },
+        Tr::GitCopyMessage => match lang {
+            Uk => "Копіювати повідомлення",
+            Ru => "Копировать сообщение",
+            En => "Copy message",
+        },
+        Tr::GitOpenCommitOnGitHub => match lang {
+            Uk => "Відкрити на GitHub",
+            Ru => "Открыть на GitHub",
+            En => "Open on GitHub",
+        },
+        Tr::GitCherryPick => match lang {
+            Uk => "Cherry-pick на поточну гілку",
+            Ru => "Cherry-pick на текущую ветку",
+            En => "Cherry-pick onto current branch",
+        },
+        Tr::GitCherryPickConfirm => match lang {
+            Uk => "Застосувати цей коміт поверх поточної гілки?",
+            Ru => "Применить этот коммит поверх текущей ветки?",
+            En => "Apply this commit on top of the current branch?",
+        },
+        Tr::GitRevert => match lang {
+            Uk => "Скасувати коміт (revert)",
+            Ru => "Отменить коммит (revert)",
+            En => "Revert commit",
+        },
+        Tr::GitRevertConfirm => match lang {
+            Uk => "Створити коміт, що скасовує цю зміну?",
+            Ru => "Создать коммит, отменяющий это изменение?",
+            En => "Create a commit that reverts this change?",
+        },
+        Tr::GitNothingToApply => match lang {
+            Uk => "Нічого застосовувати: зміни вже є",
+            Ru => "Нечего применять: изменения уже есть",
+            En => "Nothing to apply: the changes are already there",
+        },
         // ---- end history ----
 
         // ---- compare keys: append below ----

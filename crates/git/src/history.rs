@@ -11,9 +11,19 @@ pub struct Commit {
     pub author: String,
     pub email: String,
     pub time_unix: i64,
+    pub parents: Vec<String>,
     pub refs: Vec<String>,
     pub subject: String,
     pub body: String,
+}
+
+impl Commit {
+    /// Whether HEAD points at (or into a branch at) this commit.
+    pub fn is_head(&self) -> bool {
+        self.refs
+            .iter()
+            .any(|r| r == "HEAD" || r.starts_with("HEAD -> "))
+    }
 }
 
 impl Repo {
@@ -25,9 +35,10 @@ impl Repo {
             "log",
             "--no-color",
             "--no-show-signature",
+            "--topo-order",
             "--decorate=short",
             "-z",
-            "--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%D%x00%s%x00%b",
+            "--format=%H%x00%h%x00%an%x00%ae%x00%at%x00%P%x00%D%x00%s%x00%b",
             &format!("--skip={skip}"),
             &format!("-n{limit}"),
         ]);
@@ -78,7 +89,7 @@ pub(crate) fn commit_diff_args<'a>(oid: &'a str, parents: &'a str) -> Vec<&'a st
 fn parse_log(bytes: &[u8]) -> Vec<Commit> {
     let fields: Vec<_> = bytes.split(|&b| b == 0).collect();
     fields
-        .chunks_exact(8)
+        .chunks_exact(9)
         .filter_map(|fields| {
             Some(Commit {
                 oid: text(fields[0]),
@@ -86,13 +97,14 @@ fn parse_log(bytes: &[u8]) -> Vec<Commit> {
                 author: text(fields[2]),
                 email: text(fields[3]),
                 time_unix: text(fields[4]).parse().ok()?,
-                refs: text(fields[5])
+                parents: text(fields[5]).split_whitespace().map(str::to_owned).collect(),
+                refs: text(fields[6])
                     .split(", ")
                     .filter(|r| !r.is_empty())
                     .map(str::to_owned)
                     .collect(),
-                subject: text(fields[6]),
-                body: text(fields[7]).trim_end_matches(['\r', '\n']).to_owned(),
+                subject: text(fields[7]),
+                body: text(fields[8]).trim_end_matches(['\r', '\n']).to_owned(),
             })
         })
         .collect()
@@ -125,13 +137,52 @@ mod tests {
     #[test]
     fn fixed_nul_fields_preserve_empty_fields_and_commit_control_characters() {
         let bytes =
-            b"oid\0short\0a\x1fb\0email\x00123\0HEAD -> main, tag: v1\0subject\0body\x1f\n\0";
+            b"oid\0short\0a\x1fb\0email\x00123\0p1 p2\0HEAD -> main, tag: v1\0subject\0body\x1f\n\0";
         let commits = parse_log(bytes);
         assert_eq!(commits[0].author, "a\x1fb");
+        assert_eq!(commits[0].parents, ["p1", "p2"]);
+        assert!(commits[0].is_head());
         assert_eq!(commits[0].refs, ["HEAD -> main", "tag: v1"]);
         assert_eq!(commits[0].body, "body\x1f");
-        let empty = parse_log(b"oid\0short\0author\0email\x00123\0\0subject\0\0");
+        let empty = parse_log(b"oid\0short\0author\0email\x00123\0\0\0subject\0\0");
         assert!(empty[0].refs.is_empty());
+        assert!(empty[0].parents.is_empty());
+        assert!(!empty[0].is_head());
         assert!(empty[0].body.is_empty());
+    }
+
+    #[test]
+    fn real_log_reports_parents_head_and_topo_order() {
+        use crate::runner::test_repo::TestRepo;
+        let t = TestRepo::new();
+        t.file("a.txt", "1
+");
+        t.commit("base");
+        t.git(&["checkout", "-q", "-b", "side"]);
+        t.file("b.txt", "1
+");
+        t.commit("s1");
+        t.git(&["checkout", "-q", "main"]);
+        t.file("c.txt", "1
+");
+        t.commit("m1");
+        t.git(&["merge", "-q", "--no-ff", "-m", "merge", "side"]);
+        let log = t.open().log(0, 10).unwrap();
+        assert_eq!(log.len(), 4);
+        assert_eq!(log[0].subject, "merge");
+        assert_eq!(log[0].parents.len(), 2);
+        assert!(log[0].is_head());
+        assert!(log[1..].iter().all(|c| !c.is_head()));
+        assert!(log[3].parents.is_empty());
+        // Topological order: every commit appears before its parents.
+        for (i, commit) in log.iter().enumerate() {
+            for parent in &commit.parents {
+                let at = log.iter().position(|c| &c.oid == parent).unwrap();
+                assert!(at > i);
+            }
+        }
+        // Paging keeps the same sequence.
+        let second = t.open().log(2, 10).unwrap();
+        assert_eq!(second, log[2..]);
     }
 }
