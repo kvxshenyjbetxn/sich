@@ -179,6 +179,10 @@ impl GitPanel {
             .px_2()
             .pb_2()
             .children(body)
+            // Extra PR sections, each owned by its own module (keep these mount points).
+            .children(state.view.pr().and_then(|pr| self.pr_details_section(pr, lang, cx)))
+            .children(state.view.pr().and_then(|pr| self.pr_files_section(pr, lang, cx)))
+            .children(state.view.pr().and_then(|pr| self.pr_comments_section(pr, lang, cx)))
             .children(state.action_error.as_ref().map(|error| {
                 h_flex()
                     .items_start()

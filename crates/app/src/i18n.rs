@@ -365,6 +365,14 @@ pub enum Tr {
     WorktreeLocSiblingDesc,
     WorktreeLocInsideDesc,
     WorktreeLocSharedDesc,
+    // ---- comments keys: append below ----
+    // ---- end comments ----
+
+    // ---- checks keys: append below ----
+    // ---- end checks ----
+
+    // ---- details keys: append below ----
+    // ---- end details ----
 }
 
 impl Tr {
@@ -693,6 +701,14 @@ impl Tr {
         Tr::WorktreeLocSiblingDesc,
         Tr::WorktreeLocInsideDesc,
         Tr::WorktreeLocSharedDesc,
+        // ---- comments keys: append below ----
+        // ---- end comments ----
+
+        // ---- checks keys: append below ----
+        // ---- end checks ----
+
+        // ---- details keys: append below ----
+        // ---- end details ----
     ];
 }
 
@@ -2308,6 +2324,14 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "работает",
             En => "working",
         },
+        // ---- comments keys: append below ----
+        // ---- end comments ----
+
+        // ---- checks keys: append below ----
+        // ---- end checks ----
+
+        // ---- details keys: append below ----
+        // ---- end details ----
     }
 }
 
