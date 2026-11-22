@@ -107,6 +107,18 @@ pub struct PullRequest {
     pub head_owner: Option<String>,
     pub checks: Vec<Check>,
     pub updated_at: String,
+    /// GraphQL node id of the pull request (needed by the auto-merge mutation).
+    pub node_id: String,
+    /// Set while auto-merge is enabled.
+    pub auto_merge: Option<AutoMerge>,
+}
+
+/// The pull request's `autoMergeRequest`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutoMerge {
+    /// `SQUASH`, `MERGE` or `REBASE`.
+    pub method: Option<String>,
+    pub enabled_at: Option<String>,
 }
 
 impl PullRequest {
@@ -192,6 +204,15 @@ struct RawPr {
     head_repository_owner: Option<RawOwner>,
     status_check_rollup: Option<Vec<RawCheck>>,
     updated_at: Option<String>,
+    id: Option<String>,
+    auto_merge_request: Option<RawAutoMerge>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RawAutoMerge {
+    merge_method: Option<String>,
+    enabled_at: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -319,6 +340,11 @@ pub fn parse_pr_json(json: &str) -> Result<PullRequest, ForgeError> {
         head_owner: raw.head_repository_owner.and_then(|owner| non_empty(owner.login)),
         checks,
         updated_at: text(raw.updated_at),
+        node_id: text(raw.id),
+        auto_merge: raw.auto_merge_request.map(|auto| AutoMerge {
+            method: non_empty(auto.merge_method),
+            enabled_at: non_empty(auto.enabled_at),
+        }),
     })
 }
 
@@ -414,6 +440,21 @@ mod tests {
         assert_eq!(pr.checks[6].state, CheckState::Success);
         assert_eq!(pr.checks[7].state, CheckState::Pending);
         assert_eq!(pr.checks[8].state, CheckState::Failure);
+    }
+
+    #[test]
+    fn node_id_and_auto_merge_are_parsed() {
+        let json = r#"{"id":"PR_kwDOabc","autoMergeRequest":{"mergeMethod":"SQUASH","enabledAt":"2026-11-22T10:00:00Z","enabledBy":{"login":"x"}}}"#;
+        let pr = parse_pr_json(json).unwrap();
+        assert_eq!(pr.node_id, "PR_kwDOabc");
+        assert_eq!(
+            pr.auto_merge,
+            Some(AutoMerge { method: Some("SQUASH".into()), enabled_at: Some("2026-11-22T10:00:00Z".into()) })
+        );
+        for json in [r#"{}"#, r#"{"autoMergeRequest":null}"#] {
+            let pr = parse_pr_json(json).unwrap();
+            assert_eq!((pr.node_id.as_str(), pr.auto_merge), ("", None), "{json}");
+        }
     }
 
     #[test]

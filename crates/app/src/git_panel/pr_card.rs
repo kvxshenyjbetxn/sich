@@ -13,13 +13,13 @@ use gpui_kit::{
     ParentElement as _, SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, div,
     px,
 };
-use sich_git::forge::{Check, CheckState, PrState, PullRequest};
-use super::pr::{self, CompactRow, CreateBlock, GitTabPr, MergeBlock, chip_text, chips, git_tab_pr};
+use sich_git::forge::{PrState, PullRequest};
+use super::pr::{self, CompactRow, CreateBlock, GitTabPr, chip_text, chips, git_tab_pr};
 use super::render::{tool_button, tiny};
 use super::*;
 use crate::links;
 use crate::pr_store::{PrAction, PrEntry, PrView, Tone};
-use crate::settings::{self, PrMergeMethod};
+use crate::settings;
 
 const GH_SITE: &str = "https://cli.github.com";
 const GH_LOGIN: &str = "gh auth login";
@@ -40,7 +40,7 @@ fn chip_el(id: impl Into<ElementId>, text: String, color: Hsla) -> Stateful<Div>
         .child(text)
 }
 
-fn open_url(url: &str, cx: &mut App) {
+pub(super) fn open_url(url: &str, cx: &mut App) {
     if links::is_allowed(url) {
         cx.open_url(url);
     }
@@ -55,23 +55,6 @@ fn with_reason(id: &'static str, control: impl IntoElement, reason: Option<&'sta
         .when_some(reason, |node, reason| {
             node.tooltip(move |window, cx| Tooltip::new(reason).build(window, cx))
         })
-}
-
-fn check_icon(check: &Check, cx: &Context<GitPanel>) -> Icon {
-    let (icon, tone) = match check.state {
-        CheckState::Success => (Ic::CircleCheck, Tone::Success),
-        CheckState::Failure => (Ic::CircleX, Tone::Danger),
-        CheckState::Pending => (Ic::Circle, Tone::Warning),
-        CheckState::Neutral | CheckState::Skipped => (Ic::Minus, Tone::Muted),
-    };
-    Icon::new(icon).size(px(12.)).text_color(tone_color(tone, cx)).flex_shrink_0()
-}
-
-fn check_label(check: &Check) -> String {
-    match &check.workflow {
-        Some(workflow) if !workflow.is_empty() => format!("{workflow} / {}", check.name),
-        _ => check.name.clone(),
-    }
 }
 
 impl GitPanel {
@@ -149,6 +132,7 @@ impl GitPanel {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().clone();
+        self.pr_tab_visible(cx);
         let state = self.pr_state(cx).unwrap_or_default();
         let branch = status.branch.clone().unwrap_or_default();
         let header = h_flex()
@@ -400,216 +384,265 @@ impl GitPanel {
             )
             .children(more_head);
 
+        let updated = pr::format_updated(&pr.updated_at, &chrono::Local).map(|time| {
+            div()
+                .text_size(px(10.5))
+                .text_color(theme.muted_foreground)
+                .child(tr(lang, Tr::PrUpdated).replace("{t}", &time))
+        });
+
+        // The merge status chip replaces the older merge-state chip.
+        let mut chip_list: Vec<(String, Tone)> = chips(pr)
+            .into_iter()
+            .filter(|chip| !matches!(chip, pr::Chip::Merge(_)))
+            .map(|chip| (chip_text(lang, &chip), chip.tone()))
+            .collect();
+        if pr.state == PrState::Open {
+            let status = pr::merge_status(pr);
+            chip_list.insert(
+                chip_list.len().saturating_sub(1),
+                (pr::merge_status_text(lang, status, &pr.base), pr::merge_status_tone(status)),
+            );
+        }
         let chips_row = h_flex().flex_wrap().gap_1().children(
-            chips(pr)
+            chip_list
                 .into_iter()
                 .enumerate()
-                .map(|(index, chip)| chip_el(("pr-chip", index), chip_text(lang, &chip), tone_color(chip.tone(), cx))),
+                .map(|(index, (text, tone))| chip_el(("pr-chip", index), text, tone_color(tone, cx))),
         );
 
-        let checks = (!pr.checks.is_empty()).then(|| self.pr_checks_list(pr, state, lang, cx));
-        let actions = more_actions.map(|more| self.pr_actions(pr, state, status, more, lang, cx));
+        let conflicts = self.pr_conflicts_block(pr, state, lang, cx);
+        let checks = self.pr_checks_block(pr, state, lang, cx);
+        let actions = self.pr_actions(pr, state, status, more_actions, lang, cx);
 
         v_flex()
             .gap_2()
             .child(heading)
+            .children(updated)
             .child(chips_row)
+            .children(conflicts)
             .children(actions)
             .children(checks)
             .into_any_element()
     }
 
-    fn pr_checks_list(
-        &self,
-        pr: &PullRequest,
-        state: &PrEntry,
-        lang: Language,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme().clone();
-        let failed = pr.failed_run_ids();
-        let failed_jobs = pr.failed_jobs();
-        let busy = state.busy;
-        v_flex()
-            .gap_1()
-            .children((!failed.is_empty() || !failed_jobs.is_empty()).then(|| {
-                let all_jobs = failed_jobs.clone();
-                h_flex()
-                    .gap_1()
-                    .children((!failed.is_empty()).then(|| {
-                        Button::new("pr-rerun")
-                            .ghost()
-                            .xsmall()
-                            .label(tr(lang, Tr::PrRerunFailed))
-                            .disabled(busy)
-                            .on_click(cx.listener(move |panel, _, _, cx| {
-                                panel.pr_run_action(PrAction::Rerun(failed.clone()), cx)
-                            }))
-                    }))
-                    .children((!all_jobs.is_empty()).then(|| {
-                        Button::new("pr-send-all")
-                            .ghost()
-                            .xsmall()
-                            .label(tr(lang, Tr::PrSendFailuresToAgent))
-                            .disabled(busy)
-                            .loading(busy)
-                            .on_click(cx.listener(move |panel, _, _, cx| {
-                                panel.pr_send_to_agent(all_jobs.clone(), cx)
-                            }))
-                    }))
-            }))
-            .child(
-                v_flex()
-                    .children(pr.checks.iter().enumerate().map(|(index, check)| {
-                        let label: SharedString = check_label(check).into();
-                        let tooltip = label.clone();
-                        let url = check.url.clone();
-                        let send_job = (check.state == CheckState::Failure)
-                            .then(|| check.to_failed_job());
-                        h_flex()
-                            .id(("pr-check", index))
-                            .h(px(20.))
-                            .gap_1()
-                            .items_center()
-                            .min_w_0()
-                            .when(url.is_some(), |row| {
-                                row.cursor_pointer().hover(|style| style.bg(theme.list_hover))
-                            })
-                            .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                            .on_click(move |_, _, cx| {
-                                if let Some(url) = &url {
-                                    open_url(url, cx);
-                                }
-                            })
-                            .child(check_icon(check, cx))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(11.))
-                                    .child(label),
-                            )
-                            .children(send_job.map(|job| {
-                                tool_button(
-                                    ("pr-send", index),
-                                    Ic::Bot,
-                                    tr(lang, Tr::PrSendToAgent),
-                                )
-                                .disabled(busy)
-                                .on_click(cx.listener(move |panel, _, _, cx| {
-                                    cx.stop_propagation();
-                                    panel.pr_send_to_agent(vec![job.clone()], cx)
-                                }))
-                            }))
-                    })),
-            )
-            .into_any_element()
-    }
-
-    /// Unpushed commits with a Push button, then the split Merge button and the `…` menu.
+    /// Unpushed commits with a Push button, then the merge area: a split button (merge or
+    /// auto-merge, with the method choice in the dropdown) and the more menu. Draft and closed
+    /// pull requests get their own buttons.
     fn pr_actions(
         &self,
         pr: &PullRequest,
         state: &PrEntry,
         status: &RepoStatus,
-        more: AnyElement,
+        more: Option<AnyElement>,
         lang: Language,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Option<AnyElement> {
         let theme = cx.theme().clone();
+        let busy = state.busy;
+        let close_pr = pr.clone();
+        let close_panel = cx.weak_entity();
+        let close = Rc::new(move |window: &mut Window, cx: &mut App| {
+            let message = pr::close_confirm_text(lang, &close_pr);
+            let _ = close_panel.update(cx, |panel, cx| {
+                panel.confirm(
+                    Tr::PrClose,
+                    message,
+                    true,
+                    lang,
+                    |panel, _, cx| panel.pr_run_action(PrAction::Close, cx),
+                    window,
+                    cx,
+                )
+            });
+        });
+        match pr.state {
+            PrState::Merged => return None,
+            PrState::Closed => {
+                return Some(
+                    h_flex()
+                        .child(
+                            Button::new("pr-reopen")
+                                .xsmall()
+                                .primary()
+                                .label(tr(lang, Tr::PrReopen))
+                                .disabled(busy)
+                                .loading(busy)
+                                .on_click(cx.listener(|panel, _, _, cx| panel.pr_run_action(PrAction::Reopen, cx))),
+                        )
+                        .into_any_element(),
+                );
+            }
+            PrState::Draft => {
+                let close = close.clone();
+                return Some(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            Button::new("pr-ready")
+                                .xsmall()
+                                .primary()
+                                .flex_1()
+                                .label(tr(lang, Tr::PrReadyForReview))
+                                .disabled(busy)
+                                .loading(busy)
+                                .on_click(cx.listener(|panel, _, _, cx| {
+                                    panel.pr_run_action(PrAction::Ready(true), cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("pr-close-draft")
+                                .xsmall()
+                                .label(tr(lang, Tr::PrCloseShort))
+                                .disabled(busy)
+                                .on_click(move |_, window, cx| close(window, cx)),
+                        )
+                        .children(more)
+                        .into_any_element(),
+                );
+            }
+            PrState::Open => {}
+        }
+
+        let path = self.worktree.clone()?;
+        let options = self.store.read(cx).merge_options_for(&path);
+        let merge_status = pr::merge_status(pr);
+        let auto = pr::auto_merge_action(pr, merge_status, options.as_ref().is_some_and(|o| o.auto_merge_allowed));
         let unpushed = pr::unpushed_for_pr(status, Some(pr));
-        let method = settings::get(cx).pr_merge_method;
-        let block = pr::merge_block(pr, unpushed);
-        let reason = block.map(MergeBlock::reason).map(|key| tr(lang, key));
+        let method = pr::effective_method(options.as_ref(), settings::get(cx).pr_merge_method);
+        let primary = pr::primary(merge_status, auto, unpushed.is_some());
+        let reason: Option<SharedString> = (primary == pr::Primary::Disabled).then(|| {
+            match pr::merge_block(pr, unpushed) {
+                Some(block) => tr(lang, block.reason()).to_owned(),
+                None => pr::merge_status_text(lang, merge_status, &pr.base),
+            }
+            .into()
+        });
         let local_busy = self.active_operation();
+
         let confirm_pr = pr.clone();
         let panel = cx.weak_entity();
+        let merge_button = Button::new("pr-merge")
+            .xsmall()
+            .primary()
+            .flex_1()
+            .disabled(primary == pr::Primary::Disabled || busy)
+            .loading(busy);
+        let merge_button = match primary {
+            pr::Primary::Merge | pr::Primary::Disabled => merge_button
+                .label(tr(lang, pr::method_button_label(method)))
+                .on_click(move |_, window, cx| {
+                    let pr = confirm_pr.clone();
+                    let message = pr::merge_confirm_text(lang, &pr, method);
+                    let _ = panel.update(cx, |panel, cx| {
+                        panel.confirm(
+                            Tr::PrMergeConfirmTitle,
+                            message,
+                            false,
+                            lang,
+                            move |panel, _, cx| {
+                                panel.pr_run_action(PrAction::Merge(pr::forge_method(method)), cx)
+                            },
+                            window,
+                            cx,
+                        )
+                    });
+                }),
+            pr::Primary::AutoMerge(pr::AutoMergeAction::Enable) => merge_button
+                .label(tr(lang, Tr::PrAutoMergeEnable))
+                .on_click(cx.listener(move |panel, _, _, cx| {
+                    panel.pr_run_action(PrAction::EnableAutoMerge(pr::forge_method(method)), cx)
+                })),
+            pr::Primary::AutoMerge(pr::AutoMergeAction::Disable) => merge_button
+                .label(tr(lang, Tr::PrAutoMergeDisable))
+                .on_click(cx.listener(|panel, _, _, cx| panel.pr_run_action(PrAction::DisableAutoMerge, cx))),
+        };
+
+        let offered = pr::offered_methods(options.as_ref());
+        let menu_panel = cx.weak_entity();
         let merge_menu = Button::new("pr-merge-more")
             .xsmall()
             .primary()
             .icon(Icon::new(Ic::ChevronDown))
-            .disabled(state.busy)
+            .disabled(busy)
             .dropdown_menu(move |menu, _, _| {
                 let mut menu = menu;
-                for choice in [PrMergeMethod::Squash, PrMergeMethod::Merge, PrMergeMethod::Rebase] {
+                if let Some(action) = auto {
+                    let (label, act) = match action {
+                        pr::AutoMergeAction::Enable => {
+                            (Tr::PrAutoMergeEnable, PrAction::EnableAutoMerge(pr::forge_method(method)))
+                        }
+                        pr::AutoMergeAction::Disable => (Tr::PrAutoMergeDisable, PrAction::DisableAutoMerge),
+                    };
+                    let panel = menu_panel.clone();
+                    menu = menu
+                        .item(PopupMenuItem::new(tr(lang, label)).on_click(move |_, _, cx| {
+                            let act = act.clone();
+                            let _ = panel.update(cx, |panel, cx| panel.pr_run_action(act, cx));
+                        }))
+                        .separator();
+                }
+                for choice in offered.iter().copied() {
                     menu = menu.item(
-                        PopupMenuItem::new(tr(lang, pr::method_label(choice)))
+                        PopupMenuItem::new(tr(lang, pr::method_button_label(choice)))
                             .checked(choice == method)
                             .on_click(move |_, _, cx| settings::set_pr_merge_method(choice, cx)),
                     );
                 }
-                menu
+                let close = close.clone();
+                menu.separator().item(
+                    PopupMenuItem::new(tr(lang, Tr::PrClose)).on_click(move |_, window, cx| close(window, cx)),
+                )
             });
-        let merge = Button::new("pr-merge")
-            .xsmall()
-            .primary()
-            .flex_1()
-            .label(tr(lang, pr::method_label(method)))
-            .disabled(block.is_some() || state.busy)
-            .loading(state.busy)
-            .on_click(move |_, window, cx| {
-                let pr = confirm_pr.clone();
-                let message = pr::merge_confirm_text(lang, &pr, method);
-                let _ = panel.update(cx, |panel, cx| {
-                    panel.confirm(
-                        Tr::PrMergeConfirmTitle,
-                        message,
-                        false,
-                        lang,
-                        move |panel, _, cx| {
-                            panel.pr_run_action(PrAction::Merge(pr::forge_method(method)), cx)
-                        },
-                        window,
-                        cx,
-                    )
-                });
-            });
-        v_flex()
-            .gap_1()
-            .children(unpushed.map(|unpushed| {
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.))
-                            .text_color(theme.muted_foreground)
-                            .child(pr::unpushed_text(lang, unpushed)),
-                    )
-                    .child(
-                        Button::new("pr-push")
-                            .xsmall()
-                            .label(tr(lang, Tr::PrPushButton))
-                            .loading(local_busy == Some(Operation::Push))
-                            .disabled(local_busy.is_some())
-                            .on_click(cx.listener(|panel, _, window, cx| {
-                                panel.mutate(Mutation::Push, window, cx)
-                            })),
-                    )
-            }))
-            .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(
-                        h_flex()
-                            .id("pr-merge-wrap")
-                            .flex_1()
-                            .min_w_0()
-                            .gap_px()
-                            .child(merge)
-                            .child(merge_menu)
-                            .when_some(reason, |row, reason| {
-                                row.tooltip(move |window, cx| Tooltip::new(reason).build(window, cx))
-                            }),
-                    )
-                    .child(more),
-            )
-            .into_any_element()
+
+        Some(
+            v_flex()
+                .gap_1()
+                .children(unpushed.map(|unpushed| {
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(theme.muted_foreground)
+                                .child(pr::unpushed_text(lang, unpushed)),
+                        )
+                        .child(
+                            Button::new("pr-push")
+                                .xsmall()
+                                .label(tr(lang, Tr::PrPushButton))
+                                .loading(local_busy == Some(Operation::Push))
+                                .disabled(local_busy.is_some())
+                                .on_click(cx.listener(|panel, _, window, cx| {
+                                    panel.mutate(Mutation::Push, window, cx)
+                                })),
+                        )
+                }))
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            h_flex()
+                                .id("pr-merge-wrap")
+                                .flex_1()
+                                .min_w_0()
+                                .gap_px()
+                                .child(merge_button)
+                                .child(merge_menu)
+                                .when_some(reason, |row, reason| {
+                                    row.tooltip(move |window, cx| Tooltip::new(reason.clone()).build(window, cx))
+                                }),
+                        )
+                        .children(more),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Copy link, ready/draft, close and reopen.

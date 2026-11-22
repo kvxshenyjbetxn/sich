@@ -2,8 +2,11 @@
 //!
 //! Sich never reads gh credentials or tokens: every call is a plain `gh` invocation.
 mod agent_prompt;
+mod checks;
+mod conflicts;
 mod gh;
 mod github;
+mod merge;
 mod model;
 mod prefill;
 mod remote;
@@ -15,10 +18,17 @@ pub use agent_prompt::{
     KEEP_REPORTS, LOG_TAIL_BYTES, LOG_TAIL_LINES, agent_prompt, agent_prompt_line, log_tail, prune_reports,
     write_report,
 };
+pub use checks::{
+    Annotation, CheckDetails, CheckOutput, CheckRow, ChecksRollup, DETAIL_LOG_BYTES, DETAIL_LOG_LINES,
+    JobDetail, JobStep, RerunCall, RerunScope, RowCounts, RowState, count_rows, format_age, format_duration,
+    parse_rfc3339, plan_rerun, poll_interval as checks_poll_interval, row_age, row_duration, sort_by_severity,
+};
+pub use conflicts::ConflictSummary;
 pub use gh::{GhCli, GhExec, GhOutput};
 pub use github::{CreatePr, CreatedPr, GitHub, HeadRef, MergeMethod};
+pub use merge::{ALREADY_MERGEABLE, MergeOptions};
 pub use model::{
-    Check, CheckState, ChecksSummary, FailedJob, MergeState, Mergeable, PrState, PullRequest, ReviewDecision,
+    AutoMerge, Check, CheckState, ChecksSummary, FailedJob, MergeState, Mergeable, PrState, PullRequest, ReviewDecision,
     parse_pr_json,
 };
 pub use prefill::{PrDraft, pr_prefill};

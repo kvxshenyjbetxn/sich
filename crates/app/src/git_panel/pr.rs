@@ -6,7 +6,9 @@
 //! separate functions so they are unit-tested.
 
 use gpui_kit::App;
-use sich_git::forge::{CheckState, MergeMethod, MergeState, Mergeable, PrState, PullRequest, ReviewDecision};
+use sich_git::forge::{
+    CheckState, MergeMethod, MergeOptions, MergeState, Mergeable, PrState, PullRequest, ReviewDecision,
+};
 
 use super::*;
 use crate::i18n::Tr;
@@ -293,6 +295,194 @@ pub(super) fn remote_base_names<'a>(
 /// A prefilled field is overwritten only while the user has not edited it.
 pub(super) fn should_overwrite(current: &str, last_prefill: &str) -> bool {
     current == last_prefill || current.trim().is_empty()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Merge status, merge button and auto-merge
+// ---------------------------------------------------------------------------------------------
+
+/// The one-line answer to "can this PR be merged?", by priority (first match wins).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MergeStatus {
+    Merged,
+    Closed,
+    Draft,
+    ReviewRequired,
+    ChangesRequested,
+    Conflicts,
+    AutoMergeOn,
+    Behind,
+    Blocked,
+    ChecksFailed,
+    ChecksPending,
+    Able,
+    Checking,
+}
+
+pub(super) fn merge_status(pr: &PullRequest) -> MergeStatus {
+    match pr.state {
+        PrState::Merged => return MergeStatus::Merged,
+        PrState::Closed => return MergeStatus::Closed,
+        PrState::Draft => return MergeStatus::Draft,
+        PrState::Open => {}
+    }
+    if pr.review == Some(ReviewDecision::ReviewRequired) {
+        return MergeStatus::ReviewRequired;
+    }
+    if pr.review == Some(ReviewDecision::ChangesRequested) {
+        return MergeStatus::ChangesRequested;
+    }
+    if pr.mergeable == Mergeable::Conflicting || pr.merge_state == MergeState::Dirty {
+        return MergeStatus::Conflicts;
+    }
+    if pr.auto_merge.is_some() {
+        return MergeStatus::AutoMergeOn;
+    }
+    match pr.merge_state {
+        MergeState::Behind => return MergeStatus::Behind,
+        MergeState::Blocked => return MergeStatus::Blocked,
+        _ => {}
+    }
+    let mergeable = pr.mergeable == Mergeable::Mergeable
+        || matches!(pr.merge_state, MergeState::Clean | MergeState::Unstable | MergeState::HasHooks);
+    if !mergeable {
+        return MergeStatus::Checking;
+    }
+    let summary = pr.summary();
+    if summary.failed > 0 {
+        MergeStatus::ChecksFailed
+    } else if summary.pending > 0 {
+        MergeStatus::ChecksPending
+    } else {
+        MergeStatus::Able
+    }
+}
+
+pub(super) fn merge_status_tone(status: MergeStatus) -> Tone {
+    match status {
+        MergeStatus::Merged => Tone::Merged,
+        MergeStatus::Closed
+        | MergeStatus::Draft
+        | MergeStatus::Blocked
+        | MergeStatus::Checking
+        | MergeStatus::ReviewRequired
+        | MergeStatus::AutoMergeOn => Tone::Muted,
+        MergeStatus::ChangesRequested | MergeStatus::Conflicts | MergeStatus::ChecksFailed => Tone::Danger,
+        MergeStatus::Behind | MergeStatus::ChecksPending => Tone::Warning,
+        MergeStatus::Able => Tone::Success,
+    }
+}
+
+pub(super) fn merge_status_text(lang: Language, status: MergeStatus, base: &str) -> String {
+    let key = match status {
+        MergeStatus::Merged => Tr::PrStateMerged,
+        MergeStatus::Closed => Tr::PrStateClosed,
+        MergeStatus::Draft => Tr::PrStateDraft,
+        MergeStatus::ReviewRequired => Tr::PrReviewRequired,
+        MergeStatus::ChangesRequested => Tr::PrReviewChanges,
+        MergeStatus::Conflicts => Tr::PrMergeConflicts,
+        MergeStatus::AutoMergeOn => Tr::PrStatusAutoMergeOn,
+        MergeStatus::Behind => Tr::PrMergeBehind,
+        MergeStatus::Blocked => Tr::PrMergeBlocked,
+        MergeStatus::ChecksFailed => Tr::PrStatusChecksFailed,
+        MergeStatus::ChecksPending => Tr::PrStatusChecksPending,
+        MergeStatus::Able => Tr::PrStatusAble,
+        MergeStatus::Checking => Tr::PrStatusChecking,
+    };
+    tr(lang, key).replace("{base}", base)
+}
+
+/// Direct merge is possible only when GitHub considers the PR mergeable (the last group).
+pub(super) fn direct_merge_allowed(status: MergeStatus) -> bool {
+    matches!(status, MergeStatus::Able | MergeStatus::ChecksFailed | MergeStatus::ChecksPending)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AutoMergeAction {
+    Enable,
+    Disable,
+}
+
+/// The auto-merge control, shown for an open PR that is not conflicting when auto-merge is on, or
+/// the repository allows it and merging is blocked for now (review, branch behind, checks...).
+pub(super) fn auto_merge_action(pr: &PullRequest, status: MergeStatus, auto_allowed: bool) -> Option<AutoMergeAction> {
+    if pr.state != PrState::Open || status == MergeStatus::Conflicts {
+        return None;
+    }
+    if pr.auto_merge.is_some() {
+        return Some(AutoMergeAction::Disable);
+    }
+    let blocked = matches!(
+        status,
+        MergeStatus::ReviewRequired
+            | MergeStatus::ChangesRequested
+            | MergeStatus::Blocked
+            | MergeStatus::Behind
+            | MergeStatus::ChecksPending
+    );
+    (auto_allowed && blocked).then_some(AutoMergeAction::Enable)
+}
+
+/// What the primary button of the merge area does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Primary {
+    Merge,
+    AutoMerge(AutoMergeAction),
+    Disabled,
+}
+
+pub(super) fn primary(status: MergeStatus, auto: Option<AutoMergeAction>, unpushed: bool) -> Primary {
+    if direct_merge_allowed(status) && !unpushed {
+        Primary::Merge
+    } else if let Some(action) = auto {
+        Primary::AutoMerge(action)
+    } else {
+        Primary::Disabled
+    }
+}
+
+pub(super) fn settings_method(method: MergeMethod) -> PrMergeMethod {
+    match method {
+        MergeMethod::Squash => PrMergeMethod::Squash,
+        MergeMethod::Merge => PrMergeMethod::Merge,
+        MergeMethod::Rebase => PrMergeMethod::Rebase,
+    }
+}
+
+/// The method the button uses: the saved choice when the repository allows it, else its default.
+/// Without merge options (not loaded yet) the saved choice stands.
+pub(super) fn effective_method(options: Option<&MergeOptions>, chosen: PrMergeMethod) -> PrMergeMethod {
+    match options {
+        Some(options) => options.pick(forge_method(chosen)).map_or(chosen, settings_method),
+        None => chosen,
+    }
+}
+
+/// The methods offered in the dropdown: the allowed ones, or all three while unknown.
+pub(super) fn offered_methods(options: Option<&MergeOptions>) -> Vec<PrMergeMethod> {
+    match options {
+        Some(options) if !options.allowed.is_empty() => options.allowed.iter().copied().map(settings_method).collect(),
+        _ => vec![PrMergeMethod::Squash, PrMergeMethod::Merge, PrMergeMethod::Rebase],
+    }
+}
+
+/// Label of a merge method on the button and in the dropdown.
+pub(super) fn method_button_label(method: PrMergeMethod) -> Tr {
+    match method {
+        PrMergeMethod::Squash => Tr::PrMergeSquash,
+        PrMergeMethod::Merge => Tr::PrMergeCommit,
+        PrMergeMethod::Rebase => Tr::PrMergeRebase,
+    }
+}
+
+/// "2026-11-22 12:00" of an RFC 3339 timestamp in the display timezone.
+pub(super) fn format_updated<Tz: chrono::TimeZone>(updated_at: &str, timezone: &Tz) -> Option<String>
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let secs = sich_git::forge::parse_rfc3339(updated_at)?;
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|date| date.with_timezone(timezone).format("%Y-%m-%d %H:%M").to_string())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -703,5 +893,169 @@ mod tests {
         assert!(!should_overwrite("My own title", "Title from commits"));
         assert!(should_overwrite("  \n", "Title from commits"), "a cleared field may be refilled");
         assert!(!should_overwrite("typed", ""));
+    }
+
+    fn open_pr(review: Option<ReviewDecision>, mergeable: Mergeable, state: MergeState) -> PullRequest {
+        let mut p = pr(PrState::Open);
+        p.review = review;
+        p.mergeable = mergeable;
+        p.merge_state = state;
+        p
+    }
+
+    #[test]
+    fn merge_status_priority_table() {
+        use MergeState as S;
+        use Mergeable as M;
+        use ReviewDecision as R;
+        let cases = [
+            (open_pr(Some(R::ReviewRequired), M::Conflicting, S::Dirty), MergeStatus::ReviewRequired),
+            (open_pr(Some(R::ChangesRequested), M::Conflicting, S::Dirty), MergeStatus::ChangesRequested),
+            (open_pr(Some(R::Approved), M::Conflicting, S::Blocked), MergeStatus::Conflicts),
+            (open_pr(None, M::Unknown, S::Dirty), MergeStatus::Conflicts),
+            (open_pr(None, M::Mergeable, S::Behind), MergeStatus::Behind),
+            (open_pr(None, M::Mergeable, S::Blocked), MergeStatus::Blocked),
+            (open_pr(None, M::Mergeable, S::Clean), MergeStatus::Able),
+            (open_pr(None, M::Unknown, S::Clean), MergeStatus::Able),
+            (open_pr(None, M::Unknown, S::HasHooks), MergeStatus::Able),
+            (open_pr(Some(R::Approved), M::Mergeable, S::Unknown), MergeStatus::Able),
+            (open_pr(None, M::Unknown, S::Unknown), MergeStatus::Checking),
+            (open_pr(None, M::Unknown, S::Draft), MergeStatus::Checking),
+        ];
+        for (p, expected) in cases {
+            assert_eq!(merge_status(&p), expected, "{:?} {:?} {:?}", p.review, p.mergeable, p.merge_state);
+        }
+    }
+
+    #[test]
+    fn merge_status_state_auto_merge_and_checks() {
+        for (state, expected) in [
+            (PrState::Merged, MergeStatus::Merged),
+            (PrState::Closed, MergeStatus::Closed),
+            (PrState::Draft, MergeStatus::Draft),
+        ] {
+            let mut p = open_pr(Some(ReviewDecision::ReviewRequired), Mergeable::Conflicting, MergeState::Dirty);
+            p.state = state;
+            assert_eq!(merge_status(&p), expected, "{state:?} beats everything");
+        }
+        let mut p = open_pr(None, Mergeable::Mergeable, MergeState::Blocked);
+        p.auto_merge = Some(sich_git::forge::AutoMerge::default());
+        assert_eq!(merge_status(&p), MergeStatus::AutoMergeOn, "auto-merge beats blocked");
+        p.mergeable = Mergeable::Conflicting;
+        assert_eq!(merge_status(&p), MergeStatus::Conflicts, "conflicts beat auto-merge");
+        p.mergeable = Mergeable::Mergeable;
+        p.review = Some(ReviewDecision::ReviewRequired);
+        assert_eq!(merge_status(&p), MergeStatus::ReviewRequired, "review beats auto-merge");
+
+        let mut checks = open_pr(None, Mergeable::Mergeable, MergeState::Clean);
+        checks.checks = vec![check(CheckState::Success), check(CheckState::Pending)];
+        assert_eq!(merge_status(&checks), MergeStatus::ChecksPending);
+        checks.checks.push(check(CheckState::Failure));
+        assert_eq!(merge_status(&checks), MergeStatus::ChecksFailed, "failure beats pending");
+        checks.checks = vec![check(CheckState::Skipped)];
+        assert_eq!(merge_status(&checks), MergeStatus::Able);
+        checks.checks.clear();
+        assert_eq!(merge_status(&checks), MergeStatus::Able);
+        let unstable = open_pr(None, Mergeable::Unknown, MergeState::Unstable);
+        assert_eq!(merge_status(&unstable), MergeStatus::Able, "no check data: nothing failing");
+    }
+
+    #[test]
+    fn direct_merge_only_in_the_mergeable_group() {
+        use MergeStatus::*;
+        for status in [Merged, Closed, Draft, ReviewRequired, ChangesRequested, Conflicts, AutoMergeOn, Behind, Blocked, Checking] {
+            assert!(!direct_merge_allowed(status), "{status:?}");
+        }
+        for status in [Able, ChecksFailed, ChecksPending] {
+            assert!(direct_merge_allowed(status), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn auto_merge_control_visibility_rule() {
+        use MergeStatus::*;
+        let open = pr(PrState::Open);
+        for status in [ReviewRequired, ChangesRequested, Blocked, Behind, ChecksPending] {
+            assert_eq!(auto_merge_action(&open, status, true), Some(AutoMergeAction::Enable), "{status:?}");
+            assert_eq!(auto_merge_action(&open, status, false), None, "{status:?} needs the repo setting");
+        }
+        for status in [Able, ChecksFailed, Checking, Conflicts] {
+            assert_eq!(auto_merge_action(&open, status, true), None, "{status:?}");
+        }
+        let mut on = pr(PrState::Open);
+        on.auto_merge = Some(sich_git::forge::AutoMerge::default());
+        assert_eq!(auto_merge_action(&on, AutoMergeOn, false), Some(AutoMergeAction::Disable));
+        assert_eq!(auto_merge_action(&on, Able, false), Some(AutoMergeAction::Disable));
+        assert_eq!(auto_merge_action(&on, Conflicts, true), None, "never while conflicting");
+        for state in [PrState::Draft, PrState::Closed, PrState::Merged] {
+            let p = pr(state);
+            assert_eq!(auto_merge_action(&p, Blocked, true), None, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn primary_button_choice() {
+        use AutoMergeAction::*;
+        use MergeStatus::*;
+        assert_eq!(primary(Able, None, false), Primary::Merge);
+        assert_eq!(primary(ChecksPending, Some(Enable), false), Primary::Merge, "direct wins when allowed");
+        assert_eq!(primary(Able, None, true), Primary::Disabled, "unpushed commits block the merge");
+        assert_eq!(primary(Blocked, Some(Enable), false), Primary::AutoMerge(Enable));
+        assert_eq!(primary(AutoMergeOn, Some(Disable), false), Primary::AutoMerge(Disable));
+        assert_eq!(primary(Conflicts, None, false), Primary::Disabled);
+        assert_eq!(primary(Checking, None, false), Primary::Disabled);
+    }
+
+    #[test]
+    fn merge_method_resolution_and_offer() {
+        let options = MergeOptions {
+            allowed: vec![MergeMethod::Merge, MergeMethod::Rebase],
+            default: Some(MergeMethod::Rebase),
+            auto_merge_allowed: true,
+        };
+        assert_eq!(effective_method(Some(&options), PrMergeMethod::Merge), PrMergeMethod::Merge);
+        assert_eq!(effective_method(Some(&options), PrMergeMethod::Squash), PrMergeMethod::Rebase);
+        assert_eq!(effective_method(None, PrMergeMethod::Squash), PrMergeMethod::Squash);
+        assert_eq!(offered_methods(Some(&options)), vec![PrMergeMethod::Merge, PrMergeMethod::Rebase]);
+        assert_eq!(offered_methods(None).len(), 3);
+        let none = MergeOptions { allowed: vec![], default: None, auto_merge_allowed: false };
+        assert_eq!(offered_methods(Some(&none)).len(), 3, "an empty answer does not hide the button");
+        assert_eq!(effective_method(Some(&none), PrMergeMethod::Rebase), PrMergeMethod::Rebase);
+    }
+
+    #[test]
+    fn status_and_button_texts_exist_in_every_language() {
+        use MergeStatus::*;
+        for lang in Language::ALL {
+            for status in [
+                Merged, Closed, Draft, ReviewRequired, ChangesRequested, Conflicts, AutoMergeOn, Behind, Blocked,
+                ChecksFailed, ChecksPending, Able, Checking,
+            ] {
+                let text = merge_status_text(lang, status, "dev");
+                assert!(!text.is_empty() && !text.contains('{'), "{lang:?} {status:?}");
+            }
+            for method in [PrMergeMethod::Squash, PrMergeMethod::Merge, PrMergeMethod::Rebase] {
+                assert!(!tr(lang, method_button_label(method)).is_empty());
+            }
+        }
+        assert_eq!(merge_status_text(Language::En, ReviewRequired, "main"), "Review required");
+        assert_eq!(merge_status_text(Language::En, AutoMergeOn, "main"), "Auto-merge on");
+        assert_eq!(merge_status_text(Language::En, Able, "main"), "Able to merge");
+        assert_eq!(merge_status_text(Language::En, ChecksFailed, "main"), "Checks failed");
+        assert_eq!(merge_status_text(Language::En, ChecksPending, "main"), "Checks pending");
+        assert_eq!(merge_status_text(Language::En, Checking, "main"), "Checking");
+        assert_eq!(merge_status_text(Language::En, Behind, "main"), "Behind main");
+        assert_eq!(tr(Language::En, method_button_label(PrMergeMethod::Merge)), "Create a merge commit");
+        let tones: Vec<Tone> = [Merged, Conflicts, Able, Behind, Draft].map(merge_status_tone).to_vec();
+        assert_eq!(tones, [Tone::Merged, Tone::Danger, Tone::Success, Tone::Warning, Tone::Muted]);
+    }
+
+    #[test]
+    fn updated_line_uses_the_display_timezone() {
+        let plus_two = chrono::FixedOffset::east_opt(2 * 3600).unwrap();
+        assert_eq!(format_updated("2026-11-22T10:00:00Z", &plus_two).as_deref(), Some("2026-11-22 12:00"));
+        assert_eq!(format_updated("2026-11-22T23:30:00Z", &plus_two).as_deref(), Some("2026-11-23 01:30"));
+        assert_eq!(format_updated("", &plus_two), None);
+        assert_eq!(format_updated("garbage", &plus_two), None);
     }
 }

@@ -369,6 +369,39 @@ pub enum Tr {
     // ---- end comments ----
 
     // ---- checks keys: append below ----
+    PrUpdated,
+    PrMergeCommit,
+    PrAutoMergeEnable,
+    PrAutoMergeDisable,
+    PrStatusAutoMergeOn,
+    PrStatusChecksFailed,
+    PrStatusChecksPending,
+    PrStatusAble,
+    PrStatusChecking,
+    PrReadyForReview,
+    PrCloseShort,
+    PrCheckPassing,
+    PrCheckFailing,
+    PrCheckPendingN,
+    PrCheckSkipped,
+    PrChecksNone,
+    PrRerunAll,
+    PrCheckStarted,
+    PrCheckFinished,
+    PrCheckApproval,
+    PrCheckFailedJobs,
+    PrCheckFailedSteps,
+    PrCheckOutput,
+    PrCheckAnnotations,
+    PrCheckNoDetails,
+    PrCheckLoading,
+    PrCheckCopyLog,
+    PrCheckNoLog,
+    PrConflictsTitle,
+    PrConflictsBehind,
+    PrConflictsBehindOne,
+    PrConflictsNotReproduced,
+    PrConflictsSend,
     // ---- end checks ----
 
     // ---- details keys: append below ----
@@ -705,6 +738,39 @@ impl Tr {
         // ---- end comments ----
 
         // ---- checks keys: append below ----
+        Tr::PrUpdated,
+        Tr::PrMergeCommit,
+        Tr::PrAutoMergeEnable,
+        Tr::PrAutoMergeDisable,
+        Tr::PrStatusAutoMergeOn,
+        Tr::PrStatusChecksFailed,
+        Tr::PrStatusChecksPending,
+        Tr::PrStatusAble,
+        Tr::PrStatusChecking,
+        Tr::PrReadyForReview,
+        Tr::PrCloseShort,
+        Tr::PrCheckPassing,
+        Tr::PrCheckFailing,
+        Tr::PrCheckPendingN,
+        Tr::PrCheckSkipped,
+        Tr::PrChecksNone,
+        Tr::PrRerunAll,
+        Tr::PrCheckStarted,
+        Tr::PrCheckFinished,
+        Tr::PrCheckApproval,
+        Tr::PrCheckFailedJobs,
+        Tr::PrCheckFailedSteps,
+        Tr::PrCheckOutput,
+        Tr::PrCheckAnnotations,
+        Tr::PrCheckNoDetails,
+        Tr::PrCheckLoading,
+        Tr::PrCheckCopyLog,
+        Tr::PrCheckNoLog,
+        Tr::PrConflictsTitle,
+        Tr::PrConflictsBehind,
+        Tr::PrConflictsBehindOne,
+        Tr::PrConflictsNotReproduced,
+        Tr::PrConflictsSend,
         // ---- end checks ----
 
         // ---- details keys: append below ----
@@ -2328,6 +2394,171 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
         // ---- end comments ----
 
         // ---- checks keys: append below ----
+        Tr::PrUpdated => match lang {
+            Uk => "Оновлено {t}",
+            Ru => "Обновлено {t}",
+            En => "Updated {t}",
+        },
+        Tr::PrMergeCommit => match lang {
+            Uk => "Створити merge-коміт",
+            Ru => "Создать merge-коммит",
+            En => "Create a merge commit",
+        },
+        Tr::PrAutoMergeEnable => match lang {
+            Uk => "Увімкнути авто-злиття",
+            Ru => "Включить авто-слияние",
+            En => "Enable auto-merge",
+        },
+        Tr::PrAutoMergeDisable => match lang {
+            Uk => "Вимкнути авто-злиття",
+            Ru => "Выключить авто-слияние",
+            En => "Disable auto-merge",
+        },
+        Tr::PrStatusAutoMergeOn => match lang {
+            Uk => "Авто-злиття увімкнено",
+            Ru => "Авто-слияние включено",
+            En => "Auto-merge on",
+        },
+        Tr::PrStatusChecksFailed => match lang {
+            Uk => "Перевірки не пройдені",
+            Ru => "Проверки не пройдены",
+            En => "Checks failed",
+        },
+        Tr::PrStatusChecksPending => match lang {
+            Uk => "Перевірки тривають",
+            Ru => "Проверки идут",
+            En => "Checks pending",
+        },
+        Tr::PrStatusAble => match lang {
+            Uk => "Можна зливати",
+            Ru => "Можно сливать",
+            En => "Able to merge",
+        },
+        Tr::PrStatusChecking => match lang {
+            Uk => "Перевіряємо",
+            Ru => "Проверяем",
+            En => "Checking",
+        },
+        Tr::PrReadyForReview => match lang {
+            Uk => "Готово до рев'ю",
+            Ru => "Готово к ревью",
+            En => "Ready for review",
+        },
+        Tr::PrCloseShort => match lang {
+            Uk => "Закрити",
+            Ru => "Закрыть",
+            En => "Close",
+        },
+        Tr::PrCheckPassing => match lang {
+            Uk => "{n} успішних",
+            Ru => "{n} успешных",
+            En => "{n} passing",
+        },
+        Tr::PrCheckFailing => match lang {
+            Uk => "{n} невдалих",
+            Ru => "{n} упавших",
+            En => "{n} failing",
+        },
+        Tr::PrCheckPendingN => match lang {
+            Uk => "{n} у процесі",
+            Ru => "{n} в процессе",
+            En => "{n} pending",
+        },
+        Tr::PrCheckSkipped => match lang {
+            Uk => "{n} пропущених",
+            Ru => "{n} пропущено",
+            En => "{n} skipped",
+        },
+        Tr::PrChecksNone => match lang {
+            Uk => "Перевірок немає",
+            Ru => "Проверок нет",
+            En => "No checks",
+        },
+        Tr::PrRerunAll => match lang {
+            Uk => "Перезапустити всі",
+            Ru => "Перезапустить все",
+            En => "Rerun all",
+        },
+        Tr::PrCheckStarted => match lang {
+            Uk => "Розпочато",
+            Ru => "Начато",
+            En => "Started",
+        },
+        Tr::PrCheckFinished => match lang {
+            Uk => "Завершено",
+            Ru => "Завершено",
+            En => "Finished",
+        },
+        Tr::PrCheckApproval => match lang {
+            Uk => "очікує схвалення",
+            Ru => "ожидает одобрения",
+            En => "waiting for approval",
+        },
+        Tr::PrCheckFailedJobs => match lang {
+            Uk => "Невдалі завдання",
+            Ru => "Упавшие задачи",
+            En => "Failed jobs",
+        },
+        Tr::PrCheckFailedSteps => match lang {
+            Uk => "Невдалі кроки",
+            Ru => "Упавшие шаги",
+            En => "Failed steps",
+        },
+        Tr::PrCheckOutput => match lang {
+            Uk => "Вивід",
+            Ru => "Вывод",
+            En => "Output",
+        },
+        Tr::PrCheckAnnotations => match lang {
+            Uk => "Анотації",
+            Ru => "Аннотации",
+            En => "Annotations",
+        },
+        Tr::PrCheckNoDetails => match lang {
+            Uk => "Для цієї перевірки немає вбудованих деталей.",
+            Ru => "Для этой проверки нет встроенных деталей.",
+            En => "No inline details are available for this check.",
+        },
+        Tr::PrCheckLoading => match lang {
+            Uk => "Завантаження деталей…",
+            Ru => "Загрузка деталей…",
+            En => "Loading details…",
+        },
+        Tr::PrCheckCopyLog => match lang {
+            Uk => "Копіювати лог",
+            Ru => "Копировать лог",
+            En => "Copy log",
+        },
+        Tr::PrCheckNoLog => match lang {
+            Uk => "Лог недоступний",
+            Ru => "Лог недоступен",
+            En => "Log not available",
+        },
+        Tr::PrConflictsTitle => match lang {
+            Uk => "У цієї гілки є конфлікти, які треба розв'язати",
+            Ru => "У этой ветки есть конфликты, которые нужно разрешить",
+            En => "This branch has conflicts that must be resolved",
+        },
+        Tr::PrConflictsBehind => match lang {
+            Uk => "{n} комітів позаду {base} (базовий коміт {sha})",
+            Ru => "{n} коммитов позади {base} (базовый коммит {sha})",
+            En => "{n} commits behind {base} (base commit {sha})",
+        },
+        Tr::PrConflictsBehindOne => match lang {
+            Uk => "1 коміт позаду {base} (базовий коміт {sha})",
+            Ru => "1 коммит позади {base} (базовый коммит {sha})",
+            En => "1 commit behind {base} (base commit {sha})",
+        },
+        Tr::PrConflictsNotReproduced => match lang {
+            Uk => "GitHub повідомляє про конфлікти, але локальний Git їх не відтворив. Отримайте базову гілку (fetch) і спробуйте ще раз.",
+            Ru => "GitHub сообщает о конфликтах, но локальный Git их не воспроизвёл. Получите базовую ветку (fetch) и попробуйте снова.",
+            En => "GitHub reports conflicts, but local Git did not reproduce them. Fetch the base branch and try again.",
+        },
+        Tr::PrConflictsSend => match lang {
+            Uk => "Надіслати конфлікти агенту",
+            Ru => "Отправить конфликты агенту",
+            En => "Send conflicts to agent",
+        },
         // ---- end checks ----
 
         // ---- details keys: append below ----

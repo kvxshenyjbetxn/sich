@@ -5,9 +5,13 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use sich_git::forge::{ForgeError, GhExec, GitHub, HeadRef, MergeMethod, PullRequest, RemoteRepo};
+use sich_git::forge::{
+    ConflictSummary, ForgeError, GhExec, GitHub, HeadRef, MergeMethod, MergeState, Mergeable, PullRequest,
+    RemoteRepo, RerunCall,
+};
 use sich_git::{Repo, RepoStatus};
 
+use super::checks::ChecksState;
 use super::schedule::FetchState;
 
 /// Where pull requests of a worktree live. The branch is pushed to the push (head) remote, but
@@ -224,6 +228,10 @@ pub(crate) struct PrEntry {
     pub row_branch: Option<String>,
     /// Key from the Git panel's latest status; present only while the panel shows this worktree.
     pub status_key: Option<PrKey>,
+    /// Detailed checks of the PR tab.
+    pub checks: ChecksState,
+    /// Local trial merge, only while GitHub says the PR conflicts.
+    pub conflicts: Option<Result<ConflictSummary, String>>,
 }
 
 impl PrEntry {
@@ -306,6 +314,36 @@ pub(crate) fn resolve_target(repo: &Repo) -> Option<PrTarget> {
 pub(crate) struct Fetched {
     pub view: PrView,
     pub divergence: Option<(u32, u32)>,
+    pub conflicts: Option<Result<ConflictSummary, String>>,
+}
+
+/// GitHub says the (open) PR cannot be merged because of conflicts.
+pub(crate) fn is_conflicting(pr: &PullRequest) -> bool {
+    pr.is_open() && (pr.mergeable == Mergeable::Conflicting || pr.merge_state == MergeState::Dirty)
+}
+
+/// `<remote>/<base>` of the PR's base branch: the target's own ref when the PR targets the default
+/// branch, else the base remote's ref of that branch.
+pub(crate) fn conflict_base_ref(target: &PrTarget, pr_base: &str) -> Option<String> {
+    if pr_base.is_empty() || target.base.as_deref() == Some(pr_base) {
+        return target.base_ref.clone();
+    }
+    target.base_remote.as_ref().map(|remote| format!("{remote}/{pr_base}"))
+}
+
+/// Trial merge of the PR head into its base. The PR's head commit is used when it exists locally,
+/// else the checked-out commit.
+fn conflict_summary(repo: &Repo, target: &PrTarget, pr: &PullRequest) -> Option<Result<ConflictSummary, String>> {
+    if !is_conflicting(pr) {
+        return None;
+    }
+    let base_ref = conflict_base_ref(target, &pr.base)?;
+    let first = (!pr.head_oid.is_empty()).then(|| repo.conflict_summary(&pr.head_oid, &base_ref));
+    let result = match first {
+        Some(Ok(summary)) => Ok(summary),
+        _ => repo.conflict_summary("HEAD", &base_ref),
+    };
+    Some(result.map_err(|error| error.to_string()))
 }
 
 pub(crate) fn divergence(repo: &Repo, target: &PrTarget) -> Option<(u32, u32)> {
@@ -320,7 +358,11 @@ pub(crate) fn fetch_pr(repo: &Repo, target: &PrTarget, branch: &str) -> Fetched 
         let gh = GitHub::new(repo.root().to_path_buf(), target.repo.clone());
         fetch_view(&gh, &target.head_ref(branch))
     };
-    Fetched { view, divergence }
+    let conflicts = match &view {
+        PrView::Pr(pr) => conflict_summary(repo, target, pr),
+        _ => None,
+    };
+    Fetched { view, divergence, conflicts }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -329,7 +371,9 @@ pub(crate) enum PrAction {
     Ready(bool),
     Close,
     Reopen,
-    Rerun(Vec<u64>),
+    Rerun(Vec<RerunCall>),
+    EnableAutoMerge(MergeMethod),
+    DisableAutoMerge,
 }
 
 pub(crate) fn run_action(
@@ -349,7 +393,9 @@ pub(crate) fn run_action(
         PrAction::Ready(ready) => gh.set_ready(pr.number, ready),
         PrAction::Close => gh.close_pr(pr.number),
         PrAction::Reopen => gh.reopen_pr(pr.number),
-        PrAction::Rerun(ids) => gh.rerun_failed(&ids),
+        PrAction::Rerun(calls) => gh.rerun(&calls),
+        PrAction::EnableAutoMerge(method) => gh.enable_auto_merge(&pr.node_id, method, &pr.head_oid),
+        PrAction::DisableAutoMerge => gh.disable_auto_merge(pr.number),
     }
 }
 
@@ -602,5 +648,40 @@ mod tests {
         assert_eq!(state.target.as_ref().unwrap().base_ref.as_deref(), Some("origin/main"));
         let state = state_with(PrView::NoPr, None);
         assert_eq!(state.target.as_ref().unwrap().base_ref, None);
+    }
+
+    #[test]
+    fn conflicting_means_an_open_pr_github_cannot_merge() {
+        let mut p = pr(PrState::Open);
+        assert!(!is_conflicting(&p));
+        p.mergeable = Mergeable::Conflicting;
+        assert!(is_conflicting(&p));
+        p.mergeable = Mergeable::Unknown;
+        p.merge_state = MergeState::Dirty;
+        assert!(is_conflicting(&p));
+        let mut closed = pr(PrState::Closed);
+        closed.mergeable = Mergeable::Conflicting;
+        assert!(!is_conflicting(&closed));
+        let mut draft = pr(PrState::Draft);
+        draft.merge_state = MergeState::Dirty;
+        assert!(is_conflicting(&draft));
+    }
+
+    #[test]
+    fn conflict_base_ref_follows_the_prs_base_branch() {
+        let mut t = target(Some("main"));
+        assert_eq!(conflict_base_ref(&t, "main").as_deref(), Some("origin/main"));
+        assert_eq!(conflict_base_ref(&t, "").as_deref(), Some("origin/main"));
+        assert_eq!(conflict_base_ref(&t, "release").as_deref(), Some("origin/release"));
+        t.base_remote = None;
+        assert_eq!(conflict_base_ref(&t, "release"), None);
+        t.base_remote = Some("upstream".into());
+        assert_eq!(conflict_base_ref(&t, "dev").as_deref(), Some("upstream/dev"));
+    }
+
+    #[test]
+    fn rerun_and_auto_merge_actions_compare() {
+        assert_eq!(PrAction::Rerun(vec![RerunCall::Run(1)]), PrAction::Rerun(vec![RerunCall::Run(1)]));
+        assert_ne!(PrAction::EnableAutoMerge(MergeMethod::Squash), PrAction::DisableAutoMerge);
     }
 }

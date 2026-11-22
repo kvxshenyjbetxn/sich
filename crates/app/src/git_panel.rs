@@ -4,6 +4,7 @@ mod branch_picker;
 mod ops_menu;
 mod pr;
 mod pr_card;
+mod pr_checks;
 mod pr_comments;
 mod pr_details;
 mod pr_files;
@@ -434,6 +435,9 @@ impl GitPanel {
     pub(crate) fn set_pane(&mut self, pane: RightTab, cx: &mut Context<Self>) {
         if self.pane != pane {
             self.pane = pane;
+            if pane != RightTab::Pr {
+                self.pr_tab_left(cx);
+            }
             cx.notify();
         }
     }
