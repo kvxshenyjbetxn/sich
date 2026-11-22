@@ -1229,29 +1229,71 @@ impl AppView {
     }
 
     pub(crate) fn restart_legacy_terminal(&mut self, id: TermId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal_restarting(id) {
+        self.restart_terminals(std::iter::once(id), false, window, cx);
+    }
+
+    fn restart_all_legacy_terminals(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let snap = self.client.snapshot();
+        if self.restarting_daemon || !matches!(snap.status, ConnStatus::Connected { .. })
+            || !self.pending_terminal_restarts.is_empty()
+        {
             return;
         }
-        self.next_restore_token += 1;
-        let token = self.next_restore_token;
-        self.pending_terminal_restarts.insert(id, token);
+        self.restart_terminals(
+            legacy_restart_ids(snap.terminals.iter().map(|entry| (entry.info.id, entry.legacy))),
+            true, window, cx,
+        );
+    }
+
+    fn restart_terminals(
+        &mut self,
+        ids: impl IntoIterator<Item = TermId>,
+        batch: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut targets = Vec::new();
+        for id in ids {
+            if self.terminal_restarting(id) {
+                continue;
+            }
+            self.next_restore_token += 1;
+            let token = self.next_restore_token;
+            self.pending_terminal_restarts.insert(id, token);
+            targets.push((id, token));
+        }
+        if targets.is_empty() {
+            return;
+        }
         let client = self.client.clone();
+        let rt = self.activity_rt.clone();
         let lang = settings::language(cx);
         let resume = settings::get(cx).resume_agents_on_restore;
-        let job = self.activity_rt.spawn(async move {
-            client.migrate_terminal(id, token, resume, tr(lang, Tr::RestoredScrollback), tr(lang, Tr::AgentInterrupted)).await
-        });
         cx.spawn_in(window, async move |this, cx| {
-            let result = job.await.map_err(anyhow::Error::from).and_then(|result| result);
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.map_restarted_terminals(&this.client.snapshot());
-                this.pending_terminal_restarts.remove(&id);
+            let mut failed = false;
+            for (id, token) in targets {
+                let client = client.clone();
+                let result = rt.spawn(async move {
+                    client.migrate_terminal(id, token, resume, tr(lang, Tr::RestoredScrollback), tr(lang, Tr::AgentInterrupted)).await
+                }).await.map_err(anyhow::Error::from).and_then(|result| result);
                 if let Err(err) = result {
-                    tracing::warn!("could not complete terminal migration: {err:#}");
-                    notifications::show_error(tr(settings::language(cx), Tr::TerminalRestartFailed).into(), window, cx);
+                    failed = true;
+                    tracing::warn!(id, "could not complete terminal migration: {err:#}");
                 }
-                cx.notify();
-            });
+                if this.update_in(cx, |this, _, cx| {
+                    this.map_restarted_terminals(&this.client.snapshot());
+                    this.pending_terminal_restarts.remove(&id);
+                    cx.notify();
+                }).is_err() {
+                    return;
+                }
+            }
+            if failed {
+                let _ = this.update_in(cx, |_, window, cx| {
+                    let key = if batch { Tr::BatchTerminalRestartFailed } else { Tr::TerminalRestartFailed };
+                    notifications::show_error(tr(settings::language(cx), key).into(), window, cx);
+                });
+            }
         }).detach();
         cx.notify();
     }
@@ -1780,16 +1822,24 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
-        let status = status_line(
-            lang,
-            &snap.status,
-            self.restarting_daemon,
-            snap.legacy_terminals.then_some("legacy"),
-            "primary",
-        );
+        let status = status_line(lang, &snap.status, self.restarting_daemon, snap.legacy_terminals);
         let indicator = match status {
-            StatusLine::Dot { tooltip } => {
-                div()
+            StatusLine::Dot { tooltip, show_restart } => {
+                let busy = !self.pending_terminal_restarts.is_empty();
+                let restart = show_restart.then(|| {
+                    let tip = tr(lang, if busy { Tr::TerminalRestarting } else { Tr::RestartAllLegacyTerminals });
+                    let button = h_flex()
+                        .id("restart-all-legacy-terminals")
+                        .size(px(18.)).items_center().justify_center()
+                        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                        .child(Icon::new(Ic::CircleAlert).size(px(12.)).text_color(theme.warning.opacity(if busy { 0.45 } else { 0.9 })));
+                    if busy { button } else {
+                        button.cursor_pointer().on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.restart_all_legacy_terminals(window, cx);
+                        }))
+                    }
+                });
+                let dot = div()
                     .id("daemon-connected")
                     .size(px(16.))
                     .flex_shrink_0()
@@ -1797,10 +1847,10 @@ impl AppView {
                     .items_center()
                     .justify_center()
                     .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
-                    .child(div().size(px(8.)).rounded_full().bg(theme.success))
-                    .into_any_element()
+                    .child(div().size(px(8.)).rounded_full().bg(theme.success));
+                h_flex().items_center().gap_1().child(dot).children(restart).into_any_element()
             }
-            StatusLine::Text { text, .. } => text.into_any_element(),
+            StatusLine::Text(text) => text.into_any_element(),
         };
         h_flex()
             .h(px(24.))
@@ -1840,27 +1890,24 @@ fn record_release(available: &mut Option<updater::Release>, found: Option<update
 
 #[derive(Debug, PartialEq, Eq)]
 enum StatusLine {
-    Dot { tooltip: String },
-    Text { text: String, old_build: bool },
+    Dot { tooltip: String, show_restart: bool },
+    Text(String),
 }
 
 fn status_line(
     lang: i18n::Language,
     status: &ConnStatus,
     restarting: bool,
-    daemon_build: Option<&str>,
-    own_build: &str,
+    legacy_terminals: bool,
 ) -> StatusLine {
-    let old_build = matches!(status, ConnStatus::Connected { .. })
-        && daemon_build.is_some_and(|id| id != own_build);
     let text = if restarting {
         tr(lang, Tr::DaemonRestarting).to_string()
     } else {
         match *status {
-            ConnStatus::Connected { .. } if old_build => tr(lang, Tr::DaemonOlderBuild).to_string(),
             ConnStatus::Connected { pid } => {
                 return StatusLine::Dot {
                     tooltip: i18n::connected(lang, pid),
+                    show_restart: legacy_terminals,
                 };
             }
             ConnStatus::Reconnecting => tr(lang, Tr::Reconnecting).to_string(),
@@ -1869,7 +1916,11 @@ fn status_line(
             }
         }
     };
-    StatusLine::Text { text, old_build }
+    StatusLine::Text(text)
+}
+
+fn legacy_restart_ids(terminals: impl IntoIterator<Item = (TermId, bool)>) -> impl Iterator<Item = TermId> {
+    terminals.into_iter().filter_map(|(id, legacy)| legacy.then_some(id))
 }
 
 /// Blocking release lookup; run it on the background executor.
@@ -2192,50 +2243,27 @@ mod tests {
     }
 
     #[test]
-    fn connected_with_matching_build_shows_dot_with_pid() {
-        assert_eq!(
-            status_line(LANG, &CONNECTED, false, Some("current"), "current"),
-            StatusLine::Dot {
-                tooltip: "Connected to daemon (pid 12345)".into(),
-            },
-        );
-    }
-
-    #[test]
-    fn connected_with_different_build_shows_warning() {
-        assert_eq!(
-            status_line(LANG, &CONNECTED, false, Some("old"), "current"),
-            StatusLine::Text {
-                text: tr(LANG, Tr::DaemonOlderBuild).into(),
-                old_build: true,
-            },
-        );
-    }
-
-    #[test]
-    fn connected_without_build_info_shows_dot() {
-        assert_eq!(
-            status_line(LANG, &CONNECTED, false, None, "current"),
-            StatusLine::Dot {
-                tooltip: i18n::connected(LANG, 12345),
-            },
-        );
-    }
-
-    #[test]
-    fn restarting_takes_precedence_and_preserves_old_build_warning() {
-        for (status, build, old_build) in [
-            (CONNECTED, Some("old"), true),
-            (CONNECTED, Some("current"), false),
-            (ConnStatus::Reconnecting, Some("old"), false),
-            (INCOMPATIBLE, Some("old"), false),
-        ] {
+    fn connected_keeps_the_pid_indicator_and_only_offers_restart_with_legacy_terminals() {
+        for legacy in [false, true] {
             assert_eq!(
-                status_line(LANG, &status, true, build, "current"),
-                StatusLine::Text {
-                    text: tr(LANG, Tr::DaemonRestarting).into(),
-                    old_build,
-                },
+                status_line(LANG, &CONNECTED, false, legacy),
+                StatusLine::Dot { tooltip: "Connected to daemon (pid 12345)".into(), show_restart: legacy },
+            );
+        }
+    }
+
+    #[test]
+    fn batch_restart_selects_only_legacy_terminals_in_snapshot_order() {
+        assert_eq!(legacy_restart_ids([(10, false), (7, true), (2, true), (9, false)]).collect::<Vec<_>>(), [7, 2]);
+        assert_eq!(legacy_restart_ids([(10, false)]).next(), None);
+    }
+
+    #[test]
+    fn restarting_hides_the_batch_restart_action() {
+        for status in [CONNECTED, ConnStatus::Reconnecting, INCOMPATIBLE] {
+            assert_eq!(
+                status_line(LANG, &status, true, true),
+                StatusLine::Text(tr(LANG, Tr::DaemonRestarting).into()),
             );
         }
     }
@@ -2243,11 +2271,8 @@ mod tests {
     #[test]
     fn reconnecting_shows_muted_text() {
         assert_eq!(
-            status_line(LANG, &ConnStatus::Reconnecting, false, Some("old"), "current"),
-            StatusLine::Text {
-                text: tr(LANG, Tr::Reconnecting).into(),
-                old_build: false,
-            },
+            status_line(LANG, &ConnStatus::Reconnecting, false, true),
+            StatusLine::Text(tr(LANG, Tr::Reconnecting).into()),
         );
     }
 
@@ -2256,11 +2281,8 @@ mod tests {
         for version in [None, Some(PROTO_VERSION - 1)] {
             let status = ConnStatus::Incompatible { pid: None, version };
             assert_eq!(
-                status_line(LANG, &status, false, Some("old"), "current"),
-                StatusLine::Text {
-                    text: i18n::daemon_incompatible(LANG, version, PROTO_VERSION),
-                    old_build: false,
-                },
+                status_line(LANG, &status, false, true),
+                StatusLine::Text(i18n::daemon_incompatible(LANG, version, PROTO_VERSION)),
             );
         }
     }
