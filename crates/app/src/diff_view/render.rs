@@ -475,7 +475,7 @@ fn column_labels(source: &CompareSource) -> (Tr, Tr) {
     match source {
         CompareSource::Working => (Tr::DiffIndex, Tr::DiffWorking),
         CompareSource::Staged => (Tr::DiffHead, Tr::DiffIndex),
-        CompareSource::Commit(_) => (Tr::DiffBefore, Tr::DiffAfter),
+        CompareSource::Commit(_) | CompareSource::Range { .. } => (Tr::DiffBefore, Tr::DiffAfter),
         CompareSource::Conflict => (Tr::DiffOurs, Tr::DiffTheirs),
     }
 }

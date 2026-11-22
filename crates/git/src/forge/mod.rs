@@ -3,6 +3,8 @@
 //! Sich never reads gh credentials or tokens: every call is a plain `gh` invocation.
 mod agent_prompt;
 mod comments;
+mod details;
+mod files;
 mod gh;
 mod github;
 mod model;
@@ -21,6 +23,8 @@ pub use comments::{
     ReactionKind, ReviewThread, feedback_prompt_line, feedback_report, filter_counts, group_comments,
     mention, parse_conversation, unresolved_items,
 };
+pub use details::{DetailsEdit, Label, PrDetails, RepoUser, Reviewer, is_valid_login, parse_details};
+pub use files::{FileStatus, MAX_FILES, PrFile, ViewedState, totals as files_totals, viewed_count};
 pub use gh::{GhCli, GhExec, GhOutput};
 pub use github::{CreatePr, CreatedPr, GitHub, HeadRef, MergeMethod};
 pub use model::{

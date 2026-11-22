@@ -375,7 +375,7 @@ pub(crate) fn source_label(source: &CompareSource, lang: Language) -> &str {
     match source {
         CompareSource::Working => tr(lang, Tr::DiffWorking),
         CompareSource::Staged => tr(lang, Tr::DiffStaged),
-        CompareSource::Commit(oid) => oid.get(..7).unwrap_or(oid),
+        CompareSource::Commit(oid) | CompareSource::Range { head: oid, .. } => oid.get(..7).unwrap_or(oid),
         CompareSource::Conflict => tr(lang, Tr::DiffConflict),
     }
 }

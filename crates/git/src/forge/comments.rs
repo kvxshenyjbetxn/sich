@@ -394,18 +394,6 @@ pub fn mention(author: &str) -> String {
 }
 
 impl<E: GhExec> GitHub<E> {
-    /// `gh api` with the host of the repository (needed for GitHub Enterprise).
-    fn api_args(&self, parts: &[&str]) -> Vec<String> {
-        let mut args = vec!["api".to_owned()];
-        let host = &self.repo().host;
-        if host != "github.com" {
-            args.push("--hostname".to_owned());
-            args.push(host.clone());
-        }
-        args.extend(parts.iter().map(|part| (*part).to_owned()));
-        args
-    }
-
     fn graphql_args(&self, query: &str, fields: &[(&str, &str)], number: Option<u64>) -> Vec<String> {
         let mut args = self.api_args(&["graphql", "-f"]);
         args.push(format!("query={query}"));
