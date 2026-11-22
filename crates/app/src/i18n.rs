@@ -366,6 +366,35 @@ pub enum Tr {
     WorktreeLocInsideDesc,
     WorktreeLocSharedDesc,
     // ---- comments keys: append below ----
+    CommentsTitle,
+    CommentsSendUnresolved,
+    CommentsModeGrouped,
+    CommentsModeTimeline,
+    CommentsAdd,
+    CommentsFilterAll,
+    CommentsFilterHumans,
+    CommentsFilterBots,
+    CommentsNeedsReview,
+    CommentsConversation,
+    CommentsResolved,
+    CommentsTimeline,
+    CommentsOutdated,
+    CommentsBot,
+    CommentsReply,
+    CommentsResolve,
+    CommentsUnresolve,
+    CommentsEdit,
+    CommentsDelete,
+    CommentsDeleteWarning,
+    CommentsSend,
+    CommentsSave,
+    CommentsPlaceholder,
+    CommentsEmpty,
+    CommentsEmptyHumans,
+    CommentsEmptyBots,
+    CommentsTruncated,
+    CommentsLoading,
+    CommentsAddReaction,
     // ---- end comments ----
 
     // ---- checks keys: append below ----
@@ -702,6 +731,35 @@ impl Tr {
         Tr::WorktreeLocInsideDesc,
         Tr::WorktreeLocSharedDesc,
         // ---- comments keys: append below ----
+        Tr::CommentsTitle,
+        Tr::CommentsSendUnresolved,
+        Tr::CommentsModeGrouped,
+        Tr::CommentsModeTimeline,
+        Tr::CommentsAdd,
+        Tr::CommentsFilterAll,
+        Tr::CommentsFilterHumans,
+        Tr::CommentsFilterBots,
+        Tr::CommentsNeedsReview,
+        Tr::CommentsConversation,
+        Tr::CommentsResolved,
+        Tr::CommentsTimeline,
+        Tr::CommentsOutdated,
+        Tr::CommentsBot,
+        Tr::CommentsReply,
+        Tr::CommentsResolve,
+        Tr::CommentsUnresolve,
+        Tr::CommentsEdit,
+        Tr::CommentsDelete,
+        Tr::CommentsDeleteWarning,
+        Tr::CommentsSend,
+        Tr::CommentsSave,
+        Tr::CommentsPlaceholder,
+        Tr::CommentsEmpty,
+        Tr::CommentsEmptyHumans,
+        Tr::CommentsEmptyBots,
+        Tr::CommentsTruncated,
+        Tr::CommentsLoading,
+        Tr::CommentsAddReaction,
         // ---- end comments ----
 
         // ---- checks keys: append below ----
@@ -2325,6 +2383,151 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             En => "working",
         },
         // ---- comments keys: append below ----
+        Tr::CommentsTitle => match lang {
+            Uk => "Коментарі",
+            Ru => "Комментарии",
+            En => "Comments",
+        },
+        Tr::CommentsSendUnresolved => match lang {
+            Uk => "Надіслати невирішені агенту",
+            Ru => "Отправить нерешённые агенту",
+            En => "Send unresolved to agent",
+        },
+        Tr::CommentsModeGrouped => match lang {
+            Uk => "Показати за потоками",
+            Ru => "Показать по веткам",
+            En => "Show grouped",
+        },
+        Tr::CommentsModeTimeline => match lang {
+            Uk => "Показати хронологічно",
+            Ru => "Показать хронологически",
+            En => "Show as timeline",
+        },
+        Tr::CommentsAdd => match lang {
+            Uk => "Додати коментар",
+            Ru => "Добавить комментарий",
+            En => "Add comment",
+        },
+        Tr::CommentsFilterAll => match lang {
+            Uk => "Усі",
+            Ru => "Все",
+            En => "All",
+        },
+        Tr::CommentsFilterHumans => match lang {
+            Uk => "Люди",
+            Ru => "Люди",
+            En => "Humans",
+        },
+        Tr::CommentsFilterBots => match lang {
+            Uk => "Боти",
+            Ru => "Боты",
+            En => "Bots",
+        },
+        Tr::CommentsNeedsReview => match lang {
+            Uk => "Потребують уваги",
+            Ru => "Требуют внимания",
+            En => "Needs review",
+        },
+        Tr::CommentsConversation => match lang {
+            Uk => "Обговорення",
+            Ru => "Обсуждение",
+            En => "Conversation",
+        },
+        Tr::CommentsResolved => match lang {
+            Uk => "Вирішені",
+            Ru => "Решённые",
+            En => "Resolved",
+        },
+        Tr::CommentsTimeline => match lang {
+            Uk => "Хронологія",
+            Ru => "Хронология",
+            En => "Timeline",
+        },
+        Tr::CommentsOutdated => match lang {
+            Uk => "застарілий",
+            Ru => "устарел",
+            En => "outdated",
+        },
+        Tr::CommentsBot => match lang {
+            Uk => "бот",
+            Ru => "бот",
+            En => "bot",
+        },
+        Tr::CommentsReply => match lang {
+            Uk => "Відповісти",
+            Ru => "Ответить",
+            En => "Reply",
+        },
+        Tr::CommentsResolve => match lang {
+            Uk => "Вирішити",
+            Ru => "Решить",
+            En => "Resolve",
+        },
+        Tr::CommentsUnresolve => match lang {
+            Uk => "Відновити",
+            Ru => "Вернуть",
+            En => "Unresolve",
+        },
+        Tr::CommentsEdit => match lang {
+            Uk => "Редагувати",
+            Ru => "Редактировать",
+            En => "Edit",
+        },
+        Tr::CommentsDelete => match lang {
+            Uk => "Видалити",
+            Ru => "Удалить",
+            En => "Delete",
+        },
+        Tr::CommentsDeleteWarning => match lang {
+            Uk => "Видалити цей коментар з GitHub? Дію не можна скасувати.",
+            Ru => "Удалить этот комментарий на GitHub? Действие нельзя отменить.",
+            En => "Delete this comment from GitHub? This cannot be undone.",
+        },
+        Tr::CommentsSend => match lang {
+            Uk => "Надіслати",
+            Ru => "Отправить",
+            En => "Send",
+        },
+        Tr::CommentsSave => match lang {
+            Uk => "Зберегти",
+            Ru => "Сохранить",
+            En => "Save",
+        },
+        Tr::CommentsPlaceholder => match lang {
+            Uk => "Напишіть коментар… (Ctrl+Enter — надіслати)",
+            Ru => "Напишите комментарий… (Ctrl+Enter — отправить)",
+            En => "Write a comment… (Ctrl+Enter to send)",
+        },
+        Tr::CommentsEmpty => match lang {
+            Uk => "Коментарів ще немає.",
+            Ru => "Комментариев пока нет.",
+            En => "No comments yet.",
+        },
+        Tr::CommentsEmptyHumans => match lang {
+            Uk => "Коментарів від людей немає.",
+            Ru => "Комментариев от людей нет.",
+            En => "No human comments.",
+        },
+        Tr::CommentsEmptyBots => match lang {
+            Uk => "Коментарів від ботів немає.",
+            Ru => "Комментариев от ботов нет.",
+            En => "No bot comments.",
+        },
+        Tr::CommentsTruncated => match lang {
+            Uk => "Показано перші {n} коментарів",
+            Ru => "Показаны первые {n} комментариев",
+            En => "Showing first {n} comments",
+        },
+        Tr::CommentsLoading => match lang {
+            Uk => "Завантаження коментарів…",
+            Ru => "Загрузка комментариев…",
+            En => "Loading comments…",
+        },
+        Tr::CommentsAddReaction => match lang {
+            Uk => "Додати реакцію",
+            Ru => "Добавить реакцию",
+            En => "Add reaction",
+        },
         // ---- end comments ----
 
         // ---- checks keys: append below ----

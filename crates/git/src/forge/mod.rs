@@ -2,6 +2,7 @@
 //!
 //! Sich never reads gh credentials or tokens: every call is a plain `gh` invocation.
 mod agent_prompt;
+mod comments;
 mod gh;
 mod github;
 mod model;
@@ -14,6 +15,11 @@ use std::fmt;
 pub use agent_prompt::{
     KEEP_REPORTS, LOG_TAIL_BYTES, LOG_TAIL_LINES, agent_prompt, agent_prompt_line, log_tail, prune_reports,
     write_report,
+};
+pub use comments::{
+    CommentFilter, CommentGroup, CommentItem, CommentMode, GroupKind, PrComment, PrConversation, Reaction,
+    ReactionKind, ReviewThread, feedback_prompt_line, feedback_report, filter_counts, group_comments,
+    mention, parse_conversation, unresolved_items,
 };
 pub use gh::{GhCli, GhExec, GhOutput};
 pub use github::{CreatePr, CreatedPr, GitHub, HeadRef, MergeMethod};

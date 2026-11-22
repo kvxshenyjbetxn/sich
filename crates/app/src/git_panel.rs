@@ -381,6 +381,8 @@ pub(crate) struct GitPanel {
     stash_open: HashMap<String, Expansion<Vec<FileChange>>>,
     stashes_collapsed: bool,
     store: Entity<PrStore>,
+    /// Comments section of the PR tab (own entity, fed by `pr_comments_section`).
+    comments: Entity<pr_comments::PrComments>,
     /// Which of the two right-panel tabs this panel renders (set by the app).
     pane: RightTab,
     _subscriptions: Vec<Subscription>,
@@ -399,6 +401,8 @@ impl GitPanel {
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&store, |panel, _, event, cx| panel.on_store_event(event, cx)),
         ];
+        let panel = cx.weak_entity();
+        let comments = cx.new(|_| pr_comments::PrComments::new(panel));
         Self {
             worktree: None,
             generation: Generation::default(),
@@ -426,6 +430,7 @@ impl GitPanel {
             stash_open: HashMap::new(),
             stashes_collapsed: false,
             store,
+            comments,
             pane: RightTab::Git,
             _subscriptions: subscriptions,
         }
