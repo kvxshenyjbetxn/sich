@@ -43,7 +43,6 @@ pub fn clamp_sidebar_w(w: f32, window_w: f32) -> f32 {
     w.clamp(MIN_SIDEBAR_W, max)
 }
 const ROW_H: f32 = 28.;
-const ROW_PAD_LEFT: f32 = 8.;
 /// Height of a terminal row that shows an agent (title line + preview line).
 const AGENT_ROW_H: f32 = 44.;
 /// Leading slot of an agent row: always the agent glyph (the status badge sits to its left).
@@ -56,20 +55,6 @@ const BADGE_GAP: f32 = 4.;
 const ROW_GAP: f32 = 6.;
 /// Preview line indent: under the title (lead slot + gap).
 const PREVIEW_INDENT: f32 = LEAD_SLOT_W + ROW_GAP;
-
-/// `(left, top, size)` relative to the terminal's leading glyph.
-fn restart_gutter(indent: f32, has_badge: bool) -> (f32, f32, f32) {
-    const SIZE: f32 = 10.;
-    let badge_offset = if has_badge { BADGE_W + BADGE_GAP } else { 0. };
-    let left = -(badge_offset + BADGE_GAP + SIZE);
-    if ROW_PAD_LEFT + indent + left >= BADGE_GAP {
-        (left, (LEAD_SLOT_W - SIZE) / 2., SIZE)
-    } else {
-        // Home's left padding cannot fit both buttons side by side. Keep the
-        // activity badge in place and tuck only the warning underneath it.
-        (-badge_offset, LEAD_SLOT_W, (ROW_H - LEAD_SLOT_W) / 2.)
-    }
-}
 const INDENT: f32 = 14.;
 /// Compact height when a subagent has no activity preview, including the overflow row.
 const SUB_ROW_H: f32 = 24.;
@@ -345,7 +330,7 @@ fn row_base(
         .w_full()
         .h(px(ROW_H))
         .flex_shrink_0()
-        .pl(px(ROW_PAD_LEFT + indent))
+        .pl(px(8. + indent))
         .pr_2()
         .gap_1p5()
         .items_center()
@@ -852,7 +837,6 @@ impl AppView {
                 let key = key.clone();
                 let row = row_base(("side-term", id), selected, indent, &theme)
                     .group(group.clone())
-                    .relative()
                     .text_color(if exited { muted } else { theme.sidebar_foreground })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         this.activate_terminal_in(key.clone(), id, window, cx)
@@ -864,10 +848,6 @@ impl AppView {
                             cx.stop_propagation();
                         }),
                     );
-                let (restart_x, restart_y, restart_size) = restart_gutter(indent, badge.is_some());
-                let restart = self.legacy_restart_button(entry, lang, cx, restart_size.min(8.)).map(|button| {
-                    button.absolute().size(px(restart_size))
-                });
                 let Some(status) = entry.info.agent.as_ref() else {
                     return Some(
                         row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
@@ -875,15 +855,17 @@ impl AppView {
                             .children(coord_chip(self.orch.is_coordinator(id), lang, &theme))
                             .children(badge)
                             .child(close)
-                            .children(restart.map(|button| button
-                                .left(px(ROW_PAD_LEFT + indent + restart_x))
-                                .top(px((ROW_H - LEAD_SLOT_W) / 2. + restart_y))))
                             .into_any_element(),
                     );
                 };
                 let icon = agent_icon_element(status.kind, LEAD_SLOT_W, theme.foreground, muted);
                 let title = status.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or(label);
                 let model = status.model.as_deref().map(shorten_model).filter(|m| !m.is_empty());
+                // The status badge hangs left of the agent icon, inside the row's left padding.
+                // Anchored to the icon slot so both share the same vertical center.
+                let badge = badge.map(|b| {
+                    div().absolute().top(px((LEAD_SLOT_W - BADGE_W) / 2.)).left(px(-(BADGE_W + BADGE_GAP))).child(b)
+                });
                 let line1 = h_flex()
                     .w_full()
                     .items_center()
@@ -892,12 +874,10 @@ impl AppView {
                         div()
                             .relative()
                             .flex_shrink_0()
-                            .size(px(LEAD_SLOT_W))
+                            .w(px(LEAD_SLOT_W))
+                            .h(px(LEAD_SLOT_W))
                             .child(icon)
-                            .children(badge.map(|badge| {
-                                div().absolute().top(px((LEAD_SLOT_W - BADGE_W) / 2.)).left(px(-(BADGE_W + BADGE_GAP))).child(badge)
-                            }))
-                            .children(restart.map(|button| button.left(px(restart_x)).top(px(restart_y)))),
+                            .children(badge),
                     )
                     .child(
                         div()
@@ -1350,26 +1330,6 @@ mod tests {
         assert_eq!(left_badge_x(INDENT), 4.);
         assert_eq!(left_badge_x(INDENT * 2.), 18.);
         assert!(left_badge_x(0.) < 0.);
-    }
-
-    #[test]
-    fn restart_button_stays_in_the_gutter_without_covering_activity() {
-        let badge_left = -(BADGE_W + BADGE_GAP);
-        for indent in [INDENT, INDENT * 2.] {
-            for has_badge in [false, true] {
-                let (left, top, size) = restart_gutter(indent, has_badge);
-                assert!(ROW_PAD_LEFT + indent + left >= BADGE_GAP);
-                assert!(left + size <= 0., "warning must not cover the terminal glyph");
-                assert!(top >= 0. && top + size <= (ROW_H + LEAD_SLOT_W) / 2.);
-                if has_badge {
-                    if indent == INDENT {
-                        assert!(top >= BADGE_W, "Home warning must fit below the badge");
-                    } else {
-                        assert!(left + size <= badge_left, "worktree warning must fit before the badge");
-                    }
-                }
-            }
-        }
     }
 
     #[test]
