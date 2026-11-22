@@ -382,6 +382,8 @@ fn local_edits_find_comments_and_threads() {
 fn pr() -> PullRequest {
     PullRequest {
         number: 7,
+        node_id: String::new(),
+        auto_merge: None,
         title: "Add\nthing \u{1b}[31m  now".into(),
         url: "https://github.com/o/r/pull/7".into(),
         state: PrState::Open,

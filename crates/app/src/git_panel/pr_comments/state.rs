@@ -271,6 +271,8 @@ mod tests {
     fn pr() -> PullRequest {
         PullRequest {
             number: 7,
+            node_id: String::new(),
+            auto_merge: None,
             title: "Add thing".into(),
             url: "https://github.com/o/r/pull/7".into(),
             state: PrState::Open,

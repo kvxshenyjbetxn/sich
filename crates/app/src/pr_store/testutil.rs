@@ -23,6 +23,8 @@ pub(crate) fn pr(state: PrState) -> PullRequest {
         head_owner: None,
         checks: Vec::new(),
         updated_at: String::new(),
+        node_id: "PR_node".into(),
+        auto_merge: None,
     }
 }
 

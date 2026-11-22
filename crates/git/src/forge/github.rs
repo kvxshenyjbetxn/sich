@@ -7,11 +7,11 @@ use super::model::{PullRequest, parse_pr_json};
 use super::remote::RemoteRepo;
 use super::ForgeError;
 
-const PR_FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStatus,reviewDecision,baseRefName,headRefName,headRefOid,headRepositoryOwner,statusCheckRollup,updatedAt";
+const PR_FIELDS: &str = "number,title,url,state,isDraft,mergeable,mergeStateStatus,reviewDecision,baseRefName,headRefName,headRefOid,headRepositoryOwner,statusCheckRollup,updatedAt,id,autoMergeRequest";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(15);
-const VIEW_TIMEOUT: Duration = Duration::from_secs(30);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(90);
-const LOG_TIMEOUT: Duration = Duration::from_secs(60);
+pub(super) const VIEW_TIMEOUT: Duration = Duration::from_secs(30);
+pub(super) const WRITE_TIMEOUT: Duration = Duration::from_secs(90);
+pub(super) const LOG_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeMethod {
@@ -111,6 +111,22 @@ impl<E: GhExec> GitHub<E> {
         } else {
             Err(classify(&args[0], &output))
         }
+    }
+
+    /// argv of a `gh api` call: `api <parts...>` plus `--hostname` for GitHub Enterprise hosts.
+    pub(super) fn api_argv(&self, parts: &[&str]) -> Vec<String> {
+        let mut argv = args(&["api"]);
+        argv.extend(parts.iter().map(|part| (*part).to_owned()));
+        if self.repo.host != "github.com" {
+            argv.push("--hostname".to_owned());
+            argv.push(self.repo.host.clone());
+        }
+        argv
+    }
+
+    /// `repos/<owner>/<name>/<path>` for `gh api`.
+    pub(super) fn repo_endpoint(&self, path: &str) -> String {
+        format!("repos/{}/{}/{path}", self.repo.owner, self.repo.name)
     }
 
     pub fn auth_status(&self) -> Result<(), ForgeError> {
@@ -305,21 +321,6 @@ impl<E: GhExec> GitHub<E> {
     pub fn reopen_pr(&self, number: u64) -> Result<(), ForgeError> {
         let argv = args(&["pr", "reopen", &number.to_string(), "--repo", &self.repo.gh_repo_arg()]);
         self.run_ok(&argv, VIEW_TIMEOUT).map(|_| ())
-    }
-
-    pub fn rerun_failed(&self, run_ids: &[u64]) -> Result<(), ForgeError> {
-        for id in run_ids {
-            let argv = args(&[
-                "run",
-                "rerun",
-                &id.to_string(),
-                "--failed",
-                "--repo",
-                &self.repo.gh_repo_arg(),
-            ]);
-            self.run_ok(&argv, VIEW_TIMEOUT)?;
-        }
-        Ok(())
     }
 
     /// Output of the failed steps of one job (`gh run view --job <id> --log-failed`).
@@ -721,16 +722,14 @@ mod tests {
     }
 
     #[test]
-    fn rerun_failed_runs_each_id_and_stops_on_error() {
-        let exec = FakeExec::with(vec![ok(""), fail(1, "run not found"), ok("")]);
-        let gh = github(&exec);
-        let result = gh.rerun_failed(&[10, 20, 30]);
-        assert_eq!(result, Err(ForgeError::Failed("run not found".into())));
-        let calls = exec.calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], v(&["run", "rerun", "10", "--failed", "--repo", "o/r"]));
-        assert_eq!(calls[1][2], "20");
-        assert_eq!(gh.rerun_failed(&[]), Ok(()));
+    fn api_argv_adds_the_hostname_only_for_enterprise() {
+        let exec = FakeExec::default();
+        assert_eq!(github(&exec).api_argv(&["graphql"]), v(&["api", "graphql"]));
+        assert_eq!(
+            ghe(&exec).api_argv(&["repos/o/r/x"]),
+            v(&["api", "repos/o/r/x", "--hostname", "github.acme.com"])
+        );
+        assert_eq!(github(&exec).repo_endpoint("check-runs/5"), "repos/o/r/check-runs/5");
     }
 
     #[test]
