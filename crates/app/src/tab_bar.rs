@@ -296,8 +296,7 @@ impl AppView {
                                     PopupMenuItem::element(move |_, cx| preview.render(cx).w(px(328.)))
                                         .on_click(move |_, window, cx| {
                                             if let Some(id) = active {
-                                                let command = command.clone();
-                                                app.update(cx, |this, cx| this.run_quick_command(id, command, window, cx));
+                                                app.update(cx, |this, cx| this.run_quick_command(id, &command.command, window, cx));
                                             }
                                         }),
                                 );

@@ -70,7 +70,7 @@ pub(crate) struct ClientState {
     pub created_worktrees: Vec<(PathBuf, PathBuf)>,
     /// Last `OpFailed` from the daemon: (op, message, when).
     pub last_error: Option<(String, String, Instant)>,
-    pub failed_splits: Vec<u64>,
+    pub failed_terminal_opens: Vec<u64>,
 }
 
 /// Commands from the UI to the connection task.
@@ -102,13 +102,13 @@ pub(crate) struct RestoreData {
     pub resume: Option<String>,
     /// Quick commands must still run if the user types while the shell is starting.
     pub protect_resume: bool,
-    pub split: bool,
+    pub report_open_failure: bool,
     pub(crate) migration: Option<Migration>,
 }
 
 impl RestoreData {
-    pub(crate) fn fresh_split(token: u64) -> Self {
-        Self { token, scrollback: None, separator: "", interruption: None, resume: None, protect_resume: false, split: true, migration: None }
+    pub(crate) fn fresh_terminal(token: u64) -> Self {
+        Self { token, scrollback: None, separator: "", interruption: None, resume: None, protect_resume: false, report_open_failure: true, migration: None }
     }
 }
 
@@ -223,7 +223,7 @@ impl Peer {
             pending_worktrees: VecDeque::new(),
             created_worktrees: Vec::new(),
             last_error: None,
-            failed_splits: Vec::new(),
+            failed_terminal_opens: Vec::new(),
         }));
         let name = if legacy { generation::RETIRE_CLIENT } else { "sich-app" };
         let models = if endpoint.subagent_models { sich_proto::SUBAGENT_MODELS_CLIENT_SUFFIX } else { "" };
@@ -431,7 +431,7 @@ impl DaemonPool {
         let cwd = [Some(info.cwd), info.worktree.clone()].into_iter().flatten().find(|path| path.is_dir());
         let agent = info.agent.as_ref();
         let data = RestoreData {
-            token, separator, scrollback: None, split: false, protect_resume: false, migration: Some(migration),
+            token, separator, scrollback: None, report_open_failure: false, protect_resume: false, migration: Some(migration),
             interruption: agent.is_some_and(|a| a.state == sich_proto::AgentState::Working).then_some(interruption),
             resume: agent.filter(|_| resume_agents)
                 .and_then(|a| crate::session::resume_command(a.kind, a.session_id.as_deref()?)),
@@ -446,18 +446,22 @@ impl DaemonPool {
     }
 
     pub(crate) fn open_split(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, size: (u16, u16), token: u64) -> bool {
-        self.send_restore(worktree, cwd, size, RestoreData::fresh_split(token))
+        self.send_restore(worktree, cwd, size, RestoreData::fresh_terminal(token))
     }
 
-    pub(crate) fn open_quick_split(
+    pub(crate) fn open_quick_tab(
         &self,
         worktree: Option<PathBuf>,
         cwd: Option<PathBuf>,
         size: (u16, u16),
         token: u64,
-        command: String,
+        command: &str,
     ) -> bool {
-        let data = RestoreData { resume: Some(command), protect_resume: true, ..RestoreData::fresh_split(token) };
+        let data = RestoreData {
+            resume: Some(crate::quick_commands::startup_command(command)),
+            protect_resume: true,
+            ..RestoreData::fresh_terminal(token)
+        };
         self.send_restore(worktree, cwd, size, data)
     }
 
@@ -467,8 +471,8 @@ impl DaemonPool {
             && self.0.primary.cmd_tx.send(Cmd::Restore { worktree, cwd, cols: size.0, rows: size.1, data }).is_ok()
     }
 
-    pub(crate) fn take_failed_splits(&self) -> Vec<u64> {
-        std::mem::take(&mut self.0.primary.state.lock().failed_splits)
+    pub(crate) fn take_failed_terminal_opens(&self) -> Vec<u64> {
+        std::mem::take(&mut self.0.primary.state.lock().failed_terminal_opens)
     }
 
     pub fn daemon_pid(&self) -> Option<u32> {
@@ -714,7 +718,7 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn quick_split_runs_in_requested_directory_before_shell_exits() {
+    async fn quick_tab_runs_in_requested_directory_without_touching_the_source_shell() {
         isolate();
         let cwd = tempfile::tempdir().unwrap();
         let base = unique_base();
@@ -725,11 +729,14 @@ mod tests {
         });
         let pool = DaemonPool::start_on(&Handle::current(), base, build, Arc::new(|| {}), false);
         eventually("quick command daemon", || pool.terminals_synced()).await;
+        raw_create(pool.primary_socket(), cwd.path()).await;
+        eventually("source shell", || {
+            pool.snapshot().terminals.iter().any(|entry| screen_contains(entry, "migration-history"))
+        }).await;
+        let source = pool.snapshot().terminals[0].info.id;
 
-        let command = crate::quick_commands::startup_command(
-            "Set-Content -LiteralPath quick-command-result.txt -Value quick-ok # trailing comment",
-        );
-        assert!(pool.open_quick_split(None, Some(cwd.path().to_owned()), (80, 24), 42, command));
+        let command = "Set-Content -LiteralPath quick-command-result.txt -Value quick-ok # trailing comment";
+        assert!(pool.open_quick_tab(None, Some(cwd.path().to_owned()), (80, 24), 42, command));
         eventually("quick command to finish", || {
             pool.snapshot().terminals.iter().any(|entry| {
                 entry.restore_token == Some(42) && entry.info.exited.is_some()
@@ -737,6 +744,11 @@ mod tests {
         }).await;
         let result = std::fs::read_to_string(cwd.path().join("quick-command-result.txt")).unwrap();
         assert_eq!(result.trim(), "quick-ok");
+        let snap = pool.snapshot();
+        let original = snap.terminals.iter().find(|entry| entry.info.id == source).unwrap();
+        assert!(original.info.exited.is_none());
+        assert!(screen_contains(original, "migration-history"));
+        assert!(!screen_contains(original, "quick-command-result"));
         crate::cli::shutdown(pool.primary_socket()).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), daemon).await.unwrap().unwrap().unwrap();
     }

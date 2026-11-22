@@ -59,18 +59,10 @@ fn first_line(value: &str) -> SharedString {
     }
 }
 
-pub fn requires_temporary(has_agent: bool, exited: bool) -> bool {
-    has_agent || exited
-}
-
 /// Submit the command and exit with Enter (CR). PSReadLine treats LF as a continuation.
 /// A separate submission also prevents a trailing comment from swallowing `exit`.
 pub fn startup_command(command: &str) -> String {
     format!("{command}\rexit")
-}
-
-pub fn command_input(command: &str) -> Vec<u8> {
-    format!("{command}\r").into_bytes()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -167,7 +159,7 @@ mod tests {
         let preview = CommandPreview::new(&command);
         assert_eq!(preview.name.as_deref(), Some("Перевірка"));
         assert_eq!(preview.command.as_ref(), "Write-Output first…");
-        assert_eq!(command_input(&command.command), b"Write-Output first\r\nWrite-Output second\r");
+        assert_eq!(startup_command(&command.command), "Write-Output first\r\nWrite-Output second\rexit");
     }
 
     #[test]
@@ -179,17 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn agents_and_exited_shells_need_a_temporary_terminal() {
-        assert!(!requires_temporary(false, false));
-        assert!(requires_temporary(true, false));
-        assert!(requires_temporary(false, true));
-        assert!(requires_temporary(true, true));
-    }
-
-    #[test]
     fn temporary_shell_submits_command_and_exit_with_enter() {
-        assert_eq!(command_input(&startup_command("cargo test # explanation")), b"cargo test # explanation\rexit\r");
-        assert_eq!(command_input("cargo test"), b"cargo test\r");
+        assert_eq!(startup_command("cargo test # explanation"), "cargo test # explanation\rexit");
     }
 
     #[test]

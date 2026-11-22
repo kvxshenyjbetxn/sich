@@ -29,7 +29,7 @@ use crate::diff_view::DiffView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
-use crate::quick_commands::{self, QuickCommand, TemporaryCommand};
+use crate::quick_commands::{self, TemporaryCommand};
 use crate::orch_watch;
 use crate::sidebar::{DEFAULT_SIDEBAR_W, clamp_sidebar_w};
 use crate::session::{self, RightPanelState, RightTab, SavedWindow, Session, SessionInput};
@@ -78,11 +78,16 @@ struct RestoreTarget {
     attached_active: Option<TermId>,
 }
 
-struct PendingSplit {
+#[derive(Clone, Copy)]
+enum TerminalOpenKind {
+    Split { target: TermId, edge: Edge },
+    QuickTab,
+}
+
+struct PendingTerminalOpen {
     token: u64,
-    target: TerminalDrag,
-    edge: Edge,
-    temporary: bool,
+    workspace: WorkspaceKey,
+    kind: TerminalOpenKind,
     started: Instant,
 }
 
@@ -121,7 +126,7 @@ pub struct AppView {
     pub(crate) collapsed: HashSet<ProjectId>,
     /// Workspaces this window asked a terminal for; the matching new terminal gets activated.
     pending_creates: VecDeque<WorkspaceKey>,
-    pending_splits: Vec<PendingSplit>,
+    pending_terminal_opens: Vec<PendingTerminalOpen>,
     pending_terminal_restarts: HashMap<TermId, u64>,
     pub(crate) quick_terminals: HashMap<TermId, TemporaryCommand>,
     seen_projects_rev: u64,
@@ -311,7 +316,7 @@ impl AppView {
             collapsed_groups: HashSet::new(),
             collapsed: HashSet::new(),
             pending_creates: VecDeque::new(),
-            pending_splits: Vec::new(),
+            pending_terminal_opens: Vec::new(),
             pending_terminal_restarts: HashMap::new(),
             quick_terminals: HashMap::new(),
             seen_projects_rev: 0,
@@ -817,7 +822,7 @@ impl AppView {
             self.restore_targets.clear();
             self.restore_started = None;
             self.pending_creates.clear();
-            self.pending_splits.clear();
+            self.pending_terminal_opens.clear();
             self.quick_terminals.clear();
             self.views.clear();
             self.terminal_layouts.clear();
@@ -938,7 +943,7 @@ impl AppView {
                     interruption: term.interrupted.then(|| tr(lang, Tr::AgentInterrupted)),
                     resume,
                     protect_resume: false,
-                    split: false,
+                    report_open_failure: false,
                     migration: None,
                 };
                 let cwd = (!term.cwd.as_os_str().is_empty()).then_some(term.cwd);
@@ -1029,22 +1034,30 @@ impl AppView {
     }
 
     pub(crate) fn activate_terminal(&mut self, id: TermId, window: &mut Window, cx: &mut Context<Self>) {
+        self.select_terminal(id, !self.standalone_quick_tab(id), window, cx);
+    }
+
+    fn select_terminal(&mut self, id: TermId, put_in_layout: bool, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.ws.selected.clone();
-        let ids: Vec<_> = self.client.snapshot().terminals.iter()
-            .filter(|entry| key.contains(entry.info.worktree.as_deref()))
-            .map(|entry| entry.info.id).collect();
-        let previous = self.ws.active_in(&key, &ids);
-        if let Some(layout) = self.terminal_layouts.get_mut(&key) {
-            let previous = previous.map_or_else(|| layout.first_leaf(), |id| visible_active(layout, id));
-            layout.replace(previous, id);
-        } else {
-            self.terminal_layouts.insert(key.clone(), Layout::Leaf(id));
+        if put_in_layout {
+            if let Some(layout) = self.terminal_layouts.get_mut(&key) {
+                let ids: Vec<_> = self.client.snapshot().terminals.iter()
+                    .filter(|entry| key.contains(entry.info.worktree.as_deref()))
+                    .map(|entry| entry.info.id).collect();
+                let previous = self.ws.active_in(&key, &ids)
+                    .map_or_else(|| layout.first_leaf(), |id| visible_active(layout, id));
+                layout.replace(previous, id);
+            } else {
+                self.terminal_layouts.insert(key.clone(), Layout::Leaf(id));
+            }
         }
         for target in &mut self.restore_targets {
             if target.key == key {
                 target.active = None;
                 target.attached_active = Some(id);
-                target.layout = None;
+                if put_in_layout {
+                    target.layout = None;
+                }
             }
         }
         self.ws.set_active(&key, id);
@@ -1420,10 +1433,12 @@ impl AppView {
         self.terminal_layouts.retain(|key, layout| {
             layout.retain_where(|id| infos.iter().any(|info| info.id == id && key.contains(info.worktree.as_deref())))
         });
-        self.finish_pending_splits(snap, window, cx);
+        self.finish_pending_terminal_opens(snap, window, cx);
         let key = self.ws.selected.clone();
         let ids = self.workspace_ids(infos);
-        if let Some(active) = self.ws.active_in(&key, &ids) {
+        if let Some(active) = self.ws.active_in(&key, &ids)
+            && !self.standalone_quick_tab(active)
+        {
             let layout = self.terminal_layouts.entry(key.clone()).or_insert(Layout::Leaf(active));
             if !layout.contains(active) {
                 self.ws.set_active(&key, layout.first_leaf());
@@ -1493,10 +1508,16 @@ impl AppView {
         self.dragged_terminal.is_some_and(|id| self.terminal_is_split(id))
     }
 
+    fn standalone_quick_tab(&self, id: TermId) -> bool {
+        is_standalone_quick_tab(
+            self.terminal_layouts.get(&self.ws.selected), id, self.quick_terminals.contains_key(&id),
+        )
+    }
+
     pub(crate) fn run_quick_command(
         &mut self,
         source: TermId,
-        command: QuickCommand,
+        command: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1504,26 +1525,19 @@ impl AppView {
         let Some(entry) = snap.terminals.iter().find(|entry| {
             entry.info.id == source && self.ws.selected.contains(entry.info.worktree.as_deref())
         }) else { return };
-        if !quick_commands::requires_temporary(entry.info.agent.is_some(), entry.info.exited.is_some()) {
-            self.client.send_input(source, quick_commands::command_input(&command.command));
+        let workspace = self.ws.selected.clone();
+        let cwd = entry.info.cwd.is_dir().then(|| entry.info.cwd.clone());
+        self.next_restore_token += 1;
+        let token = self.next_restore_token;
+        if !self.client.open_quick_tab(workspace.path().map(PathBuf::from), cwd, entry.session.size(), token, command) {
+            let message = tr(settings::language(cx), Tr::QuickCommandOpenFailed);
+            notifications::show_error(message.to_owned(), window, cx);
             return;
         }
-        let target = TerminalDrag { workspace: self.ws.selected.clone(), id: source };
-        self.request_split(&target, Edge::Right, Some(command), window, cx);
+        self.track_terminal_open(token, workspace, TerminalOpenKind::QuickTab, cx);
     }
 
     pub(crate) fn request_terminal_split(&mut self, target: &TerminalDrag, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
-        self.request_split(target, edge, None, window, cx);
-    }
-
-    fn request_split(
-        &mut self,
-        target: &TerminalDrag,
-        edge: Edge,
-        quick_command: Option<QuickCommand>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         if target.workspace != self.ws.selected { return; }
         let snap = self.client.snapshot();
         let Some(entry) = snap.terminals.iter().find(|entry| {
@@ -1534,57 +1548,72 @@ impl AppView {
         self.next_restore_token += 1;
         let token = self.next_restore_token;
         let worktree = target.workspace.path().map(PathBuf::from);
-        let opened = if let Some(command) = &quick_command {
-            self.client.open_quick_split(worktree, cwd, size, token, quick_commands::startup_command(&command.command))
-        } else {
-            self.client.open_split(worktree, cwd, size, token)
-        };
-        if !opened {
+        if !self.client.open_split(worktree, cwd, size, token) {
             let message = tr(settings::language(cx), Tr::TerminalSplitDisconnected);
             notifications::show_error(message.to_owned(), window, cx);
             return;
         }
-        self.activate_terminal(target.id, window, cx);
-        self.pending_splits.push(PendingSplit {
-            token, target: target.clone(), edge, temporary: quick_command.is_some(), started: Instant::now(),
-        });
+        self.select_terminal(target.id, true, window, cx);
+        self.track_terminal_open(token, target.workspace.clone(), TerminalOpenKind::Split { target: target.id, edge }, cx);
+    }
+
+    fn track_terminal_open(&mut self, token: u64, workspace: WorkspaceKey, kind: TerminalOpenKind, cx: &mut Context<Self>) {
+        self.pending_terminal_opens.push(PendingTerminalOpen { token, workspace, kind, started: Instant::now() });
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RESTORE_TIMEOUT + Duration::from_millis(1)).await;
             let _ = this.update(cx, |this, cx| {
-                this.pending_splits.retain(|pending| pending.started.elapsed() <= RESTORE_TIMEOUT);
+                this.pending_terminal_opens.retain(|pending| pending.started.elapsed() <= RESTORE_TIMEOUT);
                 cx.notify();
             });
         }).detach();
     }
 
-    fn finish_pending_splits(&mut self, snap: &Snapshot, window: &mut Window, cx: &mut Context<Self>) {
-        let failures = self.client.take_failed_splits();
-        if !failures.is_empty() {
-            let message = tr(settings::language(cx), Tr::TerminalSplitFailed);
-            cx.defer_in(window, move |_, window, cx| {
-                notifications::show_error(message.to_owned(), window, cx);
-            });
-        }
-        self.pending_splits.retain(|request| {
-            let key = &request.target.workspace;
-            request.started.elapsed() <= RESTORE_TIMEOUT && !failures.contains(&request.token)
-                && self.terminal_layouts.get(key).is_some_and(|layout| layout.contains(request.target.id))
+    fn finish_pending_terminal_opens(&mut self, snap: &Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+        let failures = self.client.take_failed_terminal_opens();
+        let (mut failed_split, mut failed_quick) = (false, false);
+        self.pending_terminal_opens.retain(|request| {
+            if failures.contains(&request.token) {
+                match request.kind {
+                    TerminalOpenKind::Split { .. } => failed_split = true,
+                    TerminalOpenKind::QuickTab => failed_quick = true,
+                }
+                return false;
+            }
+            request.started.elapsed() <= RESTORE_TIMEOUT && match request.kind {
+                TerminalOpenKind::Split { target, .. } => self.terminal_layouts
+                    .get(&request.workspace).is_some_and(|layout| layout.contains(target)),
+                TerminalOpenKind::QuickTab => true,
+            }
         });
+        for (failed, key) in [(failed_split, Tr::TerminalSplitFailed), (failed_quick, Tr::QuickCommandOpenFailed)] {
+            if failed {
+                let message = tr(settings::language(cx), key);
+                cx.defer_in(window, move |_, window, cx| {
+                    notifications::show_error(message.to_owned(), window, cx);
+                });
+            }
+        }
         let mut index = 0;
-        while let Some(request) = self.pending_splits.get(index) {
+        while let Some(request) = self.pending_terminal_opens.get(index) {
             let Some(entry) = snap.terminals.iter().find(|entry| entry.restore_token == Some(request.token)) else {
                 index += 1;
                 continue;
             };
-            let request = self.pending_splits.remove(index);
-            let key = &request.target.workspace;
+            let request = self.pending_terminal_opens.remove(index);
+            let key = &request.workspace;
             if !key.contains(entry.info.worktree.as_deref()) {
                 continue;
             }
-            let layout = self.terminal_layouts.remove(key).unwrap();
-            self.terminal_layouts.insert(key.clone(), layout.split(entry.info.id, request.target.id, request.edge));
-            if request.temporary {
-                self.quick_terminals.insert(entry.info.id, TemporaryCommand::default());
+            match request.kind {
+                TerminalOpenKind::Split { target, edge } => {
+                    let layout = self.terminal_layouts.remove(key).unwrap();
+                    self.terminal_layouts.insert(key.clone(), layout.split(entry.info.id, target, edge));
+                }
+                TerminalOpenKind::QuickTab => {
+                    let mut command = TemporaryCommand::default();
+                    command.observe(entry.info.exited.is_some(), sich_orch::paths::now_ms());
+                    self.quick_terminals.insert(entry.info.id, command);
+                }
             }
             if self.ws.selected == *key && self.active_tab().is_none() {
                 self.activate_terminal(entry.info.id, window, cx);
@@ -1644,7 +1673,8 @@ impl AppView {
                     .and_then(|command| quick_commands::banner(id, command, self.orch_now_ms, lang, cx))
                     .or_else(|| orch_watch::worker_for_terminal(&self.orch, &entry.info)
                         .and_then(|worker| crate::orch_banner::render(worker, self.orch_now_ms, lang, cx)));
-                let tint = self.dragged_terminal.filter(|&source| source != id && cx.has_active_drag())
+                let standalone = self.standalone_quick_tab(id);
+                let tint = self.dragged_terminal.filter(|&source| !standalone && source != id && cx.has_active_drag())
                     .map(|_| cx.theme().primary.opacity(0.25));
                 let feedback = tint.map(|tint| gpui_kit::canvas(
                     |_, _, _| (),
@@ -1668,8 +1698,9 @@ impl AppView {
                         {
                             this.activate_terminal(id, window, cx);
                         }
-                    }))
-                    .on_drop(cx.listener(move |this, drag: &TerminalDrag, window, cx| {
+                    }));
+                let body = if standalone { body } else {
+                    body.on_drop(cx.listener(move |this, drag: &TerminalDrag, window, cx| {
                         // TerminalElement measures the same pane in prepaint, including
                         // resizes that occurred while the pointer was stationary.
                         let rect = this.views.get(&id).and_then(|view| view.read(cx).grid_bounds()).map(pane_rect);
@@ -1678,6 +1709,8 @@ impl AppView {
                             this.split_terminal(drag, id, edge, window, cx);
                         }
                     }))
+                };
+                let body = body
                     .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
                         if this.views.get(&id).is_some_and(|view| {
                             view.update(cx, |view, cx| view.paste_dropped_paths(paths.paths(), cx))
@@ -1752,7 +1785,9 @@ impl AppView {
         let tab = self.active_tab();
         let active = if tab.is_none() { self.ws.active_in(&self.ws.selected, &ids) } else { None };
         let tab_bar = self.render_tab_bar(snap, &ids, active, lang, cx);
-        let content = match (tab.map(|tab| &tab.view), self.terminal_layouts.get(&self.ws.selected)) {
+        let quick_layout = active.filter(|&id| self.standalone_quick_tab(id)).map(Layout::Leaf);
+        let layout = quick_layout.as_ref().or_else(|| self.terminal_layouts.get(&self.ws.selected));
+        let content = match (tab.map(|tab| &tab.view), layout) {
             (Some(TabView::Diff(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
             (Some(TabView::Activity(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
             (None, Some(layout)) => {
@@ -2171,6 +2206,10 @@ fn visible_active(layout: &Layout<TermId>, active: TermId) -> TermId {
     if layout.contains(active) { active } else { layout.first_leaf() }
 }
 
+fn is_standalone_quick_tab(layout: Option<&Layout<TermId>>, id: TermId, is_quick: bool) -> bool {
+    is_quick && !layout.is_some_and(|layout| layout.contains(id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2181,6 +2220,15 @@ mod tests {
         let layout = layout.remove(2).unwrap();
         assert_eq!(visible_active(&layout, 2), 1);
         assert_eq!(visible_active(&layout, 3), 3);
+    }
+
+    #[test]
+    fn quick_tab_is_standalone_until_it_is_explicitly_split() {
+        let layout = Layout::Leaf(1).split(2, 1, Edge::Right);
+        assert!(is_standalone_quick_tab(Some(&layout), 3, true));
+        assert!(!is_standalone_quick_tab(Some(&layout), 3, false));
+        let layout = layout.split(3, 2, Edge::Bottom);
+        assert!(!is_standalone_quick_tab(Some(&layout), 3, true));
     }
 
     const LANG: i18n::Language = i18n::Language::En;

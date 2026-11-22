@@ -230,8 +230,8 @@ async fn session_on<S: AsyncRead + AsyncWrite + Unpin>(
                                 send(&mut stream, &sub).await?;
                             } else if let Some(migration) = migration {
                                 let _ = migration.done.send(Err(anyhow::anyhow!("current daemon could not create the replacement terminal")));
-                            } else if data.split {
-                                conn.state.lock().failed_splits.push(data.token);
+                            } else if data.report_open_failure {
+                                conn.state.lock().failed_terminal_opens.push(data.token);
                                 (conn.wake)();
                             }
                         }
@@ -752,7 +752,7 @@ mod tests {
                 pending_worktrees: Default::default(),
                 created_worktrees: Vec::new(),
                 last_error: None,
-                failed_splits: Vec::new(),
+                failed_terminal_opens: Vec::new(),
             })),
             cmd_tx,
             wake: Arc::new(|| {}),
@@ -848,7 +848,7 @@ mod tests {
         }
         cmd_tx.send(Cmd::Restore {
             worktree: None, cwd: None, cols: DEFAULT_COLS, rows: DEFAULT_ROWS,
-            data: RestoreData { token: 42, scrollback: None, separator: "restored", interruption: None, resume: Some("codex resume abcdef12".into()), protect_resume: protected, split: false, migration: None },
+            data: RestoreData { token: 42, scrollback: None, separator: "restored", interruption: None, resume: Some("codex resume abcdef12".into()), protect_resume: protected, report_open_failure: false, migration: None },
         }).unwrap();
         let ClientMsg::RestoreTerminal { request_id, .. } = recv_client(&mut peer).await else { panic!("expected restore request") };
         let terminal = TerminalInfo {
@@ -873,7 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_split_requests_are_correlated_and_fail_without_replay() {
+    async fn fresh_terminal_requests_are_correlated_and_fail_without_replay() {
         let (conn, mut commands) = test_conn_with_rx(&Handle::current(), false);
         let state = conn.state.clone();
         let tx = conn.cmd_tx.clone();
@@ -888,7 +888,7 @@ mod tests {
         for token in [101, 202] {
             tx.send(Cmd::Restore {
                 worktree: Some("/worktree".into()), cwd: Some("/worktree/sub".into()), cols: 91, rows: 27,
-                data: RestoreData::fresh_split(token),
+                data: RestoreData::fresh_terminal(token),
             }).unwrap();
         }
         let first = recv_client(&mut peer).await;
@@ -907,7 +907,7 @@ mod tests {
         assert!(matches!(recv_client(&mut peer).await, ClientMsg::Subscribe { id: 2, .. }));
         {
             let state = state.lock();
-            assert_eq!(state.failed_splits, vec![101]);
+            assert_eq!(state.failed_terminal_opens, vec![101]);
             assert_eq!(state.terminals.iter().find(|t| t.info.id == 9).unwrap().restore_token, None);
             assert_eq!(state.terminals.iter().find(|t| t.info.id == 2).unwrap().restore_token, Some(202));
         }
@@ -930,7 +930,7 @@ mod tests {
         for _ in 0..3 { recv_client(&mut peer).await; }
         for token in [101, 202] {
             tx.send(Cmd::Restore { worktree: None, cwd: None, cols: 80, rows: 24, data: RestoreData {
-                token, scrollback: None, separator: "", interruption: None, resume: None, protect_resume: false, split: false,
+                token, scrollback: None, separator: "", interruption: None, resume: None, protect_resume: false, report_open_failure: false,
                 migration: None,
             }}).unwrap();
         }

@@ -65,6 +65,7 @@ pub enum Tr {
     QuickCommandEdit,
     QuickCommandManage,
     QuickCommandSave,
+    QuickCommandOpenFailed,
     QuickCommandRunning,
     QuickCommandFinished,
     NoTerminals,
@@ -286,6 +287,7 @@ impl Tr {
         Tr::QuickCommandEdit,
         Tr::QuickCommandManage,
         Tr::QuickCommandSave,
+        Tr::QuickCommandOpenFailed,
         Tr::QuickCommandRunning,
         Tr::QuickCommandFinished,
         Tr::NoTerminals,
@@ -979,6 +981,11 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Uk => "Зберегти",
             Ru => "Сохранить",
             En => "Save",
+        },
+        Tr::QuickCommandOpenFailed => match lang {
+            Uk => "Не вдалося відкрити вкладку для швидкої команди.",
+            Ru => "Не удалось открыть вкладку для быстрой команды.",
+            En => "Could not open a tab for the quick command.",
         },
         Tr::QuickCommandRunning => match lang {
             Uk => "Закриється після команди",
