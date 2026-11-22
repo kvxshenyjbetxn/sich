@@ -56,7 +56,7 @@ pub(crate) fn entry_title(entry: &TermEntry) -> String {
 
 impl AppView {
     pub(crate) fn legacy_restart_button(
-        &self, entry: &TermEntry, lang: Language, cx: &Context<Self>,
+        &self, entry: &TermEntry, lang: Language, cx: &Context<Self>, icon_size: f32,
     ) -> Option<Stateful<Div>> {
         if !entry.legacy {
             return None;
@@ -69,7 +69,7 @@ impl AppView {
             .id(("restart-legacy-terminal", id))
             .flex_shrink_0().items_center().justify_center()
             .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
-            .child(Icon::new(Ic::CircleAlert).size(px(8.)).text_color(color.opacity(if busy { 0.45 } else { 0.9 })))
+            .child(Icon::new(Ic::CircleAlert).size(px(icon_size)).text_color(color.opacity(if busy { 0.45 } else { 0.9 })))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 cx.stop_propagation();
                 this.restart_legacy_terminal(id, window, cx);
@@ -128,7 +128,6 @@ impl AppView {
                 h_flex()
                     .id(("tab", id))
                     .group(group)
-                    .relative()
                     .h_full()
                     .flex_shrink_0()
                     .max_w(px(220.))
@@ -156,6 +155,7 @@ impl AppView {
                             cx.stop_propagation();
                         }),
                     )
+                    .children(self.legacy_restart_button(entry, lang, cx, 11.).map(|button| button.size(px(16.))))
                     .children(badge)
                     .children(agent_icon)
                     .child(
@@ -166,11 +166,6 @@ impl AppView {
                             .child(label),
                     )
                     .child(close_wrap)
-                    // Overlay the existing left padding; a flex child widens the tab
-                    // and shifts its title, close button, and all following tabs.
-                    .children(self.legacy_restart_button(entry, lang, cx).map(|button| {
-                        button.absolute().left_0().top_0().w_3().h_full()
-                    }))
                     .context_menu(move |menu, _, cx| {
                         let split = menu_app.read(cx).terminal_is_split(id);
                         terminal_menu(menu, &menu_app, &menu_drag, split, lang)
