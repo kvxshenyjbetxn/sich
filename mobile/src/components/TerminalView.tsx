@@ -1,7 +1,9 @@
 import { useEffect, useRef } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { ImageAddon } from "@xterm/addon-image";
 import "@xterm/xterm/css/xterm.css";
+import { imageAddonOptions } from "../lib/imageOptions";
 import { api } from "../api";
 import { WriteQueue, fontForWidth, pinchFont, type TermFrame } from "../lib/termLogic";
 import type { TermRef } from "../lib/types";
@@ -9,7 +11,8 @@ import { KittyApcFilter } from "../lib/kitty/apc";
 import { ImageStore, applyEvent } from "../lib/kitty/store";
 import { attachImageOverlay } from "../lib/kitty/overlay";
 
-export const FONT_FAMILY = '"Cascadia Mono", "JetBrains Mono", "DejaVu Mono", Menlo, monospace';
+import { FONT_FAMILY, loadTermFonts } from "../lib/fonts";
+export { FONT_FAMILY };
 
 // Colors from crates/app/src/colors.rs (Gray scheme).
 const THEME = {
@@ -117,7 +120,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
     const start = async () => {
       // Make sure the bundled font is ready before xterm measures cells.
       try {
-        await document.fonts.load(`${live.current.baseFont}px "JetBrains Mono"`);
+        await loadTermFonts(live.current.baseFont);
       } catch {
         /* measure with whatever is available */
       }
@@ -130,12 +133,17 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
         theme: THEME,
         cursorBlink: false,
         scrollback: 5000,
-        allowProposedApi: false,
+        allowProposedApi: true, // required by @xterm/addon-image
         disableStdin: false,
       });
       const f = new FitAddon();
       x.loadAddon(f);
       x.open(inner);
+      try {
+        x.loadAddon(new ImageAddon(imageAddonOptions()));
+      } catch (e) {
+        console.error("image addon failed to load", e);
+      }
       xRef.current = x;
       fitAddon.current = f;
       cleanups.push(attachImageOverlay(x, images, THEME.background));
@@ -155,6 +163,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
           live.current.onReset(frame.cols, frame.rows);
           layout.current();
         } else {
+          // Kitty APC graphics are lifted out here; OSC 1337 / Sixel still reach addon-image.
           const { out, events } = apc.feed(frame.bytes);
           for (const ev of events) applyEvent(images, ev);
           if (out.length > 0) xt.write(out);

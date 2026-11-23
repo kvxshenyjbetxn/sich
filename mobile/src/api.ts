@@ -1,6 +1,7 @@
 // Thin typed wrappers over the Rust core (src-tauri/src/commands.rs). No logic here.
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { bytesToBase64 } from "./lib/base64";
 import { parseFrame, type TermFrame } from "./lib/termLogic";
 import type { ConnState, Host, TermRef, Workspace } from "./lib/types";
 
@@ -35,9 +36,9 @@ export const api = {
   setFit: (term: TermRef, fit: boolean) => invoke<void>("set_fit", { term, fit }),
   markSeen: (term: TermRef) => invoke<void>("mark_seen", { term }),
 
-  /** Raw body = image bytes; the name travels percent-encoded in a header. Resolves to the upload id. */
+  /** Bytes travel base64-encoded in JSON args (Android IPC has no raw bodies). Resolves to the upload id. */
   uploadImage: (fileName: string, bytes: Uint8Array) =>
-    invoke<string>("upload_image", bytes, { headers: { "x-file-name": encodeURIComponent(fileName) } }),
+    invoke<string>("upload_image", { fileName, dataB64: bytesToBase64(bytes) }),
 };
 
 export interface TermSizeEvent {

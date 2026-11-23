@@ -1,3 +1,12 @@
+/* Block elements / a few symbols missing from the other bundled fonts (see scripts/check-glyphs.mjs). */
+@font-face {
+  font-family: "Noto Sans Math";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/noto-sans-math/files/noto-sans-math-latin-400-normal.woff2") format("woff2");
+  unicode-range: U+2580-259F, U+29C9;
+}
 :root {
   --bg: #1e1f22;
   --panel: #2b2d30;
@@ -615,4 +624,10 @@ textarea:focus {
 .seg-btn.on {
   background: var(--accent);
   color: var(--accent-text);
+}
+.upload-error {
+  color: var(--agent-failed);
+  font-size: 12px;
+  padding: 2px 4px 4px;
+  word-break: break-word;
 }

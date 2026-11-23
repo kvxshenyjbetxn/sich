@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use sich_remote_proto::{GatewayMsg, TermRef};
 
+use crate::kitty_to_iterm::KittyToIterm;
 use crate::outbox::{Outbox, Push};
 
 pub const RING_CAP: usize = 1024 * 1024;
@@ -68,14 +69,19 @@ impl ByteRing {
     }
 }
 
+/// The ring and the `Output.seq` values live in the coordinates of the transformed stream (Kitty
+/// graphics become iTerm2 sequences, so lengths differ from the daemon's). `daemon_end` tracks
+/// the daemon's own offsets only to skip re-subscribe replays.
 pub struct TermStream {
     ring: ByteRing,
     subs: HashMap<u64, Arc<Outbox>>,
+    filter: KittyToIterm,
+    daemon_end: Option<u64>,
 }
 
 impl Default for TermStream {
     fn default() -> Self {
-        Self { ring: ByteRing::new(RING_CAP), subs: HashMap::new() }
+        Self { ring: ByteRing::new(RING_CAP), subs: HashMap::new(), filter: KittyToIterm::default(), daemon_end: None }
     }
 }
 
@@ -113,7 +119,24 @@ impl TermStream {
     /// A daemon chunk: store it and forward to every watcher. A watcher whose queue is full gets
     /// its pending output dropped and a fresh Reset + replay of the ring (never blocks).
     pub fn feed(&mut self, term: &TermRef, seq: u64, bytes: &[u8], cols: u16, rows: u16) {
-        let Some((seq, fresh)) = self.ring.push_at(seq, bytes) else { return };
+        let end = seq + bytes.len() as u64;
+        let bytes = match self.daemon_end {
+            Some(have) if seq > have => {
+                // A gap: whatever the filter was holding is lost.
+                self.filter.reset_parser();
+                bytes
+            }
+            Some(have) if end <= have => return,
+            Some(have) if seq < have => &bytes[(have - seq) as usize..],
+            _ => bytes,
+        };
+        self.daemon_end = Some(end);
+        let transformed = self.filter.feed(bytes);
+        if transformed.is_empty() {
+            return;
+        }
+        let at = self.ring.end_seq();
+        let Some((seq, fresh)) = self.ring.push_at(at, &transformed) else { return };
         for outbox in self.subs.values() {
             let mut offset = 0;
             while offset < fresh.len() {
@@ -253,5 +276,32 @@ mod tests {
             })
             .collect();
         assert_eq!(sizes, vec![CHUNK, CHUNK, 5]);
+    }
+
+    #[test]
+    fn kitty_images_are_converted_before_the_ring_and_seq_follows_the_output() {
+        let mut s = TermStream::default();
+        let o = Arc::new(Outbox::default());
+        s.subscribe(&term(), 1, o.clone(), 80, 24, 0);
+        let png = b"\x89PNG\r\n\x1a\nxxxx";
+        let apc = format!("_Ga=T,f=100;{}\\", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png));
+        let mut input = b"hi ".to_vec();
+        input.extend(apc.as_bytes());
+        s.feed(&term(), 0, &input[..10], 80, 24);
+        s.feed(&term(), 10, &input[10..], 80, 24);
+        // A re-subscribe replay of known daemon bytes is ignored.
+        s.feed(&term(), 0, &input, 80, 24);
+        s.feed(&term(), input.len() as u64, b"!", 80, 24);
+        let msgs = drain(&o);
+        let got = outputs(&msgs);
+        assert!(got.starts_with(b"hi ]1337;File=inline=1;size=12;"));
+        assert!(got.ends_with(b"!"));
+        assert_eq!(got.iter().filter(|&&b| b == 0x07).count(), 1);
+        // Late phone: replay is the converted stream, seq starts at 0 in the new coordinates.
+        let late = Arc::new(Outbox::default());
+        s.subscribe(&term(), 2, late.clone(), 80, 24, 1 << 20);
+        let late_msgs = drain(&late);
+        assert_eq!(outputs(&late_msgs), got);
+        assert!(matches!(&late_msgs[1], GatewayMsg::Output { seq: 0, .. }));
     }
 }

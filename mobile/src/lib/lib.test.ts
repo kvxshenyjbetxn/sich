@@ -4,6 +4,10 @@ import { applyCtrl, ctrlChar, keySequence, toBytes } from "./keys";
 import { chooseOutput, fitWithin, hasAlpha, outputName } from "./image";
 import { canRetry, connDot, connLabel, rejectKey } from "./connLabels";
 import { agentLine, badgeFor, rollup } from "./agent";
+import { imageAddonOptions } from "./imageOptions";
+import { FONT_FAMILY, BUNDLED_FAMILIES } from "./fonts";
+import termGlyphs from "./termGlyphs.json";
+import { bytesToBase64 } from "./base64";
 import { allTerminals, buildTree, filterTree, normPath, samePath, sortTerminals, worktreeLabel } from "./workspaceTree";
 import { WriteQueue, clampFont, fontForWidth, parseFrame, pinchFont } from "./termLogic";
 import type { Agent, ConnState, Project, Terminal, Workspace } from "./types";
@@ -414,5 +418,46 @@ describe("termLogic", () => {
     expect(pinchFont(13, 100, 50)).toBe(7);
     expect(pinchFont(13, 100, 100)).toBe(13);
     expect(pinchFont(13, 0, 100)).toBe(13);
+  });
+});
+
+// ---- base64 ----
+describe("bytesToBase64", () => {
+  const sample = (n: number) => Uint8Array.from({ length: n }, (_, i) => (i * 31 + 7) & 255);
+  const decode = (b64: string) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  it("round-trips lengths incl. non-multiples of 3 and > 32 KiB", () => {
+    for (const n of [0, 1, 2, 3, 4, 5, 32765, 32766, 32767, 32768, 32769, 65533, 65537, 100000]) {
+      const b = sample(n);
+      expect(Array.from(decode(bytesToBase64(b)))).toEqual(Array.from(b));
+    }
+  });
+  it("matches known vectors", () => {
+    expect(bytesToBase64(new TextEncoder().encode("Man"))).toBe("TWFu");
+    expect(bytesToBase64(new TextEncoder().encode("Ma"))).toBe("TWE=");
+    expect(bytesToBase64(new Uint8Array())).toBe("");
+  });
+});
+
+// ---- image addon options ----
+describe("imageAddonOptions", () => {
+  it("enables IIP and Sixel with sane limits", () => {
+    const o = imageAddonOptions();
+    expect(o.iipSupport).toBe(true);
+    expect(o.sixelSupport).toBe(true);
+    expect(o.showPlaceholder).toBe(true);
+    expect(o.pixelLimit).toBe(16_777_216);
+    expect(o.storageLimit).toBe(64);
+  });
+});
+
+// ---- terminal fonts ----
+describe("terminal font stack", () => {
+  it("lists bundled fallbacks after the primary mono font, ending in monospace", () => {
+    expect(FONT_FAMILY.indexOf('"JetBrains Mono"')).toBeLessThan(FONT_FAMILY.indexOf('"Noto Sans Symbols 2"'));
+    for (const f of BUNDLED_FAMILIES) expect(FONT_FAMILY).toContain(f);
+    expect(FONT_FAMILY.endsWith("monospace")).toBe(true);
+  });
+  it("glyph list covers what agent CLIs print", () => {
+    for (const g of ["⏵", "⏺", "⎿", "✻", "█", "⚠", "…"]) expect(termGlyphs).toContain(g);
   });
 });
