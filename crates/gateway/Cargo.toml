@@ -26,3 +26,5 @@ dirs.workspace = true
 rand = "0.9"
 base64 = "0.22"
 tempfile = "3"
+flate2 = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }

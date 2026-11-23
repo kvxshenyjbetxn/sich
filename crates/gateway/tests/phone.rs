@@ -710,3 +710,36 @@ async fn second_gateway_exits_and_takeover_replaces_the_first() {
     h.gateway = Some(second);
     h.stop().await;
 }
+
+// Not on Windows: ConPTY swallows APC sequences before the daemon sees them (the conversion
+// itself is covered by the `kitty_to_iterm` and `stream` unit tests).
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kitty_graphics_reach_the_phone_as_an_iterm_inline_image() {
+    use base64::Engine as _;
+    let h = Harness::start().await;
+    let dir = TempDir::new().unwrap();
+    let image = png();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&image);
+    let mut data = b"KITTY_BEGIN\n\x1b_Ga=t,f=100,i=7,U=1,q=2;".to_vec();
+    data.extend_from_slice(b64.as_bytes());
+    data.extend_from_slice(b"\x1b\\\x1b_Ga=p,U=1,i=7,c=4,r=2\x1b\\\x1b_Ga=T,f=100;");
+    data.extend_from_slice(b64.as_bytes());
+    data.extend_from_slice(b"\x1b\\\nKITTY_END\n");
+    let file = dir.path().join("kitty.bin");
+    std::fs::write(&file, &data).unwrap();
+    let file = file.to_string_lossy().into_owned();
+    let (shell, args): (&str, Vec<String>) = ("/bin/sh", vec!["-c".into(), format!("cat '{file}'")]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let term = h.create_terminal(shell, &args, 80, 24).await;
+    let (mut phone, _) = h.paired_phone("Imager").await;
+    phone.workspace_with(&term).await;
+    phone.subscribe(&term, 80, 24, false).await;
+    let out = phone.output_until(&term, b"KITTY_END").await;
+    let want = format!("\x1b]1337;File=inline=1;size={};preserveAspectRatio=1:{b64}\x07", image.len());
+    assert!(contains(&out, want.as_bytes()), "iTerm2 sequence missing in {:?}", String::from_utf8_lossy(&out));
+    let normalized = format!("\x1b_Ga=t,f=100,t=d,q=2,i=7,m=0;{b64}\x1b\\\x1b_Ga=p,U=1,q=2,i=7,c=4,r=2\x1b\\");
+    assert!(contains(&out, normalized.as_bytes()), "normalized APC missing in {:?}", String::from_utf8_lossy(&out));
+    assert!(!contains(&out, b"i=7,U=1"), "original control data must not leak");
+    h.stop().await;
+}
