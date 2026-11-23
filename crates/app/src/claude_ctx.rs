@@ -30,6 +30,8 @@ pub(crate) struct StatusFile {
     pub term_id: Option<String>,
     pub socket: Option<String>,
     pub updated_ms: Option<u64>,
+    pub cwd: Option<String>,
+    pub transcript_path: Option<String>,
     pub model_name: Option<String>,
     pub model_id: Option<String>,
     pub effort: Option<String>,
@@ -75,6 +77,8 @@ pub(crate) struct ModFile {
     pub snapshot: Option<ModSnapshot>,
     #[serde(rename = "agentRuns")]
     pub agent_runs: Vec<AgentRun>,
+    pub cwd: Option<String>,
+    pub root: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
@@ -88,6 +92,7 @@ pub(crate) struct ModSnapshot {
     pub mcp: Vec<McpItem>,
     pub memory: Vec<MemoryItem>,
     pub skills: Option<SkillsInfo>,
+    pub agents: Vec<AgentItem>,
     pub at: Option<u64>,
 }
 
@@ -114,6 +119,8 @@ pub(crate) struct McpItem {
 pub(crate) struct MemoryItem {
     pub name: String,
     pub detail: Option<String>,
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
     pub tokens: u64,
 }
 
@@ -129,6 +136,18 @@ pub(crate) struct SkillsInfo {
 #[serde(default)]
 pub(crate) struct SkillItem {
     pub name: String,
+    /// Providing plugin name.
+    pub detail: Option<String>,
+    /// Engine source word (`userSettings`, `plugin`, ...).
+    pub source: Option<String>,
+    pub tokens: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub(crate) struct AgentItem {
+    pub name: String,
+    pub source: Option<String>,
     pub tokens: u64,
 }
 
@@ -195,7 +214,11 @@ pub(crate) struct CtxView {
     pub mcp: Vec<McpItem>,
     pub memory: Vec<MemoryItem>,
     pub skills: Option<SkillsInfo>,
+    pub agents: Vec<AgentItem>,
     pub runs: Vec<AgentRun>,
+    /// Session directory (mod `root`, else mod `cwd`, else status `cwd`).
+    pub root: Option<PathBuf>,
+    pub transcript_path: Option<PathBuf>,
     pub cost_usd: Option<f64>,
     pub duration_ms: Option<u64>,
     pub api_duration_ms: Option<u64>,
@@ -239,6 +262,13 @@ pub(crate) fn fallback_categories(current: Option<&CurrentUsage>, max: Option<u6
         out.push(Category { name: "Free".into(), tokens: max - used, color: None, kind: CatKind::Free });
     }
     out
+}
+
+/// The session directory: the mod's `root`, else its `cwd`, else the status line's `cwd`.
+fn session_root(status: Option<&StatusFile>, modf: Option<&ModFile>) -> Option<PathBuf> {
+    modf.and_then(|m| non_blank(&m.root).or_else(|| non_blank(&m.cwd)))
+        .or_else(|| status.and_then(|s| non_blank(&s.cwd)))
+        .map(PathBuf::from)
 }
 
 /// Merges the two files of one session. `None` when there is nothing to show.
@@ -288,6 +318,9 @@ pub(crate) fn merge(session_id: &str, status: Option<&StatusFile>, modf: Option<
         mcp: snap.map(|s| s.mcp.clone()).unwrap_or_default(),
         memory: snap.map(|s| s.memory.clone()).unwrap_or_default(),
         skills: snap.and_then(|s| s.skills.clone()),
+        agents: snap.map(|s| s.agents.clone()).unwrap_or_default(),
+        root: session_root(status, modf),
+        transcript_path: status.and_then(|s| non_blank(&s.transcript_path)).map(PathBuf::from),
         runs: modf.map(|m| m.agent_runs.clone()).unwrap_or_default(),
         cost_usd: status.and_then(|s| s.cost_usd),
         duration_ms: status.and_then(|s| s.duration_ms),
@@ -640,6 +673,52 @@ mod tests {
             assert!(parse_status(bad).is_none(), "{bad}");
         }
         assert!(parse_mod("garbage").is_none());
+    }
+
+    const MOD_NEW: &str = r#"{ "sessionId":"abc", "cwd":"C:/w/sub", "root":"C:/w",
+        "snapshot":{ "rows":[],
+          "memory":[{"name":"CLAUDE.md","detail":"C:/w/CLAUDE.md","type":"Project","tokens":10}],
+          "skills":{"count":1,"tokens":5,"items":[{"name":"p:s","detail":"p","source":"plugin","tokens":5}]},
+          "agents":[{"name":"scout","source":"userSettings","tokens":7}] } }"#;
+
+    #[test]
+    fn parses_new_optional_fields_and_old_files_without_them() {
+        let m = parse_mod(MOD_NEW).unwrap();
+        assert_eq!(m.root.as_deref(), Some("C:/w"));
+        assert_eq!(m.cwd.as_deref(), Some("C:/w/sub"));
+        let snap = m.snapshot.unwrap();
+        assert_eq!(snap.memory[0].kind.as_deref(), Some("Project"));
+        let skill = &snap.skills.unwrap().items[0];
+        assert_eq!((skill.detail.as_deref(), skill.source.as_deref()), (Some("p"), Some("plugin")));
+        assert_eq!(snap.agents, [AgentItem { name: "scout".into(), source: Some("userSettings".into()), tokens: 7 }]);
+        // The previous format still parses, the new fields are simply empty.
+        let old = parse_mod(MOD).unwrap();
+        assert_eq!(old.root, None);
+        let snap = old.snapshot.unwrap();
+        assert!(snap.agents.is_empty());
+        assert_eq!(snap.memory[0].kind, None);
+        assert_eq!(snap.skills.unwrap().items[0].source, None);
+        let s = parse_status(r#"{"cwd":"C:/s","transcript_path":"C:/t/a.jsonl"}"#).unwrap();
+        assert_eq!(s.transcript_path.as_deref(), Some("C:/t/a.jsonl"));
+        assert_eq!(parse_status(STATUS).unwrap().transcript_path, None);
+    }
+
+    #[test]
+    fn merge_exposes_root_agents_and_transcript() {
+        let m = parse_mod(MOD_NEW).unwrap();
+        let s = parse_status(r#"{"cwd":"C:/status","transcript_path":"C:/t/a.jsonl"}"#).unwrap();
+        let v = merge("abc", Some(&s), Some(&m)).unwrap();
+        assert_eq!(v.root, Some(PathBuf::from("C:/w")));
+        assert_eq!(v.agents.len(), 1);
+        assert_eq!(v.transcript_path, Some(PathBuf::from("C:/t/a.jsonl")));
+        // Root falls back to the mod cwd, then to the status cwd.
+        let no_root = ModFile { root: None, ..m.clone() };
+        assert_eq!(merge("abc", None, Some(&no_root)).unwrap().root, Some(PathBuf::from("C:/w/sub")));
+        let bare = ModFile::default();
+        assert_eq!(merge("abc", Some(&s), Some(&bare)).unwrap().root, Some(PathBuf::from("C:/status")));
+        assert_eq!(merge("abc", None, Some(&bare)).unwrap().root, None);
+        let blank = ModFile { root: Some("  ".into()), ..Default::default() };
+        assert_eq!(merge("abc", None, Some(&blank)).unwrap().root, None);
     }
 
     #[test]

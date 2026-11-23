@@ -207,14 +207,16 @@ async function measure($: EngineInterface): Promise<void> {
         }))
         // Loaded tools (really in the context) first, then the deferred ones.
         .sort((a, b) => Number(b.loaded) - Number(a.loaded) || byTokens(a, b)),
-      memory: b.memoryFiles.map(f => ({ name: baseName(f.path), detail: f.path, tokens: f.tokens })),
+      memory: b.memoryFiles.map(f => ({ name: baseName(f.path), detail: f.path, type: f.type, tokens: f.tokens })),
       skills: {
         count: b.skills?.totalSkills ?? 0,
         tokens: b.skills?.tokens ?? 0,
         items: (b.skills?.skillFrontmatter ?? [])
-          .map(k => ({ name: k.name, detail: k.pluginName, tokens: k.tokens }))
+          .map(k => ({ name: k.name, detail: k.pluginName, source: k.source, tokens: k.tokens }))
           .sort(byTokens),
       },
+      // Custom agents (built-in ones are left out by the engine).
+      agents: (b.agents ?? []).map(a => ({ name: a.agentType, source: a.source, tokens: a.tokens })).sort(byTokens),
       detail: 'summary',
       at: await $.clock.now(),
     }

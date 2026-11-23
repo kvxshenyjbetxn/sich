@@ -1,5 +1,6 @@
 export type CtxRow = { name: string; tokens: number; color: string; kind: 'used' | 'free' | 'buffer' | 'deferred' }
-export type CtxItem = { name: string; detail?: string; tokens: number; loaded?: boolean }
+/** `detail`: MCP server, memory file path or skill plugin name. `type`: memory kind; `source`: engine source word. */
+export type CtxItem = { name: string; detail?: string; type?: string; source?: string; tokens: number; loaded?: boolean }
 export type CtxSnapshot = {
   model: string
   total: number
@@ -9,6 +10,8 @@ export type CtxSnapshot = {
   mcp: CtxItem[]
   memory: CtxItem[]
   skills: { count: number; tokens: number; items: CtxItem[] }
+  /** Custom agents: `name` is the agent type. Optional: older exports lack it. */
+  agents?: CtxItem[]
   detail: 'summary' | 'full'
   at: number
 }

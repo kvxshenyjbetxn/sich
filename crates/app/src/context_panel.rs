@@ -21,6 +21,7 @@ use crate::app_view::AppView;
 use crate::claude_ctx::{
     self, AgentRun, CatKind, Category, CtxView, Loader, Target, Tone, format_tokens, percent_label, percent_of,
 };
+use crate::ctx_files::{self, Env, Item, ResolveCache, Resolved};
 use crate::daemon_client::TerminalOwner;
 use crate::i18n::{Language, Tr, tr};
 use crate::workspace::WorkspaceKey;
@@ -38,6 +39,7 @@ pub(crate) enum Section {
     Mcp,
     Memory,
     Skills,
+    Agents,
 }
 
 impl Section {
@@ -264,6 +266,8 @@ pub(crate) struct ContextUi {
     views: HashMap<TermId, CtxView>,
     pins: Vec<(WorkspaceKey, TermId)>,
     toggled: HashSet<Section>,
+    /// Files of the panel items that exist on disk (see `ctx_files`).
+    resolved: HashMap<Item, Resolved>,
 }
 
 impl ContextUi {
@@ -286,6 +290,13 @@ impl ContextUi {
         if !self.toggled.remove(&section) {
             self.toggled.insert(section);
         }
+    }
+
+    /// Replaces the resolved files; true when anything changed.
+    fn set_resolved(&mut self, resolved: HashMap<Item, Resolved>) -> bool {
+        let changed = self.resolved != resolved;
+        self.resolved = resolved;
+        changed
     }
 
     /// Replaces the data; true when anything changed.
@@ -313,6 +324,7 @@ impl ContextUi {
             .detach();
         cx.spawn_in(window, async move |view, cx| {
             let mut loader = Loader::default();
+            let mut cache = ResolveCache::default();
             loop {
                 let timer = cx.background_executor().timer(POLL).fuse();
                 let wakeup = rx.recv().fuse();
@@ -337,17 +349,22 @@ impl ContextUi {
                     }
                     continue;
                 };
-                let (next, views) = cx
+                let (next, next_cache, views) = cx
                     .background_executor()
                     .spawn(async move {
                         let views = loader.load(&dir, &targets);
-                        (loader, views)
+                        let mut cache = cache;
+                        refresh_resolved(&mut cache, views.values(), claude_ctx::now_ms());
+                        (loader, cache, views)
                     })
                     .await;
                 loader = next;
+                let resolved = next_cache.snapshot();
+                cache = next_cache;
                 if view
                     .update(cx, |view, cx| {
-                        if view.ctx_ui.replace(views) {
+                        let changed = view.ctx_ui.replace(views);
+                        if view.ctx_ui.set_resolved(resolved) || changed {
                             cx.notify();
                         }
                     })
@@ -359,6 +376,20 @@ impl ContextUi {
         })
         .detach();
     }
+}
+
+/// Resolves the items that are new or stale in `cache` (blocking file reads: background only).
+fn refresh_resolved<'a>(cache: &mut ResolveCache, views: impl Iterator<Item = &'a CtxView>, now_ms: u64) {
+    let items: Vec<Item> = views.flat_map(ctx_files::items_of).collect();
+    let due = cache.due(&items, now_ms);
+    if due.is_empty() {
+        return;
+    }
+    let results = match Env::from_system() {
+        Some(env) => ctx_files::resolve_all(&env, due, &|path| path.is_file()),
+        None => due.into_iter().map(|item| (item, None)).collect(),
+    };
+    cache.store(results, now_ms);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -444,6 +475,7 @@ fn label_key(section: Section) -> Tr {
         Section::Mcp => Tr::CtxMcp,
         Section::Memory => Tr::CtxMemory,
         Section::Skills => Tr::CtxSkills,
+        Section::Agents => Tr::CtxAgents,
     }
 }
 
@@ -554,23 +586,92 @@ fn render_runs(view: &CtxView, lang: Language, theme: &Theme) -> AnyElement {
     v_flex().w_full().gap_1p5().pl_4().children(rows).into_any_element()
 }
 
-fn render_mcp(view: &CtxView, theme: &Theme) -> AnyElement {
-    let rows = view.mcp.iter().map(|item| {
+/// What the popup menu of a file row can do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileAction {
+    OpenInTab,
+    OpenDefault,
+    Reveal,
+    CopyPath,
+}
+
+/// The menu entries in order, with their labels.
+pub(crate) const FILE_ACTIONS: [(FileAction, Tr); 4] = [
+    (FileAction::OpenInTab, Tr::CtxOpenInTab),
+    (FileAction::OpenDefault, Tr::CtxOpenDefault),
+    (FileAction::Reveal, Tr::CtxShowInFolder),
+    (FileAction::CopyPath, Tr::CtxCopyPath),
+];
+
+impl AppView {
+    pub(crate) fn run_file_action(&mut self, action: FileAction, file: &Resolved, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            FileAction::OpenInTab => self.open_file_tab(file.path.clone(), file.read_only, window, cx),
+            FileAction::OpenDefault => crate::os::open_default(&file.path),
+            FileAction::Reveal => crate::os::reveal_in_file_manager(&file.path),
+            FileAction::CopyPath => {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(file.path.display().to_string()));
+            }
+        }
+    }
+}
+
+/// A row that opens a menu when its item resolves to a file; plain content otherwise.
+fn file_row(
+    id: String,
+    content: Div,
+    item: Option<&Item>,
+    ui: &ContextUi,
+    lang: Language,
+    cx: &Context<AppView>,
+) -> AnyElement {
+    let Some(file) = item.and_then(|item| ui.resolved.get(item)).cloned() else {
+        return content.into_any_element();
+    };
+    let app = cx.weak_entity();
+    Button::new(gpui_kit::SharedString::from(id))
+        .ghost()
+        .xsmall()
+        .w_full()
+        .h_auto()
+        .py_0p5()
+        .justify_start()
+        .tooltip(file.path.display().to_string())
+        .child(content.w_full())
+        .dropdown_menu(move |menu, _, _| {
+            let mut menu = menu;
+            for (action, label) in FILE_ACTIONS {
+                let (app, file) = (app.clone(), file.clone());
+                menu = menu.item(PopupMenuItem::new(tr(lang, label)).on_click(
+                    move |_: &ClickEvent, window: &mut Window, cx: &mut gpui_kit::App| {
+                        let _ = app.update(cx, |this, cx| this.run_file_action(action, &file, window, cx));
+                    },
+                ));
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+fn render_mcp(view: &CtxView, ui: &ContextUi, lang: Language, theme: &Theme, cx: &Context<AppView>) -> AnyElement {
+    let root = view.root.as_deref();
+    let rows = view.mcp.iter().enumerate().map(|(index, item)| {
         let label = match item.detail.as_deref().filter(|d| !d.is_empty()) {
             Some(server) => format!("{} · {server}", item.name),
             None => item.name.clone(),
         };
-        muted_row(theme)
+        let row = muted_row(theme)
             .text_color(if item.loaded { theme.foreground } else { theme.muted_foreground })
             .child(name_cell(label))
-            .child(div().flex_shrink_0().child(format_tokens(item.tokens)))
+            .child(div().flex_shrink_0().child(format_tokens(item.tokens)));
+        file_row(format!("ctx-mcp-{index}"), row, ctx_files::mcp_item(item, root).as_ref(), ui, lang, cx)
     });
     v_flex().w_full().gap_1().pl_4().children(rows).into_any_element()
 }
 
-fn render_memory(view: &CtxView, theme: &Theme) -> AnyElement {
-    let rows = view.memory.iter().map(|item| {
-        v_flex()
+fn render_memory(view: &CtxView, ui: &ContextUi, lang: Language, theme: &Theme, cx: &Context<AppView>) -> AnyElement {
+    let rows = view.memory.iter().enumerate().map(|(index, item)| {
+        let row = v_flex()
             .w_full()
             .child(
                 h_flex().w_full().gap_2().text_size(px(12.))
@@ -579,14 +680,29 @@ fn render_memory(view: &CtxView, theme: &Theme) -> AnyElement {
             )
             .children(item.detail.clone().filter(|d| !d.is_empty()).map(|path| {
                 div().w_full().truncate().text_size(px(11.)).text_color(theme.muted_foreground).child(path)
-            }))
+            }));
+        file_row(format!("ctx-mem-{index}"), row, ctx_files::memory_item(item).as_ref(), ui, lang, cx)
     });
     v_flex().w_full().gap_1p5().pl_4().children(rows).into_any_element()
 }
 
-fn render_skills(view: &CtxView, theme: &Theme) -> AnyElement {
-    let rows = view.skills.iter().flat_map(|s| s.items.iter()).map(|item| {
-        muted_row(theme).child(name_cell(item.name.clone())).child(div().flex_shrink_0().child(format_tokens(item.tokens)))
+fn render_skills(view: &CtxView, ui: &ContextUi, lang: Language, theme: &Theme, cx: &Context<AppView>) -> AnyElement {
+    let root = view.root.as_deref();
+    let rows = view.skills.iter().flat_map(|s| s.items.iter()).enumerate().map(|(index, item)| {
+        let row = muted_row(theme).child(name_cell(item.name.clone())).child(div().flex_shrink_0().child(format_tokens(item.tokens)));
+        file_row(format!("ctx-skill-{index}"), row, Some(&ctx_files::skill_item(item, root)), ui, lang, cx)
+    });
+    v_flex().w_full().gap_1().pl_4().children(rows).into_any_element()
+}
+
+fn render_agents(view: &CtxView, ui: &ContextUi, lang: Language, theme: &Theme, cx: &Context<AppView>) -> AnyElement {
+    let root = view.root.as_deref();
+    let rows = view.agents.iter().enumerate().map(|(index, item)| {
+        let source = item.source.as_deref().filter(|s| !s.is_empty()).map(|s| format!("{} · {s}", item.name));
+        let row = muted_row(theme)
+            .child(name_cell(source.unwrap_or_else(|| item.name.clone())))
+            .child(div().flex_shrink_0().child(format_tokens(item.tokens)));
+        file_row(format!("ctx-agent-{index}"), row, Some(&ctx_files::agent_item(item, root)), ui, lang, cx)
     });
     v_flex().w_full().gap_1().pl_4().children(rows).into_any_element()
 }
@@ -597,29 +713,33 @@ fn session_line(label: &'static str, value: String, theme: &Theme) -> Div {
         .child(div().flex_shrink_0().child(value))
 }
 
-fn render_session(view: &CtxView, lang: Language, theme: &Theme) -> AnyElement {
-    let mut lines = Vec::new();
+fn render_session(view: &CtxView, ui: &ContextUi, lang: Language, theme: &Theme, cx: &Context<AppView>) -> AnyElement {
+    let mut lines: Vec<AnyElement> = Vec::new();
     if let Some(cost) = view.cost_usd {
-        lines.push(session_line(tr(lang, Tr::CtxCost), format!("${cost:.2}"), theme));
+        lines.push(session_line(tr(lang, Tr::CtxCost), format!("${cost:.2}"), theme).into_any_element());
     }
     if let Some(ms) = view.duration_ms {
-        lines.push(session_line(tr(lang, Tr::CtxDuration), span_text(lang, ms / 1000), theme));
+        lines.push(session_line(tr(lang, Tr::CtxDuration), span_text(lang, ms / 1000), theme).into_any_element());
     }
     if let Some(ms) = view.api_duration_ms {
-        lines.push(session_line(tr(lang, Tr::CtxApiDuration), span_text(lang, ms / 1000), theme));
+        lines.push(session_line(tr(lang, Tr::CtxApiDuration), span_text(lang, ms / 1000), theme).into_any_element());
     }
     if view.lines_added.is_some() || view.lines_removed.is_some() {
         let text = format!("+{} / \u{2212}{}", view.lines_added.unwrap_or(0), view.lines_removed.unwrap_or(0));
-        lines.push(session_line(tr(lang, Tr::CtxLines), text, theme));
+        lines.push(session_line(tr(lang, Tr::CtxLines), text, theme).into_any_element());
     }
     if let Some(cache) = &view.cache {
         let mut parts = vec![tr(lang, if cache.warm == Some(true) { Tr::CtxCacheWarm } else { Tr::CtxCacheCold }).to_string()];
         parts.extend(cache.ttl.clone().filter(|t| !t.is_empty()));
         parts.extend(cache.hit_ratio.map(|r| format!("{}%", (r * 100.).round().clamp(0., 100.) as u32)));
-        lines.push(session_line(tr(lang, Tr::CtxCache), parts.join(" · "), theme));
+        lines.push(session_line(tr(lang, Tr::CtxCache), parts.join(" · "), theme).into_any_element());
     }
     if !view.session_id.is_empty() {
-        lines.push(session_line(tr(lang, Tr::CtxSessionId), view.session_id.chars().take(8).collect(), theme));
+        lines.push(session_line(tr(lang, Tr::CtxSessionId), view.session_id.chars().take(8).collect(), theme).into_any_element());
+    }
+    if let Some(path) = &view.transcript_path {
+        let line = session_line(tr(lang, Tr::CtxTranscript), crate::file_doc::file_name(path), theme);
+        lines.push(file_row("ctx-transcript".into(), line, Some(&Item::Transcript(path.clone())), ui, lang, cx));
     }
     v_flex().w_full().gap_1().children(lines).into_any_element()
 }
@@ -711,7 +831,7 @@ pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx
             } else if !view.detailed {
                 out.push(div().text_size(px(11.)).text_color(theme.muted_foreground).child(tr(lang, Tr::CtxNoMod)).into_any_element());
             }
-            let sections: [(Section, &'static str, String, bool); 4] = [
+            let sections: [(Section, &'static str, String, bool); 5] = [
                 (Section::Subagents, "ctx-sec-runs", view.runs.len().to_string(), !view.runs.is_empty()),
                 (
                     Section::Mcp,
@@ -732,6 +852,7 @@ pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx
                     }),
                     view.skills.as_ref().is_some_and(|s| s.count.unwrap_or(0) > 0 || !s.items.is_empty()),
                 ),
+                (Section::Agents, "ctx-sec-agents", view.agents.len().to_string(), !view.agents.is_empty()),
             ];
             for (section, id, count, present) in sections {
                 if !present {
@@ -742,14 +863,15 @@ pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx
                 if open {
                     out.push(match section {
                         Section::Subagents => render_runs(view, lang, theme),
-                        Section::Mcp => render_mcp(view, theme),
-                        Section::Memory => render_memory(view, theme),
-                        Section::Skills => render_skills(view, theme),
+                        Section::Mcp => render_mcp(view, ui, lang, theme, cx),
+                        Section::Memory => render_memory(view, ui, lang, theme, cx),
+                        Section::Skills => render_skills(view, ui, lang, theme, cx),
+                        Section::Agents => render_agents(view, ui, lang, theme, cx),
                     });
                 }
             }
             out.push(divider(tr(lang, Tr::CtxSession), theme).into_any_element());
-            out.push(render_session(view, lang, theme));
+            out.push(render_session(view, ui, lang, theme, cx));
             out
         }
     };
@@ -850,6 +972,40 @@ mod tests {
         assert!(section_open(Section::Mcp, &ui.toggled));
         ui.toggle(Section::Mcp);
         assert!(!section_open(Section::Mcp, &ui.toggled));
+    }
+
+    #[test]
+    fn agents_section_starts_collapsed_and_file_menu_is_complete() {
+        assert!(!section_open(Section::Agents, &HashSet::new()));
+        assert!(section_open(Section::Agents, &HashSet::from([Section::Agents])));
+        assert_eq!(label_key(Section::Agents), Tr::CtxAgents);
+        let actions: Vec<_> = FILE_ACTIONS.iter().map(|(a, _)| *a).collect();
+        assert_eq!(actions, [FileAction::OpenInTab, FileAction::OpenDefault, FileAction::Reveal, FileAction::CopyPath]);
+        for (_, label) in FILE_ACTIONS {
+            for lang in Language::ALL {
+                assert!(!tr(lang, label).trim().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_files_replace_reports_changes_only() {
+        let mut ui = ContextUi::default();
+        let file = Resolved { path: "/a.md".into(), read_only: false };
+        let map = HashMap::from([(Item::Memory("/a.md".into()), file)]);
+        assert!(ui.set_resolved(map.clone()));
+        assert!(!ui.set_resolved(map));
+        assert!(ui.set_resolved(HashMap::new()));
+    }
+
+    #[test]
+    fn refresh_resolved_only_touches_due_items() {
+        let mut cache = ResolveCache::default();
+        let view = CtxView { transcript_path: Some("/no/such/dir/s.jsonl".into()), ..Default::default() };
+        refresh_resolved(&mut cache, [&view].into_iter(), 1_000);
+        assert!(cache.snapshot().is_empty());
+        assert!(cache.due(&ctx_files::items_of(&view), 1_000).is_empty());
+        assert_eq!(cache.due(&ctx_files::items_of(&view), 1_000 + ctx_files::RESOLVE_TTL_MS).len(), 1);
     }
 
     #[test]

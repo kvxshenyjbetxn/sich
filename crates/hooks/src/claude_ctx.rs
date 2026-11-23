@@ -55,6 +55,9 @@ pub struct CtxStatus {
     pub socket: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Absolute path of the session transcript (`.jsonl`), when Claude reports it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     pub updated_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -98,6 +101,7 @@ impl Default for CtxStatus {
             term_id: None,
             socket: None,
             cwd: None,
+            transcript_path: None,
             updated_ms: 0,
             version: None,
             model_id: None,
@@ -188,6 +192,7 @@ pub fn status_from_payload(
         term_id,
         socket,
         cwd: text(&payload["cwd"]),
+        transcript_path: text(&payload["transcript_path"]).filter(|p| !p.trim().is_empty()),
         updated_ms: now_ms,
         version: text(&payload["version"]),
         model_id: text(&payload["model"]["id"]),
@@ -300,6 +305,26 @@ mod tests {
         assert_eq!(out["current"]["cache_read"], 55613);
         assert_eq!(out["cache"]["expires_at"], 1795400300);
         assert!(out.get("remaining_percentage").is_none());
+    }
+
+    #[test]
+    fn transcript_path_is_optional_and_kept_verbatim() {
+        let mut payload = sample();
+        let none = status_from_payload(&payload, None, None, 1).unwrap();
+        assert_eq!(none.transcript_path, None);
+        assert!(serde_json::to_value(&none).unwrap().get("transcript_path").is_none());
+        payload["transcript_path"] = json!("C:/Users/me/.claude/projects/x/abc-123.jsonl");
+        let s = status_from_payload(&payload, None, None, 1).unwrap();
+        assert_eq!(s.transcript_path.as_deref(), Some("C:/Users/me/.claude/projects/x/abc-123.jsonl"));
+        let back: CtxStatus = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+        for bad in [json!(""), json!("  "), json!(5), json!(null)] {
+            payload["transcript_path"] = bad;
+            assert_eq!(status_from_payload(&payload, None, None, 1).unwrap().transcript_path, None);
+        }
+        // A status file written before the field existed still parses.
+        let old: CtxStatus = serde_json::from_str(r#"{"session_id":"x","cwd":"/w"}"#).unwrap();
+        assert_eq!(old.transcript_path, None);
     }
 
     #[test]

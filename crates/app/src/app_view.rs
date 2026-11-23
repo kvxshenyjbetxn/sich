@@ -27,6 +27,7 @@ use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::context_panel::{self, ContextUi};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonPool, RestartResult, RestoreData, Snapshot};
 use crate::diff_view::DiffView;
+use crate::file_view::FileView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
 use crate::i18n::{self, Tr, tr};
 use crate::notifications;
@@ -100,11 +101,13 @@ struct PendingTerminalOpen {
 pub(crate) enum TabKey {
     Diff(CompareKey),
     Activity(ActivityTarget),
+    File(PathBuf),
 }
 
 pub(crate) enum TabView {
     Diff(Entity<DiffView>),
     Activity(Entity<ActivityView>),
+    File(Entity<FileView>),
 }
 
 pub struct AppView {
@@ -456,7 +459,7 @@ impl AppView {
             let previous = tabs.active;
             let removed = tabs.close_where(|tab| match &tab.view {
                 TabView::Activity(view) => due_for_close(view.read(cx).auto_close_state(enabled), now_ms),
-                TabView::Diff(_) => false,
+                TabView::Diff(_) | TabView::File(_) => false,
             });
             if removed && workspace == &self.ws.selected {
                 selected_changed = true;
@@ -1171,7 +1174,7 @@ impl AppView {
     fn sync_diff_highlight(&self, cx: &mut Context<Self>) {
         let key = self.active_tab().and_then(|tab| match &tab.key {
             TabKey::Diff(key) => Some(key.clone()),
-            TabKey::Activity(_) => None,
+            TabKey::Activity(_) | TabKey::File(_) => None,
         });
         self.git_panel.update(cx, |panel, cx| panel.set_active_diff(key, cx));
     }
@@ -1313,6 +1316,23 @@ impl AppView {
         self.activate_tab(id, window, cx);
     }
 
+    /// Opens (or focuses) the editor tab of `path` in the current workspace.
+    pub(crate) fn open_file_tab(&mut self, path: PathBuf, read_only: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let key = TabKey::File(crate::file_doc::tab_path(&path));
+        let id = self.next_tab_id;
+        let tabs = self.workspace_tabs.entry(self.ws.selected.clone()).or_default();
+        let tab = tabs.open(id, key, || TabView::File(cx.new(|cx| FileView::new(path, read_only, window, cx))));
+        let opened = tab.id;
+        if opened == id {
+            self.next_tab_id += 1;
+            // The tab title shows the dirty mark.
+            if let TabView::File(view) = &tab.view {
+                cx.observe(view, |_, _, cx| cx.notify()).detach();
+            }
+        }
+        self.activate_tab(opened, window, cx);
+    }
+
     pub(crate) fn activate_tab(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tabs) = self.workspace_tabs.get_mut(&self.ws.selected) {
             tabs.activate(id);
@@ -1336,6 +1356,7 @@ impl AppView {
         match &tab.view {
             TabView::Diff(view) => view.update(cx, |view, cx| view.focus(window, cx)),
             TabView::Activity(view) => view.update(cx, |view, cx| view.focus(window, cx)),
+            TabView::File(view) => view.update(cx, |view, cx| view.focus(window, cx)),
         }
         // Terminal tabs are rendered before the other workspace tabs.
         let terminals = self.client.snapshot().terminals.iter()
@@ -1942,6 +1963,7 @@ impl AppView {
         let content = match (tab.map(|tab| &tab.view), layout) {
             (Some(TabView::Diff(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
             (Some(TabView::Activity(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
+            (Some(TabView::File(view)), _) => div().flex_1().min_h_0().w_full().child(view.clone()),
             (None, Some(layout)) => {
                 div().relative().flex_1().min_h_0().w_full()
                     .child(self.render_split_node(layout, Vec::new(), snap, false, lang, cx))

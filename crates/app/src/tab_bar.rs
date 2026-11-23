@@ -195,6 +195,16 @@ impl AppView {
                             agent_icon_element(target.key.agent, 13., theme.foreground, theme.muted_foreground),
                             Tr::ActivityClose)
                     }
+                    (TabKey::File(path), TabView::File(view)) => {
+                        let view = view.read(cx);
+                        let mut name = crate::file_doc::file_name(path);
+                        if view.is_dirty() {
+                            name.push_str(" {25CF}");
+                        }
+                        let source = tr(lang, Tr::FileTab);
+                        (SharedString::from(name), SharedString::from(source), view.path().display().to_string(),
+                            Icon::new(Ic::FileText).size(px(13.)).flex_shrink_0().into_any_element(), Tr::FileClose)
+                    }
                     _ => unreachable!("workspace tab key and view must match"),
                 };
                 let tooltip = SharedString::from(tooltip);
