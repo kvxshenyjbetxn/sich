@@ -517,6 +517,22 @@ pub enum Tr {
     // ---- end prwt ----
 
     // ---- notes keys: append below ----
+    NotesTitle,
+    NotesAdd,
+    NotesPlaceholder,
+    NotesSave,
+    NotesSend,
+    NotesCopyAll,
+    NotesCopy,
+    NotesEdit,
+    NotesDelete,
+    NotesClearAll,
+    NotesClearConfirm,
+    NotesSent,
+    NotesOutdated,
+    NotesFile,
+    NotesLine,
+    NotesLines,
     // ---- end notes ----
 }
 
@@ -998,6 +1014,22 @@ impl Tr {
         // ---- end prwt ----
 
         // ---- notes keys: append below ----
+        Tr::NotesTitle,
+        Tr::NotesAdd,
+        Tr::NotesPlaceholder,
+        Tr::NotesSave,
+        Tr::NotesSend,
+        Tr::NotesCopyAll,
+        Tr::NotesCopy,
+        Tr::NotesEdit,
+        Tr::NotesDelete,
+        Tr::NotesClearAll,
+        Tr::NotesClearConfirm,
+        Tr::NotesSent,
+        Tr::NotesOutdated,
+        Tr::NotesFile,
+        Tr::NotesLine,
+        Tr::NotesLines,
         // ---- end notes ----
     ];
 }
@@ -3298,6 +3330,86 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
         // ---- end prwt ----
 
         // ---- notes keys: append below ----
+        Tr::NotesTitle => match lang {
+            Uk => "Нотатки",
+            Ru => "Заметки",
+            En => "Notes",
+        },
+        Tr::NotesAdd => match lang {
+            Uk => "Додати нотатку",
+            Ru => "Добавить заметку",
+            En => "Add note",
+        },
+        Tr::NotesPlaceholder => match lang {
+            Uk => "Нотатка до рядка (Ctrl+Enter — зберегти)",
+            Ru => "Заметка к строке (Ctrl+Enter — сохранить)",
+            En => "Review note (Ctrl+Enter to save)",
+        },
+        Tr::NotesSave => match lang {
+            Uk => "Зберегти",
+            Ru => "Сохранить",
+            En => "Save",
+        },
+        Tr::NotesSend => match lang {
+            Uk => "Надіслати агенту",
+            Ru => "Отправить агенту",
+            En => "Send to agent",
+        },
+        Tr::NotesCopyAll => match lang {
+            Uk => "Копіювати все",
+            Ru => "Копировать всё",
+            En => "Copy all",
+        },
+        Tr::NotesCopy => match lang {
+            Uk => "Копіювати",
+            Ru => "Копировать",
+            En => "Copy",
+        },
+        Tr::NotesEdit => match lang {
+            Uk => "Редагувати",
+            Ru => "Редактировать",
+            En => "Edit",
+        },
+        Tr::NotesDelete => match lang {
+            Uk => "Видалити",
+            Ru => "Удалить",
+            En => "Delete",
+        },
+        Tr::NotesClearAll => match lang {
+            Uk => "Очистити все",
+            Ru => "Очистить всё",
+            En => "Clear all",
+        },
+        Tr::NotesClearConfirm => match lang {
+            Uk => "Видалити всі нотатки цього worktree?",
+            Ru => "Удалить все заметки этого worktree?",
+            En => "Delete all notes of this worktree?",
+        },
+        Tr::NotesSent => match lang {
+            Uk => "Надіслано",
+            Ru => "Отправлено",
+            En => "Sent",
+        },
+        Tr::NotesOutdated => match lang {
+            Uk => "Застаріла",
+            Ru => "Устарела",
+            En => "Outdated",
+        },
+        Tr::NotesFile => match lang {
+            Uk => "файл",
+            Ru => "файл",
+            En => "file",
+        },
+        Tr::NotesLine => match lang {
+            Uk => "рядок",
+            Ru => "строка",
+            En => "line",
+        },
+        Tr::NotesLines => match lang {
+            Uk => "рядки",
+            Ru => "строки",
+            En => "lines",
+        },
         // ---- end notes ----
     }
 }

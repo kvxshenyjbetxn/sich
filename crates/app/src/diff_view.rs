@@ -1,5 +1,6 @@
 //! Background comparison state and virtualized side-by-side and inline views.
 
+mod notes;
 mod render;
 mod scroll;
 
@@ -10,7 +11,7 @@ use std::sync::Arc;
 
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, ListAlignment, ListOffset, ListState,
-    ScrollStrategy, UniformListScrollHandle, Window, point, px,
+    ScrollStrategy, Subscription, UniformListScrollHandle, Window, point, px,
 };
 use sich_git::compare::{
     CompareContent, CompareKey, CompareSource, DiffLineView, Fold, Projection, display_columns,
@@ -20,6 +21,8 @@ use sich_git::{GitError, Repo};
 use self::scroll::{HorizontalGeometry, ScrollDrag};
 use crate::git_panel::GitPanel;
 use crate::i18n::{Language, Tr, tr};
+use crate::notes_store::NotesStore;
+use crate::notes_store::model::RowAnchors;
 use crate::settings::{self, DiffMode};
 
 pub(crate) struct DiffView {
@@ -44,6 +47,15 @@ pub(crate) struct DiffView {
     busy: bool,
     mutation_error: Option<String>,
     change: Option<usize>,
+    /// Review notes: the shared store, where each note line sits in the projection, what to
+    /// draw this frame, the open composer and the variable-height list used while notes show.
+    notes: Entity<NotesStore>,
+    anchors: Arc<RowAnchors>,
+    layout: Arc<notes::NoteLayout>,
+    composer: Option<notes::Composer>,
+    notes_scroll: ListState,
+    notes_list: bool,
+    _notes_subscription: Subscription,
 }
 
 #[derive(Default)]
@@ -91,6 +103,8 @@ impl DiffView {
             .detach();
         }
         let settings = settings::get(cx);
+        let notes = NotesStore::global(cx);
+        let notes_subscription = cx.observe(&notes, |_, _, cx| cx.notify());
         Self {
             id,
             worktree,
@@ -113,6 +127,13 @@ impl DiffView {
             busy,
             mutation_error: None,
             change: None,
+            notes,
+            anchors: Arc::default(),
+            layout: Arc::default(),
+            composer: None,
+            notes_scroll: wrapped_list(0),
+            notes_list: false,
+            _notes_subscription: notes_subscription,
         }
     }
 
@@ -145,6 +166,7 @@ impl DiffView {
                     };
                     view.replace_projection(projection);
                     view.comparison = Some(Arc::new(content));
+                    view.refresh_anchors();
                     view.clamp_horizontal_offset();
                     cx.notify();
                 }
@@ -171,11 +193,12 @@ impl DiffView {
     fn rebuild_projection(&mut self) {
         if let Some(content) = &self.comparison {
             self.replace_projection(project(content, self.mode, &self.expanded));
+            self.refresh_anchors();
         }
     }
 
     fn replace_projection(&mut self, projection: Projection) {
-        if let Some(list) = &self.wrapped_scroll {
+        for list in self.wrapped_scroll.iter().chain(Some(&self.notes_scroll)) {
             if list.item_count() == projection.len() {
                 list.remeasure();
             } else {
@@ -206,7 +229,7 @@ impl DiffView {
     }
 
     fn vertical_anchor(&self) -> ListOffset {
-        if let Some(list) = &self.wrapped_scroll {
+        if let Some(list) = self.active_list() {
             return list.logical_scroll_top();
         }
         let offset = self.scroll.0.borrow().base_handle.offset().y;
@@ -224,6 +247,7 @@ impl DiffView {
             self.wrapped_scroll = Some(list);
         } else {
             self.wrapped_scroll = None;
+            self.notes_scroll.scroll_to(anchor);
             let handle = self.scroll.0.borrow().base_handle.clone();
             handle.set_offset(point(px(0.), px(-fixed_offset(anchor))));
             self.clamp_horizontal_offset();
@@ -235,7 +259,7 @@ impl DiffView {
         let top = self.vertical_anchor().item_ix;
         if let Some(row) = change_destination(self.projection.changes(), self.change, top, next) {
             self.change = Some(row);
-            if let Some(list) = &self.wrapped_scroll {
+            if let Some(list) = self.active_list() {
                 list.scroll_to(ListOffset {
                     item_ix: row,
                     offset_in_item: px(0.),

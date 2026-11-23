@@ -22,6 +22,7 @@ mod groups;
 mod i18n;
 mod input;
 mod links;
+mod notes_store;
 mod notifications;
 mod notify;
 mod omp_hooks;
