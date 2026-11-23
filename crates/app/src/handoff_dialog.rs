@@ -166,9 +166,10 @@ impl Render for HandoffDialog {
 
         let mut agents = h_flex().gap_2();
         for (index, kind) in handoff::TARGETS.into_iter().enumerate() {
+            let button = Button::new(("handoff-agent", index)).small();
+            let button = if self.target == kind { button.primary() } else { button };
             agents = agents.child(
-                Button::new(("handoff-agent", index))
-                    .small()
+                button
                     .label(handoff::kind_name(kind))
                     .selected(self.target == kind)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
