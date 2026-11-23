@@ -10,6 +10,20 @@ Sich installs this folder at `<sich config>/claude-mod/sich-context/` and lists 
 `env.CLAUDE_CODE_PLUGIN_DIRS` of Claude's `settings.json`. Turning off "Claude context (mod)" in
 the Sich settings removes both again.
 
+It also records every image of the session (files Claude reads, pasted attachments, images typed
+as a path in the prompt, MCP image results) in `<sich config>/claude-ctx/<sessionId>.img.json`:
+
+```
+{ "version": 1, "sessionId", "cwd", "termId", "socket": string|null, "updatedAt": <ms>,
+  "images": [ { "id", "name", "source": "read"|"paste"|"mcp",
+                "path": string|null, "data": string|null, "mime": string|null, "at": <ms> } ] }
+```
+
+`images` is oldest first, capped at the newest 300. Exactly one of `path` (an existing image file) and
+`data` is set. `data` is the path of a text file `<sich config>/claude-ctx/img/<sessionId>/<id>.b64`
+holding the image bytes as standard padded base64 (no `data:` prefix). Reading the same `path` again
+moves its entry to the end. The mod never prunes; Sich removes old manifests and `.b64` files.
+
 ## Develop
 
 ```sh
