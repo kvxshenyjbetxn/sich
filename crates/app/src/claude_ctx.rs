@@ -185,6 +185,8 @@ pub(crate) struct CtxView {
     pub used: Option<u64>,
     pub max: Option<u64>,
     pub model: Option<String>,
+    /// Raw model id (status `model_id`, else the mod snapshot's model), for the sidebar fallback.
+    pub model_id: Option<String>,
     pub effort: Option<String>,
     pub updated_ms: u64,
     pub categories: Vec<Category>,
@@ -251,6 +253,7 @@ pub(crate) fn merge(session_id: &str, status: Option<&StatusFile>, modf: Option<
     let model = status
         .and_then(|s| non_blank(&s.model_name).or_else(|| non_blank(&s.model_id)))
         .or_else(|| snap.and_then(|s| non_blank(&s.model)));
+    let model_id = status.and_then(|s| non_blank(&s.model_id)).or_else(|| snap.and_then(|s| non_blank(&s.model)));
     let updated_ms = [status.and_then(|s| s.updated_ms), modf.and_then(|m| m.updated_at), snap.and_then(|s| s.at)]
         .into_iter()
         .flatten()
@@ -277,6 +280,7 @@ pub(crate) fn merge(session_id: &str, status: Option<&StatusFile>, modf: Option<
         used,
         max,
         model,
+        model_id,
         effort: status.and_then(|s| non_blank(&s.effort)),
         updated_ms,
         categories,
@@ -647,6 +651,7 @@ mod tests {
         assert_eq!(both.used, Some(4 + 2803 + 55613));
         assert_eq!(both.max, Some(1_000_000));
         assert_eq!(both.model.as_deref(), Some("Opus 5.5"));
+        assert_eq!(both.model_id.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(both.effort.as_deref(), Some("high"));
         assert_eq!(both.updated_ms, 3000);
         assert!(both.detailed);
@@ -660,6 +665,7 @@ mod tests {
         assert_eq!(only_mod.used, Some(55674));
         assert_eq!(only_mod.max, Some(1_000_000));
         assert_eq!(only_mod.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(only_mod.model_id.as_deref(), Some("claude-opus-5-5"));
         assert_eq!(only_mod.cost_usd, None);
 
         assert!(merge("abc", None, None).is_none());

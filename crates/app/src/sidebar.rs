@@ -13,10 +13,10 @@ use gpui_kit::{
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, PathPromptOptions, Render,
     SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
-use sich_proto::{AgentStatus, GroupId, GroupInfo, ProjectId, ProjectInfo, SubagentActivityKey, SubagentStatus, TermId, TerminalInfo, WorktreeInfo};
+use sich_proto::{AgentKind, AgentStatus, GroupId, GroupInfo, ProjectId, ProjectInfo, SubagentActivityKey, SubagentStatus, TermId, TerminalInfo, WorktreeInfo};
 
 use crate::agent_badge::{
-    Badge, agent_icon_element, agent_preview, badge_element, badge_for, rollup, shorten_model, subagent_badge,
+    Badge, agent_icon_element, agent_preview, badge_element, badge_for, rollup, shorten_model, sidebar_model, subagent_badge,
     subagent_detail, subagent_label, subagent_tooltip,
 };
 use crate::app_view::AppView;
@@ -907,7 +907,11 @@ impl AppView {
                 };
                 let icon = agent_icon_element(status.kind, LEAD_SLOT_W, theme.foreground, muted);
                 let title = status.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or(label);
-                let model = status.model.as_deref().map(shorten_model).filter(|m| !m.is_empty());
+                // Claude's hook may have been lost: fall back to the model of its context data.
+                let ctx_model = (status.kind == AgentKind::Claude)
+                    .then(|| self.ctx_ui.view(id).and_then(|v| v.model_id.as_deref()))
+                    .flatten();
+                let model = sidebar_model(status.model.as_deref(), ctx_model);
                 // The status badge hangs left of the agent icon, inside the row's left padding.
                 // Anchored to the icon slot so both share the same vertical center.
                 let badge = badge.map(|b| {

@@ -155,6 +155,12 @@ pub fn shorten_model(model: &str) -> String {
     m.strip_prefix("claude-").filter(|s| !s.is_empty()).unwrap_or(m).to_string()
 }
 
+/// The model shown in the sidebar: the hook's model wins; the Claude context data's model id is
+/// only a fallback for when the hook was lost (missing or blank). Result is shortened, never empty.
+pub fn sidebar_model(hook_model: Option<&str>, ctx_model_id: Option<&str>) -> Option<String> {
+    [hook_model, ctx_model_id].into_iter().flatten().map(shorten_model).find(|m| !m.is_empty())
+}
+
 fn non_blank(s: &Option<String>) -> Option<String> {
     s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
 }
@@ -432,6 +438,16 @@ mod tests {
         assert_eq!(p(AgentState::Failed, Some("d"), Some("p"), Some("m")).as_deref(), Some("m"));
         assert_eq!(p(AgentState::Failed, Some("d"), Some("p"), None).as_deref(), Some("d"));
         assert_eq!(p(AgentState::Failed, None, Some("p"), None), None);
+    }
+
+    #[test]
+    fn sidebar_model_prefers_hook_and_falls_back_to_ctx() {
+        assert_eq!(sidebar_model(Some("claude-opus-5-5"), Some("claude-sonnet-5-5")).as_deref(), Some("opus-5-5"));
+        assert_eq!(sidebar_model(None, Some("claude-sonnet-5-5")).as_deref(), Some("sonnet-5-5"));
+        assert_eq!(sidebar_model(Some("  "), Some("claude-haiku")).as_deref(), Some("haiku"));
+        assert_eq!(sidebar_model(Some(""), None), None);
+        assert_eq!(sidebar_model(None, Some("")), None);
+        assert_eq!(sidebar_model(None, None), None);
     }
 
     #[test]
