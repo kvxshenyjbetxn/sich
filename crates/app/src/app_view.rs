@@ -2087,11 +2087,11 @@ impl AppView {
             .text_color(theme.muted_foreground)
             .child(
                 h_flex().flex_1().min_w_0().gap_2().items_center()
-                    .child(div().min_w_0().truncate().child(indicator))
-                    .children(self.focused.and_then(|id| self.ctx_ui.view(id)).map(|view| {
-                        context_panel::status_item(view, lang, crate::claude_ctx::now_ms(), &theme, cx)
-                    })),
+                    .child(div().min_w_0().truncate().child(indicator)),
             )
+            .children(self.focused.and_then(|id| self.ctx_ui.view(id)).map(|view| {
+                context_panel::status_item(view, lang, crate::claude_ctx::now_ms(), &theme, cx)
+            }))
             .children(self.usage_bar.render(lang, cx))
             .child(
                 Button::new("open-settings")
