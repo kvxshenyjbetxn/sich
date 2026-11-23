@@ -138,6 +138,37 @@ export function scanLine(
   }
 }
 
+/** A run of consecutive cells of any placeholder char (whatever its id), on one screen row. */
+export interface CoverRun {
+  y: number;
+  x: number;
+  len: number;
+}
+
+/** Appends runs of ALL placeholder cells (even unresolvable ones) so none can show as tofu. */
+export function scanCover(line: LineLike | undefined, y: number, cols: number, out: CoverRun[]) {
+  if (!line) return;
+  let cur: CoverRun | null = null;
+  for (let x = 0; x < cols; x++) {
+    const cell = line.getCell(x);
+    const isPh = !!cell && cell.getWidth() > 0 && cell.getChars().codePointAt(0) === PLACEHOLDER;
+    if (!isPh) {
+      cur = null;
+      continue;
+    }
+    if (cur && cur.x + cur.len === x) cur.len++;
+    else {
+      cur = { y, x, len: 1 };
+      out.push(cur);
+    }
+  }
+}
+
+/** Pixel rectangle of a cover run (full cells, terminal background). */
+export function coverBox(run: CoverRun, cellW: number, cellH: number) {
+  return { left: run.x * cellW, top: run.y * cellH, width: run.len * cellW, height: cellH };
+}
+
 export interface Box {
   left: number;
   top: number;

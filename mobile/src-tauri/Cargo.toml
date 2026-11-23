@@ -1,6 +1,6 @@
 [package]
 name = "sich-remote-app"
-version = "0.1.43"
+version = "0.1.44"
 edition = "2024"
 description = "Sich phone app (Tauri 2)"
 

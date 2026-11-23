@@ -6,7 +6,7 @@
  * resize / font changes, so it follows the buffer without private APIs.
  */
 import type { Terminal } from "@xterm/xterm";
-import { imageCells, scanLine, stripBox, type LineLike, type Strip } from "./placeholder";
+import { coverBox, imageCells, scanCover, scanLine, stripBox, type CoverRun, type LineLike, type Strip } from "./placeholder";
 import type { ImageStore } from "./store";
 
 export function attachImageOverlay(term: Terminal, store: ImageStore, background: string): () => void {
@@ -30,10 +30,6 @@ export function attachImageOverlay(term: Terminal, store: ImageStore, background
     if (disposed) return;
     const el = ensureLayer();
     if (!el) return;
-    if (store.size === 0) {
-      el.replaceChildren();
-      return;
-    }
     const screen = el.parentElement!;
     const cellW = screen.clientWidth / term.cols;
     const cellH = screen.clientHeight / term.rows;
@@ -41,13 +37,29 @@ export function attachImageOverlay(term: Terminal, store: ImageStore, background
 
     const buf = term.buffer.active;
     const strips: Strip[] = [];
+    const covers: CoverRun[] = [];
     for (let y = 0; y < term.rows; y++) {
-      scanLine(buf.getLine(buf.viewportY + y) as LineLike | undefined, y, term.cols, strips, (r) => {
+      const line = buf.getLine(buf.viewportY + y) as LineLike | undefined;
+      scanCover(line, y, term.cols, covers);
+      scanLine(line, y, term.cols, strips, (r) => {
         store.noteExtent(r.image, r.row, r.col);
       });
     }
 
     const frag = document.createDocumentFragment();
+    // Background boxes first: every placeholder cell is hidden, even without a loaded image.
+    for (const c of covers) {
+      const b = coverBox(c, cellW, cellH);
+      const d = document.createElement("div");
+      d.className = "kitty-strip";
+      const st = d.style;
+      st.left = `${b.left}px`;
+      st.top = `${b.top}px`;
+      st.width = `${b.width}px`;
+      st.height = `${b.height}px`;
+      st.backgroundColor = background;
+      frag.appendChild(d);
+    }
     for (const s of strips) {
       const img = store.get(s.image);
       if (!img) continue;

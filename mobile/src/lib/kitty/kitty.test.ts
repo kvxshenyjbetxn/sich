@@ -3,6 +3,9 @@ import { DIACRITICS } from "./diacritics";
 import { KittyApcFilter, KittyCommandAssembler, type KittyEvent } from "./apc";
 import {
   PLACEHOLDER,
+  coverBox,
+  scanCover,
+  type CoverRun,
   diacritic,
   diacriticIndex,
   imageCells,
@@ -253,6 +256,29 @@ describe("strip grouping", () => {
     const seen: number[] = [];
     scanLine({ getCell: (x) => [ph(3, 4, 9), ph(null, null, 9)][x] }, 0, 2, [], (r) => seen.push(r.row * 100 + r.col));
     expect(seen).toEqual([304, 305]);
+  });
+});
+
+describe("cover runs", () => {
+  const cover = (cells: FakeCell[]) => {
+    const out: CoverRun[] = [];
+    scanCover({ getCell: (x) => cells[x] }, 3, cells.length, out);
+    return out;
+  };
+  it("covers every placeholder cell, including default-colored and unresolvable ones", () => {
+    const def = new FakeCell(String.fromCodePoint(PLACEHOLDER));
+    expect(cover([new FakeCell("a"), ph(0, 0, 5), def, ph(0, 2, 9), new FakeCell("b"), def])).toEqual([
+      { y: 3, x: 1, len: 3 },
+      { y: 3, x: 5, len: 1 },
+    ]);
+  });
+  it("box spans all cells of the run", () => {
+    expect(coverBox({ y: 2, x: 4, len: 3 }, 10, 20)).toEqual({ left: 40, top: 40, width: 30, height: 20 });
+  });
+  it("handles missing lines", () => {
+    const out: CoverRun[] = [];
+    scanCover(undefined, 0, 4, out);
+    expect(out).toEqual([]);
   });
 });
 
