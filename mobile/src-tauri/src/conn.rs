@@ -14,13 +14,14 @@ use futures::{SinkExt, StreamExt};
 use iroh::endpoint::{Connection, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, TransportAddr};
 use sich_remote_proto::{
-    ALPN, GatewayMsg, MIN_COMPATIBLE, PairUrl, PhoneMsg, REMOTE_PROTO_VERSION, TermRef, Workspace, compatible,
+    ALPN, ChatImageBytes, GatewayMsg, MIN_COMPATIBLE, PairUrl, PhoneMsg, REMOTE_PROTO_VERSION, TermRef, Workspace, compatible,
     decode_frame, encode_frame, frame_codec,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
+use crate::chat::{self, CAP_CHAT, ChatSink};
 use crate::backoff::{Backoff, PING_INTERVAL, is_dead};
 use crate::hosts::{Host, HostStore};
 use crate::ui::{ConnState, OutputSink, Ui, reject_code};
@@ -59,6 +60,16 @@ struct Sub {
     sink: Arc<dyn OutputSink>,
 }
 
+/// The active chat subscription (one at a time), re-sent after a reconnect.
+struct ChatSub {
+    term: TermRef,
+    limit: u32,
+    sink: Arc<dyn ChatSink>,
+}
+
+/// How long a chat image fetch may take.
+const CHAT_IMAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
 enum Cmd {
     Pair(PairUrl),
     Connect(Host),
@@ -73,6 +84,10 @@ enum Cmd {
     SetFit { term: TermRef, fit: bool },
     MarkSeen(TermRef),
     Upload { file_name: String, data: Vec<u8>, reply: oneshot::Sender<Result<String, String>> },
+    ChatSubscribe { term: TermRef, limit: u32, sink: Arc<dyn ChatSink> },
+    ChatUnsubscribe(TermRef),
+    ChatLoadEarlier { term: TermRef, before_order: u64, limit: u32 },
+    ChatImage { term: TermRef, image_ref: String, reply: oneshot::Sender<Result<ChatImageBytes, String>> },
 }
 
 /// Cheap handle used by Tauri commands. Never holds a connection.
@@ -81,6 +96,7 @@ pub struct ConnectionManager {
     tx: mpsc::UnboundedSender<Cmd>,
     state: Arc<Mutex<ConnState>>,
     workspace: Arc<Mutex<Option<Workspace>>>,
+    caps: Arc<Mutex<Vec<String>>>,
 }
 
 impl ConnectionManager {
@@ -95,6 +111,7 @@ impl ConnectionManager {
         let (tx, rx) = mpsc::unbounded_channel();
         let state = Arc::new(Mutex::new(ConnState::Idle));
         let workspace = Arc::new(Mutex::new(None));
+        let caps = Arc::new(Mutex::new(Vec::new()));
         let actor = Actor {
             cfg,
             ui,
@@ -103,15 +120,17 @@ impl ConnectionManager {
             endpoint: None,
             state: state.clone(),
             workspace: workspace.clone(),
+            caps: caps.clone(),
             target: None,
             halted: false,
             sub: None,
+            chat: None,
             backoff: Backoff::new(),
             next_req: 1,
             next_nonce: 1,
         };
         rt.spawn(actor.run(rx));
-        Self { tx, state, workspace }
+        Self { tx, state, workspace, caps }
     }
 
     pub fn state(&self) -> ConnState {
@@ -120,6 +139,34 @@ impl ConnectionManager {
 
     pub fn workspace(&self) -> Option<Workspace> {
         self.workspace.lock().unwrap().clone()
+    }
+
+    /// Capabilities the gateway advertised in its last `Welcome`.
+    pub fn capabilities(&self) -> Vec<String> {
+        self.caps.lock().unwrap().clone()
+    }
+
+    pub fn chat_subscribe(&self, term: TermRef, limit: u32, sink: Arc<dyn ChatSink>) {
+        let _ = self.tx.send(Cmd::ChatSubscribe { term, limit, sink });
+    }
+
+    pub fn chat_unsubscribe(&self, term: TermRef) {
+        let _ = self.tx.send(Cmd::ChatUnsubscribe(term));
+    }
+
+    pub fn chat_load_earlier(&self, term: TermRef, before_order: u64, limit: u32) {
+        let _ = self.tx.send(Cmd::ChatLoadEarlier { term, before_order, limit });
+    }
+
+    /// Fetch an image of the chat transcript (30 s timeout).
+    pub async fn chat_image(&self, term: TermRef, image_ref: String) -> Result<ChatImageBytes, String> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(Cmd::ChatImage { term, image_ref, reply }).map_err(|_| "manager stopped".to_string())?;
+        match tokio::time::timeout(CHAT_IMAGE_TIMEOUT, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err("connection lost".into()),
+            Err(_) => Err("image request timed out".into()),
+        }
     }
 
     pub fn pair(&self, url: PairUrl) {
@@ -223,6 +270,7 @@ struct Session {
     out: mpsc::UnboundedSender<PhoneMsg>,
     established: bool,
     uploads: HashMap<u64, oneshot::Sender<Result<String, String>>>,
+    chat_images: HashMap<u64, oneshot::Sender<Result<ChatImageBytes, String>>>,
 }
 
 impl Session {
@@ -256,10 +304,12 @@ struct Actor {
     endpoint: Option<Endpoint>,
     state: Arc<Mutex<ConnState>>,
     workspace: Arc<Mutex<Option<Workspace>>>,
+    caps: Arc<Mutex<Vec<String>>>,
     target: Option<Target>,
     /// Reconnecting stopped (rejected / failed pairing): wait for the user.
     halted: bool,
     sub: Option<Sub>,
+    chat: Option<ChatSub>,
     backoff: Backoff,
     next_req: u64,
     next_nonce: u64,
@@ -441,6 +491,41 @@ impl Actor {
                     s.send(PhoneMsg::SendText { term, text, images, submit });
                 }
             }
+            Cmd::ChatSubscribe { term, limit, sink } => {
+                if let Some(old) = self.chat.as_ref().filter(|c| c.term != term)
+                    && let Some(s) = sess.as_deref()
+                {
+                    s.send(PhoneMsg::ChatUnsubscribe { term: old.term.clone() });
+                }
+                self.chat = Some(ChatSub { term: term.clone(), limit, sink });
+                if let Some(s) = sess.as_deref() {
+                    s.send(PhoneMsg::ChatSubscribe { term, limit });
+                }
+            }
+            Cmd::ChatUnsubscribe(term) => {
+                if self.chat.as_ref().is_some_and(|c| c.term == term) {
+                    self.chat = None;
+                }
+                if let Some(s) = sess.as_deref() {
+                    s.send(PhoneMsg::ChatUnsubscribe { term });
+                }
+            }
+            Cmd::ChatLoadEarlier { term, before_order, limit } => {
+                if let Some(s) = sess.as_deref() {
+                    s.send(PhoneMsg::ChatLoadEarlier { term, before_order, limit });
+                }
+            }
+            Cmd::ChatImage { term, image_ref, reply } => match sess.filter(|s| s.established) {
+                Some(s) => {
+                    let req_id = self.next_req;
+                    self.next_req += 1;
+                    s.chat_images.insert(req_id, reply);
+                    let _ = s.out.send(PhoneMsg::ChatImage { req_id, term, image_ref });
+                }
+                None => {
+                    let _ = reply.send(Err("not connected".into()));
+                }
+            },
             Cmd::MarkSeen(term) => {
                 if let Some(s) = sess.as_deref() {
                     s.send(PhoneMsg::MarkSeen { term });
@@ -551,13 +636,13 @@ impl Actor {
         });
         let _guard = SessionGuard { conn: conn.clone(), tasks: vec![writer, reader] };
 
-        let mut sess = Session { out: out_tx, established: false, uploads: HashMap::new() };
+        let mut sess = Session { out: out_tx, established: false, uploads: HashMap::new(), chat_images: HashMap::new() };
         let _ = sess.out.send(PhoneMsg::Hello {
             proto_version: REMOTE_PROTO_VERSION,
             min_compatible: MIN_COMPATIBLE,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             device_name: self.cfg.device_name.clone(),
-            capabilities: vec![],
+            capabilities: vec![CAP_CHAT.to_string()],
             pair_secret,
         });
 
@@ -580,7 +665,7 @@ impl Actor {
                     last_rx = Instant::now();
                     probe = None;
                     match msg {
-                        GatewayMsg::Welcome { proto_version, min_compatible, host_name, .. } => {
+                        GatewayMsg::Welcome { proto_version, min_compatible, host_name, capabilities, .. } => {
                             if !compatible(proto_version, min_compatible) {
                                 return End::Rejected {
                                     reason: "incompatible".into(),
@@ -588,6 +673,7 @@ impl Actor {
                                 };
                             }
                             sess.established = true;
+                            *self.caps.lock().unwrap() = capabilities;
                             self.backoff.reset();
                             let name = self.on_welcome(target, &conn, &host_name);
                             self.set_state(ConnState::Connected { host_name: name });
@@ -599,6 +685,9 @@ impl Actor {
                                     fit: sub.fit,
                                     replay_bytes: REPLAY_BYTES,
                                 });
+                            }
+                            if let Some(c) = &self.chat {
+                                sess.send(PhoneMsg::ChatSubscribe { term: c.term.clone(), limit: c.limit });
                             }
                         }
                         GatewayMsg::Rejected { reason } => {
@@ -632,8 +721,26 @@ impl Actor {
                         }
                         GatewayMsg::Exited { term, code } => self.ui.term_exited(&term, code),
                         GatewayMsg::Error { message } => self.ui.gateway_error(&message),
-                        // TODO: chat handled in mobile chat module
-                        GatewayMsg::ChatSnapshot { .. } | GatewayMsg::ChatUpdate { .. } | GatewayMsg::ChatEarlier { .. } | GatewayMsg::ChatImageData { .. } => {}
+                        GatewayMsg::ChatSnapshot { term, status, messages, has_more } => {
+                            if let Some(c) = self.chat.as_ref().filter(|c| c.term == term) {
+                                c.sink.event(chat::snapshot_event(&status, &messages, has_more));
+                            }
+                        }
+                        GatewayMsg::ChatUpdate { term, messages } => {
+                            if let Some(c) = self.chat.as_ref().filter(|c| c.term == term) {
+                                c.sink.event(chat::update_event(&messages));
+                            }
+                        }
+                        GatewayMsg::ChatEarlier { term, messages, has_more } => {
+                            if let Some(c) = self.chat.as_ref().filter(|c| c.term == term) {
+                                c.sink.event(chat::earlier_event(&messages, has_more));
+                            }
+                        }
+                        GatewayMsg::ChatImageData { req_id, result } => {
+                            if let Some(reply) = sess.chat_images.remove(&req_id) {
+                                let _ = reply.send(result);
+                            }
+                        }
                     }
                 }
                 cmd = rx.recv() => {

@@ -67,9 +67,11 @@ interface Props {
   onPinchFont: (px: number) => void;
   /** The gateway cleared the terminal and reported its size. */
   onReset: (cols: number, rows: number) => void;
+  /** Chat view is shown: keep the subscription but do not lay out / resize the PTY. */
+  paused?: boolean;
 }
 
-export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, onData, onPinchFont, onReset }: Props) {
+export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, onData, onPinchFont, onReset, paused = false }: Props) {
   const hostRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
   const xRef = useRef<XTerm | null>(null);
@@ -77,8 +79,8 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
   const lastSent = useRef({ cols: 0, rows: 0 });
 
   // Latest props for callbacks created once per terminal.
-  const live = useRef({ fit, baseFont, ptyCols, ptyRows, onData, onPinchFont, onReset, disabled, term });
-  live.current = { fit, baseFont, ptyCols, ptyRows, onData, onPinchFont, onReset, disabled, term };
+  const live = useRef({ fit, baseFont, ptyCols, ptyRows, onData, onPinchFont, onReset, disabled, term, paused });
+  live.current = { fit, baseFont, ptyCols, ptyRows, onData, onPinchFont, onReset, disabled, term, paused };
 
   /** Apply size/font for the current mode. */
   const layout = useRef(() => {});
@@ -86,7 +88,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
     const x = xRef.current;
     const f = fitAddon.current;
     const host = hostRef.current;
-    if (!x || !f || !host) return;
+    if (!x || !f || !host || live.current.paused) return;
     const { fit, baseFont, ptyCols, ptyRows, term } = live.current;
     if (fit) {
       if (x.options.fontSize !== baseFont) x.options.fontSize = baseFont;
@@ -232,7 +234,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
   // Mode / size / font changes.
   useEffect(() => {
     layout.current();
-  }, [fit, baseFont, ptyCols, ptyRows]);
+  }, [fit, baseFont, ptyCols, ptyRows, paused]);
 
   return (
     <div ref={hostRef} className={`term-host ${fit ? "fit" : "free"}`}>

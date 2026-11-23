@@ -8,6 +8,7 @@ use sich_remote_proto::{PairUrl, TermRef};
 use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
 
+use crate::chat::{self, ChatSink};
 use crate::conn::ConnectionManager;
 use crate::hosts::{Host, HostStore};
 use crate::ui::{
@@ -55,6 +56,15 @@ impl OutputSink for ChannelSink {
     }
     fn output(&self, bytes: Vec<u8>) {
         let _ = self.0.send(InvokeResponseBody::Raw(encode_output_frame(&bytes)));
+    }
+}
+
+/// Chat events go through a per-subscription channel as JSON objects (see `chat.rs`).
+struct ChatChannelSink(Channel<Value>);
+
+impl ChatSink for ChatChannelSink {
+    fn event(&self, ev: Value) {
+        let _ = self.0.send(ev);
     }
 }
 
@@ -170,6 +180,34 @@ pub fn connection_state(state: State<'_, AppState>) -> ConnState {
 #[tauri::command]
 pub fn workspace_snapshot(state: State<'_, AppState>) -> Option<Value> {
     state.mgr.workspace().map(|w| workspace_to_json(&w))
+}
+
+/// Capabilities the gateway advertised (the UI shows the chat toggle only with `chat`).
+#[tauri::command]
+pub fn gateway_capabilities(state: State<'_, AppState>) -> Vec<String> {
+    state.mgr.capabilities()
+}
+
+#[tauri::command]
+pub fn chat_subscribe(state: State<'_, AppState>, term: TermRef, limit: u32, on_event: Channel<Value>) {
+    state.mgr.chat_subscribe(term, limit, Arc::new(ChatChannelSink(on_event)));
+}
+
+#[tauri::command]
+pub fn chat_unsubscribe(state: State<'_, AppState>, term: TermRef) {
+    state.mgr.chat_unsubscribe(term);
+}
+
+#[tauri::command]
+pub fn chat_load_earlier(state: State<'_, AppState>, term: TermRef, before_order: u64, limit: u32) {
+    state.mgr.chat_load_earlier(term, before_order, limit);
+}
+
+/// Resolves to a `data:` URL of the transcript image.
+#[tauri::command]
+pub async fn chat_image(state: State<'_, AppState>, term: TermRef, image_ref: String) -> Result<String, String> {
+    let img = state.mgr.chat_image(term, image_ref).await?;
+    Ok(chat::data_url(&img.mime, &img.data))
 }
 
 /// Max decoded image size (same as the gateway).

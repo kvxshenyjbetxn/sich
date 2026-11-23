@@ -382,3 +382,128 @@ async fn stop_returns_to_idle_and_closes() {
     let end = tokio::time::timeout(Duration::from_secs(5), g.recv.next()).await;
     assert!(matches!(end, Ok(None) | Ok(Some(Err(_)))));
 }
+
+#[derive(Default)]
+struct TestChatSink {
+    events: Mutex<Vec<serde_json::Value>>,
+}
+
+impl crate::chat::ChatSink for TestChatSink {
+    fn event(&self, ev: serde_json::Value) {
+        self.events.lock().unwrap().push(ev);
+    }
+}
+
+fn chat_msg(id: &str, order: u64) -> sich_remote_proto::ChatMessage {
+    sich_remote_proto::ChatMessage {
+        id: id.into(),
+        order,
+        role: sich_remote_proto::ChatRole::User,
+        timestamp_ms: None,
+        blocks: vec![sich_remote_proto::ChatBlock::Text { markdown: "hello".into() }],
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_events_reach_the_sink_and_resubscribe_after_reconnect() {
+    use sich_remote_proto::ChatStatus;
+    let r = rig().await;
+    let sink = Arc::new(TestChatSink::default());
+    r.mgr.connect(r.host());
+    r.mgr.chat_subscribe(term(1), 50, sink.clone());
+
+    let mut g = GwConn::accept(&r.gw).await;
+    assert!(matches!(g.recv().await, PhoneMsg::Hello { .. }));
+    g.send(GatewayMsg::Welcome {
+        proto_version: REMOTE_PROTO_VERSION,
+        min_compatible: MIN_COMPATIBLE,
+        host_name: "My PC".into(),
+        gateway_version: "test".into(),
+        capabilities: vec!["chat".into()],
+    })
+    .await;
+    assert_eq!(g.recv_msg().await, PhoneMsg::ChatSubscribe { term: term(1), limit: 50 });
+    wait_for("connected", || matches!(r.mgr.state(), ConnState::Connected { .. })).await;
+    assert_eq!(r.mgr.capabilities(), vec!["chat".to_string()]);
+
+    g.send(GatewayMsg::ChatSnapshot {
+        term: term(1),
+        status: ChatStatus::Ready,
+        messages: vec![chat_msg("a", 0)],
+        has_more: true,
+    })
+    .await;
+    // Other terminals' chat events are ignored.
+    g.send(GatewayMsg::ChatUpdate { term: term(2), messages: vec![chat_msg("x", 1)] }).await;
+    g.send(GatewayMsg::ChatUpdate { term: term(1), messages: vec![chat_msg("b", 10)] }).await;
+    g.send(GatewayMsg::ChatEarlier { term: term(1), messages: vec![], has_more: false }).await;
+    wait_for("chat events", || sink.events.lock().unwrap().len() >= 3).await;
+    {
+        let ev = sink.events.lock().unwrap();
+        assert_eq!(ev.len(), 3);
+        assert_eq!(ev[0]["kind"], "snapshot");
+        assert_eq!(ev[0]["status"]["state"], "ready");
+        assert_eq!(ev[0]["has_more"], true);
+        assert_eq!(ev[1]["kind"], "update");
+        assert_eq!(ev[1]["messages"][0]["id"], "b");
+        assert_eq!(ev[2]["kind"], "earlier");
+    }
+
+    r.mgr.chat_load_earlier(term(1), 0, 30);
+    assert_eq!(g.recv_msg().await, PhoneMsg::ChatLoadEarlier { term: term(1), before_order: 0, limit: 30 });
+
+    // Reconnect: the chat is re-subscribed.
+    g.conn.close(7u32.into(), b"test");
+    drop(g);
+    let mut g2 = GwConn::accept(&r.gw).await;
+    assert!(matches!(g2.recv().await, PhoneMsg::Hello { .. }));
+    g2.welcome("My PC").await;
+    assert_eq!(g2.recv_msg().await, PhoneMsg::ChatSubscribe { term: term(1), limit: 50 });
+
+    // Unsubscribe: no more events, and the gateway is told.
+    r.mgr.chat_unsubscribe(term(1));
+    assert_eq!(g2.recv_msg().await, PhoneMsg::ChatUnsubscribe { term: term(1) });
+    g2.send(GatewayMsg::ChatUpdate { term: term(1), messages: vec![chat_msg("c", 20)] }).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(sink.events.lock().unwrap().len(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_image_resolves_by_req_id_and_fails_offline() {
+    let r = rig().await;
+    // Not connected: fails fast.
+    assert_eq!(r.mgr.chat_image(term(1), "ref".into()).await.unwrap_err(), "not connected");
+
+    r.mgr.connect(r.host());
+    let mut g = GwConn::accept(&r.gw).await;
+    g.recv().await;
+    g.welcome("My PC").await;
+    wait_for("connected", || matches!(r.mgr.state(), ConnState::Connected { .. })).await;
+    assert!(r.mgr.capabilities().is_empty());
+
+    let mgr = r.mgr.clone();
+    let ok = tokio::spawn(async move { mgr.chat_image(term(1), "img-1".into()).await });
+    let req_id = match g.recv_msg().await {
+        PhoneMsg::ChatImage { req_id, term: t, image_ref } => {
+            assert_eq!((t, image_ref.as_str()), (term(1), "img-1"));
+            req_id
+        }
+        other => panic!("{other:?}"),
+    };
+    g.send(GatewayMsg::ChatImageData {
+        req_id,
+        result: Ok(sich_remote_proto::ChatImageBytes { mime: "image/png".into(), data: vec![1, 2] }),
+    })
+    .await;
+    let got = ok.await.unwrap().unwrap();
+    assert_eq!((got.mime.as_str(), got.data.as_slice()), ("image/png", &[1u8, 2][..]));
+
+    let mgr = r.mgr.clone();
+    let bad = tokio::spawn(async move { mgr.chat_image(term(1), "img-2".into()).await });
+    let req_id = match g.recv_msg().await {
+        PhoneMsg::ChatImage { req_id, .. } => req_id,
+        other => panic!("{other:?}"),
+    };
+    g.send(GatewayMsg::ChatImageData { req_id, result: Err("gone".into()) }).await;
+    assert_eq!(bad.await.unwrap().unwrap_err(), "gone");
+}
