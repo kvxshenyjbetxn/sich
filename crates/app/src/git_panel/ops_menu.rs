@@ -107,11 +107,19 @@ impl GitPanel {
                             Button::new("git-op-continue")
                                 .primary()
                                 .xsmall()
-                                .label(tr(lang, Tr::GitContinue))
+                                .label(tr(
+                                    lang,
+                                    if op == InProgress::Merge { Tr::CmpCompleteMerge } else { Tr::GitContinue },
+                                ))
                                 .disabled(!continue_enabled(status, busy.is_some()))
                                 .loading(busy == Some(Operation::Continue))
                                 .on_click(cx.listener(move |panel, _, window, cx| {
-                                    panel.mutate(Mutation::Continue(op), window, cx)
+                                    let mutation = if op == InProgress::Merge {
+                                        Mutation::CompleteMerge
+                                    } else {
+                                        Mutation::Continue(op)
+                                    };
+                                    panel.mutate(mutation, window, cx)
                                 })),
                         )
                         .child(
@@ -399,6 +407,7 @@ mod tests {
             status: ChangeKind::Modified,
             added: None,
             removed: None,
+            conflict: None,
         }
     }
 
