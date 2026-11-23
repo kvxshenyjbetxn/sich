@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use futures::FutureExt as _;
 use gpui_kit::assets::IconName as Ic;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, StyledExt as _, Theme, h_flex, v_flex};
 use gpui_kit::{
@@ -93,6 +95,22 @@ pub(crate) fn short_title(title: &str, max: usize) -> String {
     }
     let cut: String = title.chars().take(max.saturating_sub(1)).collect();
     format!("{}…", cut.trim_end())
+}
+
+/// The agent switcher is only useful when there is something to choose from.
+pub(crate) fn switcher_visible(claude_count: usize) -> bool {
+    claude_count > 1
+}
+
+/// Switcher button text: "<Auto> · <followed agent>" in auto mode, the pinned agent's title otherwise.
+pub(crate) fn switcher_label(auto: &str, pinned: bool, selected_title: &str) -> String {
+    let title = short_title(selected_title, 24);
+    if pinned { title } else { format!("{auto} · {title}") }
+}
+
+/// Menu row of one terminal: "Title · 18%" ("–" while its percentage is unknown).
+pub(crate) fn switcher_item_label(title: &str, percent: Option<f64>) -> String {
+    format!("{} · {}", short_title(title, 24), percent.map(percent_label).unwrap_or_else(|| "–".into()))
 }
 
 /// "5s", "3m 4s", "2h 5m" with the units of the language.
@@ -476,7 +494,7 @@ fn render_categories(view: &CtxView, lang: Language, theme: &Theme) -> AnyElemen
     v_flex().w_full().gap_2().child(bar).child(v_flex().w_full().gap_1().children(rows)).children(note).into_any_element()
 }
 
-fn render_header(view: &CtxView, lang: Language, now_ms: u64, theme: &Theme) -> AnyElement {
+fn render_header(view: &CtxView, lang: Language, theme: &Theme) -> AnyElement {
     let color = tone_color(claude_ctx::tone(view.percent), theme);
     let percent = view.percent.map(percent_label).unwrap_or_else(|| "–".into());
     let tokens = match (view.used, view.max) {
@@ -501,10 +519,6 @@ fn render_header(view: &CtxView, lang: Language, now_ms: u64, theme: &Theme) -> 
                 )
                 .child(div().text_size(px(12.)).child(tokens))
                 .child(div().text_size(px(11.5)).text_color(theme.muted_foreground).child(model)),
-        )
-        .child(
-            div().flex_shrink_0().text_size(px(11.)).text_color(theme.muted_foreground)
-                .child(updated_ago(lang, view, now_ms)),
         )
         .into_any_element()
 }
@@ -636,36 +650,62 @@ pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx
         return centered(tr(lang, Tr::CtxNoClaude), theme);
     };
 
-    let chips = (ids.len() > 1).then(|| {
-        let auto_key = input.key.clone();
-        let auto = chip("ctx-chip-auto", tr(lang, Tr::CtxAuto).to_string(), None, pinned.is_none(), theme)
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.ctx_ui.set_pin(auto_key.clone(), None);
-                cx.notify();
-            }));
-        let terminals = input.targets.iter().map(|target| {
-            let id = target.key;
-            let pin_key = input.key.clone();
-            let percent = ui.view(id).and_then(|v| v.percent);
-            chip(
-                ("ctx-chip", id as usize),
-                short_title(&target.title, 16),
-                Some((percent, claude_ctx::tone(percent))),
-                pinned == Some(id),
-                theme,
+    let switcher = switcher_visible(ids.len()).then(|| {
+        let selected_title = input.targets.iter().find(|t| t.key == selected).map_or("", |t| t.title.as_str());
+        let label = switcher_label(tr(lang, Tr::CtxAuto), pinned.is_some(), selected_title);
+        let auto = tr(lang, Tr::CtxAuto).to_string();
+        let items: Vec<(TermId, String)> = input
+            .targets
+            .iter()
+            .map(|t| (t.key, switcher_item_label(&t.title, ui.view(t.key).and_then(|v| v.percent))))
+            .collect();
+        let (app, key) = (cx.weak_entity(), input.key.clone());
+        let button = Button::new("ctx-switcher")
+            .ghost()
+            .small()
+            .max_w_full()
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1()
+                    .child(div().min_w_0().truncate().child(label))
+                    .child(Icon::new(Ic::ChevronDown).size(px(12.)).flex_shrink_0()),
             )
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.ctx_ui.set_pin(pin_key.clone(), Some(id));
-                cx.notify();
-            }))
-        });
-        h_flex().w_full().flex_wrap().gap_1().child(auto).children(terminals)
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.max_h(px(300.)).scrollable(true);
+                let pin = |id: Option<TermId>| {
+                    let (app, key) = (app.clone(), key.clone());
+                    move |_: &ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
+                        let _ = app.update(cx, |this, cx| {
+                            this.ctx_ui.set_pin(key.clone(), id);
+                            cx.notify();
+                        });
+                    }
+                };
+                menu = menu.item(PopupMenuItem::new(auto.clone()).checked(pinned.is_none()).on_click(pin(None)));
+                for (id, text) in &items {
+                    menu = menu.item(PopupMenuItem::new(text.clone()).checked(pinned == Some(*id)).on_click(pin(Some(*id))));
+                }
+                menu
+            });
+        div().flex_1().min_w_0().child(button)
+    });
+    let updated = ui.view(selected).map(|view| {
+        div().flex_shrink_0().text_size(px(11.)).text_color(theme.muted_foreground).child(updated_ago(lang, view, input.now_ms))
+    });
+    let top = (switcher.is_some() || updated.is_some()).then(|| {
+        h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .child(switcher.unwrap_or_else(|| div().flex_1().min_w_0()))
+            .children(updated)
     });
 
     let body: Vec<AnyElement> = match ui.view(selected) {
         None => vec![centered(tr(lang, Tr::CtxWaiting), theme)],
         Some(view) => {
-            let mut out = vec![render_header(view, lang, input.now_ms, theme)];
+            let mut out = vec![render_header(view, lang, theme)];
             if !view.categories.is_empty() {
                 out.push(render_categories(view, lang, theme));
             } else if !view.detailed {
@@ -721,34 +761,9 @@ pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx
         .overflow_y_scroll()
         .p_3()
         .gap_3()
-        .children(chips)
+        .children(top)
         .children(body)
         .into_any_element()
-}
-
-fn chip(
-    id: impl Into<gpui_kit::ElementId>,
-    label: String,
-    percent: Option<(Option<f64>, Tone)>,
-    active: bool,
-    theme: &Theme,
-) -> gpui_kit::Stateful<Div> {
-    h_flex()
-        .id(id)
-        .gap_1()
-        .px_2()
-        .py_0p5()
-        .items_center()
-        .rounded_md()
-        .border_1()
-        .border_color(if active { theme.primary } else { theme.border })
-        .bg(if active { theme.primary.opacity(0.12) } else { theme.sidebar })
-        .cursor_pointer()
-        .text_size(px(11.5))
-        .child(label)
-        .children(percent.map(|(percent, tone)| {
-            div().text_color(tone_color(tone, theme)).child(percent.map(percent_label).unwrap_or_else(|| "–".into()))
-        }))
 }
 
 #[cfg(test)]
@@ -844,6 +859,19 @@ mod tests {
         assert!(ui.replace(views.clone()));
         assert!(!ui.replace(views));
         assert!(ui.replace(HashMap::new()));
+    }
+
+    #[test]
+    fn switcher_text_and_visibility() {
+        assert!(!switcher_visible(0));
+        assert!(!switcher_visible(1));
+        assert!(switcher_visible(2));
+        assert_eq!(switcher_label("Auto", false, "build"), "Auto · build");
+        assert_eq!(switcher_label("Auto", true, "build"), "build");
+        assert_eq!(switcher_label("Авто", false, ""), "Авто · Claude");
+        assert_eq!(switcher_label("Auto", true, "a very long terminal title here"), "a very long terminal ti…");
+        assert_eq!(switcher_item_label("build", Some(18.4)), format!("build · {}", percent_label(18.4)));
+        assert_eq!(switcher_item_label("build", None), "build · –");
     }
 
     #[test]
