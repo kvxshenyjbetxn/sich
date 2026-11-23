@@ -363,9 +363,9 @@ pub(crate) fn now_ms() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Session ids become file names: anything outside `[A-Za-z0-9_-]` is replaced with `_`.
+/// Session ids become file names the same way the writers name them (outside `[A-Za-z0-9_-]` is dropped).
 pub(crate) fn sanitize_id(id: &str) -> String {
-    id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect()
+    sich_hooks::claude_ctx::sanitize_session_id(id).unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -715,7 +715,7 @@ mod tests {
         assert_eq!(percent_label(5.6), "6%");
         assert_eq!(age_secs(1000, 6000), 5);
         assert_eq!(age_secs(9000, 1000), 0);
-        assert_eq!(sanitize_id("a/b c-1_x"), "a_b_c-1_x");
+        assert_eq!(sanitize_id("a/b c-1_x"), "abc-1_x");
     }
 
     fn cand(session: &str, term: &str, socket: &str, updated: u64) -> Candidate {
