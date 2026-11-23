@@ -1,7 +1,9 @@
 //! Project registry (persisted as JSON) and the project/worktree operations.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -213,6 +215,90 @@ fn scan_one(e: &Entry) -> ProjectInfo {
         });
     }
     info
+}
+
+/// Cheap filesystem-only summary of a repo's worktree set and HEADs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fingerprint {
+    head: Option<SystemTime>,
+    /// (entry name, mtime of its HEAD, mtime of its gitdir), sorted by name.
+    entries: Vec<(String, Option<SystemTime>, Option<SystemTime>)>,
+}
+
+fn mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+/// Fingerprint of `<common_dir>/worktrees/*` and `<common_dir>/HEAD`; None if `common_dir` is not a directory.
+pub fn worktree_fingerprint(common_dir: &Path) -> Option<Fingerprint> {
+    if !common_dir.is_dir() {
+        return None;
+    }
+    let mut entries = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(common_dir.join("worktrees")) {
+        for e in rd.flatten() {
+            let dir = e.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            entries.push((e.file_name().to_string_lossy().into_owned(), mtime(&dir.join("HEAD")), mtime(&dir.join("gitdir"))));
+        }
+    }
+    entries.sort();
+    Some(Fingerprint { head: mtime(&common_dir.join("HEAD")), entries })
+}
+
+const WATCH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// One watcher pass: refreshes the common-dir cache and returns the fingerprint per project path.
+fn watch_pass(
+    paths: &[PathBuf],
+    cache: &mut HashMap<PathBuf, PathBuf>,
+) -> HashMap<PathBuf, Option<Fingerprint>> {
+    cache.retain(|p, dir| paths.contains(p) && dir.is_dir());
+    let mut out = HashMap::new();
+    for p in paths {
+        if !cache.contains_key(p)
+            && p.is_dir()
+            && let Ok(dir) = crate::worktree_location::git_common_dir(p)
+        {
+            cache.insert(p.clone(), dir);
+        }
+        out.insert(p.clone(), cache.get(p).and_then(|d| worktree_fingerprint(d)));
+    }
+    out
+}
+
+/// Every 3 s notices external `git worktree add/remove/prune` and branch switches and rebroadcasts projects.
+pub fn spawn_watcher(mgr: Arc<Manager>) {
+    tokio::spawn(async move {
+        let mut cache: HashMap<PathBuf, PathBuf> = HashMap::new();
+        let mut last: Option<HashMap<PathBuf, Option<Fingerprint>>> = None;
+        let mut tick = tokio::time::interval(WATCH_INTERVAL);
+        loop {
+            tokio::select! {
+                _ = mgr.shutdown.cancelled() => break,
+                _ = tick.tick() => {}
+            }
+            let paths: Vec<PathBuf> = mgr.projects.entries().into_iter().map(|e| e.path).collect();
+            let taken = std::mem::take(&mut cache);
+            let Ok((now, taken)) = tokio::task::spawn_blocking(move || {
+                let mut c = taken;
+                let r = watch_pass(&paths, &mut c);
+                (r, c)
+            })
+            .await
+            else {
+                continue;
+            };
+            cache = taken;
+            let changed = last.as_ref().is_some_and(|l| *l != now);
+            last = Some(now);
+            if changed && !mgr.hub.is_empty() {
+                broadcast(&mgr).await;
+            }
+        }
+    });
 }
 
 async fn scan(mgr: &Arc<Manager>) -> Vec<ProjectInfo> {
@@ -478,5 +564,92 @@ mod tests {
         assert!(valid_group_name(&groups, "game", None).is_err());
         assert_eq!(valid_group_name(&groups, " web ", None).unwrap(), "web");
         assert_eq!(valid_group_name(&groups, "GAME", Some(1)).unwrap(), "GAME");
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    fn repo() -> (tempfile::TempDir, PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let r = dunce::canonicalize(t.path()).unwrap().join("r");
+        std::fs::create_dir_all(&r).unwrap();
+        git(&r, &["init"]);
+        git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "i"]);
+        (t, r)
+    }
+
+    fn fp(r: &Path) -> Option<Fingerprint> {
+        worktree_fingerprint(&crate::worktree_location::git_common_dir(r).unwrap())
+    }
+
+    fn pause() {
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    #[test]
+    fn fingerprint_none_for_non_git_dir() {
+        let t = tempfile::tempdir().unwrap();
+        assert_eq!(worktree_fingerprint(&t.path().join("missing")), None);
+        let mut cache = HashMap::new();
+        let out = watch_pass(&[t.path().to_path_buf()], &mut cache);
+        assert_eq!(out[t.path()], None);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn fingerprint_stable_and_empty_without_worktrees() {
+        let (_t, r) = repo();
+        let a = fp(&r).unwrap();
+        assert!(a.entries.is_empty());
+        assert_eq!(a, fp(&r).unwrap());
+    }
+
+    #[test]
+    fn fingerprint_tracks_worktree_add_remove_and_checkout() {
+        let (t, r) = repo();
+        let before = fp(&r).unwrap();
+        pause();
+        let wt = t.path().join("wt-a");
+        git(&r, &["worktree", "add", "-b", "feat-a", wt.to_str().unwrap()]);
+        let added = fp(&r).unwrap();
+        assert_ne!(before, added);
+        assert_eq!(added.entries.len(), 1);
+        assert_eq!(added, fp(&r).unwrap());
+
+        pause();
+        git(&wt, &["checkout", "-b", "other"]);
+        let switched = fp(&r).unwrap();
+        assert_ne!(added, switched);
+
+        pause();
+        git(&r, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+        let removed = fp(&r).unwrap();
+        assert!(removed.entries.is_empty());
+        assert_ne!(switched, removed);
+    }
+
+    #[test]
+    fn fingerprint_tracks_main_branch_switch() {
+        let (_t, r) = repo();
+        let a = fp(&r).unwrap();
+        pause();
+        git(&r, &["checkout", "-b", "x"]);
+        assert_ne!(a, fp(&r).unwrap());
+    }
+
+    #[test]
+    fn watch_pass_works_in_linked_worktree_with_git_file() {
+        let (t, r) = repo();
+        let wt = t.path().join("wt-b");
+        git(&r, &["worktree", "add", "-b", "b", wt.to_str().unwrap()]);
+        assert!(wt.join(".git").is_file());
+        let mut cache = HashMap::new();
+        let out = watch_pass(&[wt.clone()], &mut cache);
+        assert!(out[&wt].as_ref().is_some_and(|f| f.entries.len() == 1));
+        // Cache is dropped for projects that disappear from the list.
+        watch_pass(&[], &mut cache);
+        assert!(cache.is_empty());
     }
 }

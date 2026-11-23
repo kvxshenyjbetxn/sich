@@ -143,6 +143,8 @@ pub struct AppView {
     pub(crate) ctx_ui: ContextUi,
     /// Whether the window has focus (kept by the activation observer and `sync`).
     window_active: bool,
+    /// When the project list was last refreshed on window activation.
+    last_activation_refresh: Option<Instant>,
     /// Native window handle for the taskbar flash (Windows).
     hwnd: Option<isize>,
     /// Last badge kind seen per terminal, to detect transitions into "needs the user".
@@ -340,6 +342,7 @@ impl AppView {
             usage_bar: crate::usage_bar::UsageBar::default(),
             ctx_ui: ContextUi::default(),
             window_active: false,
+            last_activation_refresh: None,
             hwnd: None,
             attention: HashMap::new(),
             toast_cooldown: Cooldown::default(),
@@ -558,6 +561,11 @@ impl AppView {
             let active = window.is_window_active();
             if active {
                 this.git_panel.update(cx, GitPanel::refresh);
+                let now = Instant::now();
+                if should_refresh_on_activation(this.last_activation_refresh, now) {
+                    this.last_activation_refresh = Some(now);
+                    this.client.refresh_projects();
+                }
             }
             this.window_active = active;
             let snap = this.client.snapshot();
@@ -2475,9 +2483,27 @@ fn pane_to_replace(
     pane.map_or_else(|| layout.first_leaf(), |id| visible_active(layout, id))
 }
 
+/// Minimum gap between project-list refreshes triggered by window activation.
+const ACTIVATION_REFRESH_GAP: Duration = Duration::from_secs(10);
+
+/// Whether activating the window should refresh the project list (first time, or at least 10 s since the last).
+fn should_refresh_on_activation(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|t| now.saturating_duration_since(t) >= ACTIVATION_REFRESH_GAP)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activation_refresh_is_throttled() {
+        let t0 = Instant::now();
+        assert!(should_refresh_on_activation(None, t0));
+        assert!(!should_refresh_on_activation(Some(t0), t0));
+        assert!(!should_refresh_on_activation(Some(t0), t0 + Duration::from_secs(9)));
+        assert!(should_refresh_on_activation(Some(t0), t0 + Duration::from_secs(10)));
+        assert!(!should_refresh_on_activation(Some(t0 + Duration::from_secs(5)), t0));
+    }
     #[test]
     fn removed_or_detached_active_falls_back_to_a_visible_leaf() {
         let layout = Layout::Leaf(1).split(2, 1, Edge::Right).split(3, 2, Edge::Bottom);

@@ -108,6 +108,7 @@ async fn serve(socket_name: &str, build_id: &str, registered: bool) -> anyhow::R
     if let Some(dir) = scrollback::directory() {
         scrollback::prune(&dir, std::time::SystemTime::now());
     }
+    projects::spawn_watcher(mgr.clone());
     let mut retirement_tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {

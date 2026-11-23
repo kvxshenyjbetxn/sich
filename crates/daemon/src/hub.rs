@@ -53,6 +53,10 @@ impl Hub {
         self.conns.lock().remove(&id);
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.conns.lock().is_empty()
+    }
+
     pub fn broadcast(&self, msg: ServerMsg) {
         let conns: Vec<ConnHandle> = self.conns.lock().values().cloned().collect();
         for c in conns {

@@ -561,3 +561,49 @@ async fn worktree_at_a_given_base_commit_with_slash_name() {
     h.stop().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_worktree_changes_are_rescanned_without_refresh() {
+    let _guard = SERIAL.lock().await;
+    let (tmp, _cfg) = isolate("watch");
+    let repo = init_repo(&tmp);
+    let mut h = start("watch").await;
+    let c = &mut h.conn;
+
+    send(c, ClientMsg::AddProject { path: repo.clone(), group: None }).await;
+    assert_eq!(expect_projects(c).await[0].worktrees.len(), 1);
+    // Let the watcher record its baseline before changing anything.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+
+    let wt = tmp.join("external-wt");
+    git(&repo, &["worktree", "add", "-b", "ext", wt.to_str().unwrap()]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let projects = timeout(deadline - tokio::time::Instant::now(), expect_projects(c))
+            .await
+            .expect("no projects update after external worktree add");
+        if projects[0].worktrees.iter().any(|w| lossy_eq(&w.path, &wt)) {
+            break;
+        }
+    }
+
+    git(&repo, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let projects = timeout(deadline - tokio::time::Instant::now(), expect_projects(c))
+            .await
+            .expect("no projects update after external worktree remove");
+        if !projects[0].worktrees.iter().any(|w| lossy_eq(&w.path, &wt)) {
+            break;
+        }
+    }
+
+    h.stop().await;
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Path comparison that tolerates paths that no longer exist.
+fn lossy_eq(a: &Path, b: &Path) -> bool {
+    let n = |p: &Path| dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()).to_string_lossy().to_lowercase();
+    n(a) == n(b)
+}
