@@ -80,6 +80,8 @@ pub struct AppSettings {
     pub omp_hooks: bool,
     pub usage_limits: bool,
     pub claude_statusline_wrap: bool,
+    /// Install the bundled Claude Code mod that exports the context breakdown (needs `agent_hooks`).
+    pub claude_context_mod: bool,
     /// Install the Claude Code skill that teaches a coordinator agent `sich orch`.
     pub orchestration_skill: bool,
     /// Start orchestration workers with the agent's full-autonomy flag.
@@ -117,6 +119,7 @@ impl Default for AppSettings {
             omp_hooks: true,
             usage_limits: true,
             claude_statusline_wrap: false,
+            claude_context_mod: true,
             orchestration_skill: true,
             orch_unattended_workers: true,
             close_to_tray: true,
@@ -264,6 +267,14 @@ pub fn set_claude_statusline_wrap(enabled: bool, cx: &mut App) {
         s.claude_statusline_wrap = enabled;
         store(s, cx);
         cx.refresh_windows();
+    }
+}
+
+pub fn set_claude_context_mod(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.claude_context_mod != enabled {
+        s.claude_context_mod = enabled;
+        store(s, cx);
     }
 }
 
@@ -524,6 +535,16 @@ mod tests {
         let restored: AppSettings = serde_json::from_str(&saved).unwrap();
         assert!(!restored.usage_limits);
         assert!(restored.claude_statusline_wrap);
+    }
+
+    #[test]
+    fn claude_context_mod_defaults_to_true_and_round_trips() {
+        let old: AppSettings = serde_json::from_str(r#"{"language":"uk","agent_hooks":false}"#).unwrap();
+        assert!(old.claude_context_mod);
+        assert!(AppSettings::default().claude_context_mod);
+        let off = AppSettings { claude_context_mod: false, ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.claude_context_mod);
     }
 
     #[test]

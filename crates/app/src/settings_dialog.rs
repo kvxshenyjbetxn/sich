@@ -79,6 +79,25 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                             .on_click(|checked, _, cx| settings::set_claude_statusline_wrap(*checked, cx)),
                     )
                     .child(
+                        v_flex()
+                            .gap_1()
+                            .child(
+                                Switch::new("claude-context-mod")
+                                    .checked(prefs.claude_context_mod)
+                                    .label(tr(lang, Tr::ClaudeContextMod))
+                                    .on_click(|checked, window, cx| {
+                                        settings::set_claude_context_mod(*checked, cx);
+                                        agent_hooks::apply(settings::get(cx).agent_hooks, Some(window), cx);
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(tr(lang, Tr::ClaudeContextModDesc)),
+                            ),
+                    )
+                    .child(
                         Switch::new("resume-agents-on-restore")
                             .checked(settings::get(cx).resume_agents_on_restore)
                             .label(tr(lang, Tr::ResumeAgentsOnRestore))

@@ -1,7 +1,9 @@
 //! `sich hook <agent>` (the command agent CLIs run on their hook events) and the installer that
 //! registers it in Claude Code's `settings.json`.
 
+pub mod claude_ctx;
 pub mod claude_install;
+pub mod claude_mod;
 mod codex_app_server;
 pub mod codex_install;
 pub mod codex_trust;

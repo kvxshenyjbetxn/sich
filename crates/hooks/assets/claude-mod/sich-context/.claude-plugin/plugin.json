@@ -1,0 +1,1 @@
+{ "name": "sich-context", "version": "0.1.0", "description": "Exports the context-window breakdown of Claude Code sessions to Sich (no UI)", "types": "./types/index.d.ts" }

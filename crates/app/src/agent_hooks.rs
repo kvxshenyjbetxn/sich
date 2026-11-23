@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use gpui_kit::{App, AsyncApp, Global, Window};
 use sich_hooks::claude_install::{self, InstallReport};
+use sich_hooks::{claude_ctx, claude_mod};
 
 use crate::i18n::{self, Language, Tr, tr};
 use crate::notifications;
@@ -94,13 +95,45 @@ pub fn status_text(lang: Language, status: &HooksStatus) -> (String, bool) {
     }
 }
 
+/// The context mod is installed only while both the hooks and its own setting are on.
+pub fn context_mod_wanted(agent_hooks: bool, claude_context_mod: bool) -> bool {
+    agent_hooks && claude_context_mod
+}
+
+/// Installs or removes the bundled context mod; a Claude older than the mod's minimum is skipped.
+fn apply_context_mod(
+    enable: bool,
+    claude_dir: &Path,
+    sich_dir: &Path,
+    version: Option<&str>,
+) -> anyhow::Result<()> {
+    if enable {
+        claude_mod::install(claude_dir, sich_dir, version).map(|_| ())
+    } else {
+        claude_mod::uninstall(claude_dir, sich_dir)
+    }
+}
+
 /// Blocking install/uninstall (runs `claude --version`, so never on the UI thread).
-fn run(enable: bool, dir: Option<PathBuf>, exe: Option<PathBuf>) -> HooksStatus {
+fn run(enable: bool, mod_enabled: bool, dir: Option<PathBuf>, exe: Option<PathBuf>) -> HooksStatus {
     let (Some(dir), Some(exe)) = (dir, exe) else {
         return HooksStatus::Error("cannot locate the Claude config directory or the sich executable".into());
     };
-    let result = if enable { claude_install::install(&dir, &exe) } else { claude_install::uninstall(&dir, &exe) };
-    status_after(enable, result)
+    let version = if enable { claude_install::probe_claude_version() } else { None };
+    let result = if enable {
+        claude_install::install_with_version(&dir, &exe, version.as_deref())
+    } else {
+        claude_install::uninstall(&dir, &exe)
+    };
+    let status = status_after(enable, result);
+    if matches!(status, HooksStatus::Error(_)) {
+        return status;
+    }
+    let Some(sich_dir) = claude_ctx::sich_config_dir() else { return status };
+    match apply_context_mod(context_mod_wanted(enable, mod_enabled), &dir, &sich_dir, version.as_deref()) {
+        Ok(()) => status,
+        Err(e) => HooksStatus::Error(format!("Claude context mod: {e:#}")),
+    }
 }
 
 /// Installs or removes the hooks on the background executor and publishes the result. Errors
@@ -111,10 +144,11 @@ pub fn apply(enable: bool, window: Option<&Window>, cx: &mut App) {
     set_state(st, cx);
 
     let handle = window.map(|w| w.window_handle());
+    let mod_enabled = settings::get(cx).claude_context_mod;
     let dir = claude_install::default_claude_config_dir();
     let exe = crate::daemon_host::launcher_exe();
     cx.spawn(async move |cx: &mut AsyncApp| {
-        let status = cx.background_executor().spawn(async move { run(enable, dir, exe) }).await;
+        let status = cx.background_executor().spawn(async move { run(enable, mod_enabled, dir, exe) }).await;
         let error = match &status {
             HooksStatus::Error(e) => Some(e.clone()),
             _ => None,
@@ -191,6 +225,29 @@ mod tests {
         let (text, err) = status_text(Language::Uk, &HooksStatus::Error("bad json".into()));
         assert_eq!(text, "bad json");
         assert!(err);
+    }
+
+    #[test]
+    fn context_mod_needs_hooks_and_its_own_setting() {
+        assert!(context_mod_wanted(true, true));
+        assert!(!context_mod_wanted(true, false));
+        assert!(!context_mod_wanted(false, true));
+        assert!(!context_mod_wanted(false, false));
+    }
+
+    #[test]
+    fn context_mod_install_and_uninstall_in_temp_dirs() {
+        let temp = std::env::temp_dir().join(format!("sich-ctx-mod-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        let (claude, sich) = (temp.join("claude"), temp.join("sich"));
+        apply_context_mod(true, &claude, &sich, Some("2.1.330")).unwrap();
+        assert!(claude_mod::is_installed(&claude, &sich));
+        apply_context_mod(false, &claude, &sich, Some("2.1.330")).unwrap();
+        assert!(!claude_mod::is_installed(&claude, &sich));
+        // A too-old Claude is skipped without error and without files.
+        apply_context_mod(true, &claude, &sich, Some("2.1.0")).unwrap();
+        assert!(!claude_mod::is_installed(&claude, &sich));
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
