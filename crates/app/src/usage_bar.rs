@@ -402,8 +402,10 @@ enum Tone {
     Danger,
 }
 
-fn tone(used: Option<u8>, stale: bool) -> Tone {
-    match used.filter(|_| !stale) {
+// An old reading keeps its color: usage only grows while an agent runs, and a
+// passed reset already clears the percentage. Staleness is shown in details.
+fn tone(used: Option<u8>) -> Tone {
+    match used {
         Some(90..) => Tone::Danger,
         Some(80..=89) => Tone::Warning,
         Some(_) => Tone::Good,
@@ -504,7 +506,7 @@ impl Chip {
     }
 
     fn color(&self, used: Option<u8>, theme: &Theme) -> Hsla {
-        match tone(used, self.stale) {
+        match tone(used) {
             Tone::Muted => theme.muted_foreground,
             Tone::Good => theme.success,
             Tone::Warning => theme.warning,
@@ -612,20 +614,21 @@ mod tests {
 
     #[test]
     fn tone_thresholds_and_staleness() {
-        assert_eq!(tone(Some(0), false), Tone::Good);
-        assert_eq!(tone(Some(79), false), Tone::Good);
-        assert_eq!(tone(None, false), Tone::Muted);
-        assert_eq!(tone(Some(80), false), Tone::Warning);
-        assert_eq!(tone(Some(89), false), Tone::Warning);
-        assert_eq!(tone(Some(90), false), Tone::Danger);
+        assert_eq!(tone(Some(0)), Tone::Good);
+        assert_eq!(tone(Some(79)), Tone::Good);
+        assert_eq!(tone(None), Tone::Muted);
+        assert_eq!(tone(Some(80)), Tone::Warning);
+        assert_eq!(tone(Some(89)), Tone::Warning);
+        assert_eq!(tone(Some(90)), Tone::Danger);
         let rounded = Chip::new(Some(reading(0, 79.5, None)), None, 0);
         assert_eq!(rounded.percentages[0], Some(80));
-        assert_eq!(tone(rounded.percentages[0], false), Tone::Warning);
+        assert_eq!(tone(rounded.percentages[0]), Tone::Warning);
         let sample = reading(0, 99.0, None);
         assert!(!Chip::new(Some(sample), None, STALE_SECS).stale);
         let stale = Chip::new(Some(sample), None, STALE_SECS + 1);
         assert!(stale.stale);
-        assert_eq!(tone(stale.percentages[0], stale.stale), Tone::Muted);
+        // Regression: an old reading used to turn gray; it must keep its color.
+        assert_eq!(tone(stale.percentages[0]), Tone::Danger);
         assert_eq!(stale.updated(Language::Uk).as_deref(), Some("оновлено 30 хв тому (застаріло)"));
     }
 
