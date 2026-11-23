@@ -396,6 +396,7 @@ fn pr() -> PullRequest {
         head_owner: None,
         checks: Vec::new(),
         updated_at: String::new(),
+        awaiting_approval: 0,
     }
 }
 

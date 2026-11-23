@@ -206,7 +206,24 @@ pub(crate) fn merge_result(previous: &PrView, new: PrView) -> PrView {
 }
 
 pub(crate) fn fetch_view<E: GhExec>(gh: &GitHub<E>, head: &HeadRef) -> PrView {
-    view_from_result(gh.pr_for_branch(head))
+    let mut result = gh.pr_for_branch(head);
+    if let Ok(Some(pr)) = &mut result {
+        fill_awaiting_approval(gh, pr);
+    }
+    view_from_result(result)
+}
+
+/// Workflow runs waiting for approval are not in `statusCheckRollup`; the checks rollup query
+/// lists them. Only asked for open PRs that look healthy otherwise (a failure already makes the PR
+/// red). Fails soft: on any error the count stays 0.
+fn fill_awaiting_approval<E: GhExec>(gh: &GitHub<E>, pr: &mut PullRequest) {
+    if !pr.is_open() || pr.summary().failed > 0 {
+        return;
+    }
+    let Ok(rollup) = gh.check_rollup(pr.number) else { return };
+    if rollup.head_oid.is_empty() || rollup.head_oid == pr.head_oid {
+        pr.awaiting_approval = rollup.rows.iter().filter(|row| row.pending_approval).count() as u32;
+    }
 }
 
 /// Per-worktree pull request state, cached by worktree path.
@@ -403,7 +420,7 @@ pub(crate) fn run_action(
 mod tests {
     use sich_git::forge::{GhOutput, PrState};
 
-    use super::super::testutil::{Scripted, pr, remote, target};
+    use super::super::testutil::{Scripted, Sequence, ok_output, pr, remote, target};
     use super::*;
 
     fn rr(host: &str, owner: &str, name: &str) -> RemoteRepo {
@@ -640,6 +657,75 @@ mod tests {
         assert_eq!(run(1, "", "no pull requests found for branch \"feat\""), PrView::NoPr);
         assert!(matches!(run(1, "", "boom"), PrView::Error(_) | PrView::NotAuthenticated));
         assert!(matches!(run(0, "not json", ""), PrView::Error(_)));
+    }
+
+    fn pr_json(state: &str, rollup: &str) -> String {
+        format!(r#"{{"number":7,"state":"{state}","headRefOid":"abc","statusCheckRollup":[{rollup}]}}"#)
+    }
+
+    fn rollup_json(oid: &str, suites: usize) -> String {
+        let suite = r#"{"databaseId":1,"conclusion":"ACTION_REQUIRED","app":{"name":"GitHub Actions"},"checkRuns":{"totalCount":0}}"#;
+        let nodes = vec![suite; suites].join(",");
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"headRefOid":"{oid}","commits":{{"nodes":[{{"commit":{{"oid":"{oid}","statusCheckRollup":null,"checkSuites":{{"nodes":[{nodes}]}}}}}}]}}}}}}}}}}"#
+        )
+    }
+
+    fn fetch_with(responses: Vec<Result<GhOutput, ForgeError>>) -> (PrView, Vec<Vec<String>>) {
+        let exec = Sequence::new(responses);
+        let gh = GitHub::with_exec(&exec, ".".into(), remote());
+        let view = fetch_view(&gh, &HeadRef::new(None, "feat"));
+        (view, exec.calls())
+    }
+
+    fn awaiting(view: &PrView) -> u32 {
+        view.pr().expect("a PR").awaiting_approval
+    }
+
+    #[test]
+    fn runs_awaiting_approval_are_counted_for_an_open_pr_without_failures() {
+        let (view, calls) = fetch_with(vec![ok_output(&pr_json("OPEN", "")), ok_output(&rollup_json("abc", 2))]);
+        assert_eq!(awaiting(&view), 2);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(view.pr().unwrap().summary().failed, 2);
+        let (view, _) = fetch_with(vec![ok_output(&pr_json("OPEN", "")), ok_output(&rollup_json("", 1))]);
+        assert_eq!(awaiting(&view), 1, "an empty rollup head is accepted");
+    }
+
+    #[test]
+    fn a_failing_rollup_query_keeps_the_pr_with_zero_awaiting() {
+        let (view, calls) = fetch_with(vec![
+            ok_output(&pr_json("OPEN", "")),
+            Ok(GhOutput { code: Some(1), stdout: String::new(), stderr: "boom".into() }),
+        ]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(awaiting(&view), 0);
+        let (view, _) = fetch_with(vec![ok_output(&pr_json("OPEN", "")), ok_output("not json")]);
+        assert_eq!(awaiting(&view), 0);
+    }
+
+    #[test]
+    fn an_already_failing_pr_skips_the_rollup_query() {
+        let failing = r#"{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"FAILURE"}"#;
+        let (view, calls) = fetch_with(vec![ok_output(&pr_json("OPEN", failing))]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!((awaiting(&view), view.pr().unwrap().summary().failed), (0, 1));
+    }
+
+    #[test]
+    fn merged_and_closed_prs_skip_the_rollup_query() {
+        for state in ["MERGED", "CLOSED"] {
+            let (view, calls) = fetch_with(vec![ok_output(&pr_json(state, ""))]);
+            assert_eq!(calls.len(), 1, "{state}");
+            assert_eq!(awaiting(&view), 0);
+        }
+    }
+
+    #[test]
+    fn a_rollup_of_another_commit_is_ignored() {
+        let (view, calls) = fetch_with(vec![ok_output(&pr_json("OPEN", "")), ok_output(&rollup_json("zzz", 2))]);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(awaiting(&view), 0);
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub(crate) fn pr(state: PrState) -> PullRequest {
         updated_at: String::new(),
         node_id: "PR_node".into(),
         auto_merge: None,
+        awaiting_approval: 0,
     }
 }
 
@@ -53,6 +54,34 @@ impl GhExec for Scripted {
     fn run(&self, _: &Path, _: &[String], _: Duration) -> Result<GhOutput, ForgeError> {
         Ok(self.0.clone())
     }
+}
+
+/// Answers `gh` calls from a queue and records the argument lists.
+#[derive(Default)]
+pub(crate) struct Sequence {
+    calls: std::sync::Mutex<Vec<Vec<String>>>,
+    responses: std::sync::Mutex<std::collections::VecDeque<Result<GhOutput, ForgeError>>>,
+}
+
+impl Sequence {
+    pub(crate) fn new(responses: Vec<Result<GhOutput, ForgeError>>) -> Self {
+        Self { responses: std::sync::Mutex::new(responses.into()), ..Self::default() }
+    }
+
+    pub(crate) fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl GhExec for &Sequence {
+    fn run(&self, _: &Path, args: &[String], _: Duration) -> Result<GhOutput, ForgeError> {
+        self.calls.lock().unwrap().push(args.to_vec());
+        self.responses.lock().unwrap().pop_front().expect("unscripted gh call")
+    }
+}
+
+pub(crate) fn ok_output(stdout: &str) -> Result<GhOutput, ForgeError> {
+    Ok(GhOutput { code: Some(0), stdout: stdout.into(), stderr: String::new() })
 }
 
 pub(crate) fn gh_with(code: i32, stdout: &str) -> GitHub<Scripted> {

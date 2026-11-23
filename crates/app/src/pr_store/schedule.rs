@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use sich_git::forge::PrState;
+use sich_git::forge::{MergeState, Mergeable, PrState};
 
 use super::model::{PrEntry, PrKey, PrView};
 
@@ -22,6 +22,10 @@ pub(crate) const RESOLVE_TTL: Duration = Duration::from_secs(15 * 60);
 pub(crate) const TICK: Duration = Duration::from_secs(3);
 
 const MIN: u64 = 60;
+/// GitHub computes mergeability lazily: an open PR whose mergeability is still UNKNOWN is re-read
+/// soon (the first query only triggers the computation).
+pub(crate) const UNKNOWN_MERGE_SELECTED: u64 = 15;
+pub(crate) const UNKNOWN_MERGE_BACKGROUND: u64 = 30;
 
 /// Whether the worktree is the selected one (shown in the right panel) or only a sidebar row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +83,8 @@ pub(crate) fn decide(trigger: PrTrigger, now: Instant, state: &FetchState) -> De
 /// How often a PR in this state is re-read in the background; `None` = never.
 ///
 /// Open/draft: selected 60 s while checks run, else 2 min; background rows 2 min / 5 min.
+/// An open (not draft) PR with unknown mergeability is re-read after 15 s selected / 30 s
+/// background at most, since GitHub is still computing it.
 /// No PR: 5 min selected, 15 min background. Closed: 15 min. Merged: never. Errors: 5 min selected,
 /// 15 min background; a missing or unauthenticated `gh` is never retried for background rows.
 pub(crate) fn poll_interval(view: &PrView, role: Role) -> Option<Duration> {
@@ -91,10 +97,18 @@ pub(crate) fn poll_interval(view: &PrView, role: Role) -> Option<Duration> {
             PrState::Closed => secs(15 * MIN),
             PrState::Open | PrState::Draft => {
                 let pending = pr.summary().pending > 0;
-                match (selected, pending) {
-                    (true, true) => secs(MIN),
-                    (true, false) | (false, true) => secs(2 * MIN),
-                    (false, false) => secs(5 * MIN),
+                let normal = match (selected, pending) {
+                    (true, true) => MIN,
+                    (true, false) | (false, true) => 2 * MIN,
+                    (false, false) => 5 * MIN,
+                };
+                let merge_unknown = pr.state == PrState::Open
+                    && (pr.mergeable == Mergeable::Unknown || pr.merge_state == MergeState::Unknown);
+                if merge_unknown {
+                    let fast = if selected { UNKNOWN_MERGE_SELECTED } else { UNKNOWN_MERGE_BACKGROUND };
+                    secs(fast.min(normal))
+                } else {
+                    secs(normal)
                 }
             }
         },
@@ -279,6 +293,39 @@ mod tests {
         assert_eq!(poll_interval(&running, Role::Background), Some(SEC(120)));
         assert_eq!(poll_interval(&passed, Role::Background), Some(SEC(300)));
         assert_eq!(poll_interval(&view_in(PrState::Draft), Role::Background), Some(SEC(300)));
+    }
+
+    fn unknown_merge(state: PrState, mergeable: Mergeable, merge_state: MergeState) -> PrView {
+        let mut p = pr(state);
+        p.mergeable = mergeable;
+        p.merge_state = merge_state;
+        PrView::Pr(Box::new(p))
+    }
+
+    #[test]
+    fn unknown_mergeability_is_re_read_soon() {
+        let unknown_mergeable = unknown_merge(PrState::Open, Mergeable::Unknown, MergeState::Clean);
+        let unknown_state = unknown_merge(PrState::Open, Mergeable::Mergeable, MergeState::Unknown);
+        for view in [&unknown_mergeable, &unknown_state] {
+            assert_eq!(poll_interval(view, Role::Selected), Some(SEC(15)));
+            assert_eq!(poll_interval(view, Role::Background), Some(SEC(30)));
+        }
+        let known = unknown_merge(PrState::Open, Mergeable::Mergeable, MergeState::Clean);
+        assert_eq!(poll_interval(&known, Role::Selected), Some(SEC(120)));
+        assert_eq!(poll_interval(&known, Role::Background), Some(SEC(300)));
+        let draft = unknown_merge(PrState::Draft, Mergeable::Unknown, MergeState::Unknown);
+        assert_eq!(poll_interval(&draft, Role::Selected), Some(SEC(120)));
+        assert_eq!(poll_interval(&draft, Role::Background), Some(SEC(300)));
+    }
+
+    #[test]
+    fn sync_trigger_polls_an_unknown_mergeability_after_fifteen_seconds() {
+        let now = Instant::now();
+        let key = PrKey { branch: "feat".into(), upstream: None, ahead: 0, head_oid: Some("a".into()) };
+        let state = FetchState { last_fetch: Some(now), last_key: Some(key.clone()), ..FetchState::default() };
+        let view = unknown_merge(PrState::Open, Mergeable::Unknown, MergeState::Unknown);
+        assert_eq!(sync_trigger(now + SEC(14), &state, &key, &view, Role::Selected), None);
+        assert_eq!(sync_trigger(now + SEC(15), &state, &key, &view, Role::Selected), Some(PrTrigger::Periodic));
     }
 
     #[test]

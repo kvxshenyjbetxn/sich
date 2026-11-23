@@ -159,6 +159,14 @@ mod tests {
     }
 
     #[test]
+    fn runs_awaiting_approval_turn_an_open_pr_without_checks_red() {
+        let mut p = open(&[]);
+        p.awaiting_approval = 2;
+        let g = glyph_of_pr(&p);
+        assert_eq!((g.tone, g.status), (Tone::Danger, GlyphStatus::ChecksFailing(2)));
+    }
+
+    #[test]
     fn conflicts_turn_an_open_pr_red_whatever_its_checks() {
         let mut p = open(&[CheckState::Success]);
         p.merge_state = MergeState::Dirty;

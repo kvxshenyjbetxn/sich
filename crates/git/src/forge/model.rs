@@ -111,6 +111,9 @@ pub struct PullRequest {
     pub node_id: String,
     /// Set while auto-merge is enabled.
     pub auto_merge: Option<AutoMerge>,
+    /// Workflow runs waiting for approval: ACTION_REQUIRED check suites without check runs, which
+    /// `statusCheckRollup` does not list. Filled by a separate rollup query; 0 when unknown.
+    pub awaiting_approval: u32,
 }
 
 /// The pull request's `autoMergeRequest`.
@@ -122,8 +125,12 @@ pub struct AutoMerge {
 }
 
 impl PullRequest {
+    /// Counts of `checks`, plus `awaiting_approval` runs as failed. Those are not in `checks`, so
+    /// `failed_jobs`/`failed_run_ids` ignore them (they cannot be rerun).
     pub fn summary(&self) -> ChecksSummary {
         let mut summary = ChecksSummary::default();
+        summary.total += self.awaiting_approval;
+        summary.failed += self.awaiting_approval;
         for check in &self.checks {
             summary.total += 1;
             match check.state {
@@ -345,6 +352,7 @@ pub fn parse_pr_json(json: &str) -> Result<PullRequest, ForgeError> {
             method: non_empty(auto.merge_method),
             enabled_at: non_empty(auto.enabled_at),
         }),
+        awaiting_approval: 0,
     })
 }
 
@@ -582,6 +590,23 @@ mod tests {
 
     fn rollup(items: &[String]) -> PullRequest {
         parse_pr_json(&format!(r#"{{"statusCheckRollup":[{}]}}"#, items.join(","))).unwrap()
+    }
+
+    #[test]
+    fn awaiting_approval_counts_as_failed_but_is_not_a_rerunnable_check() {
+        let mut pr = rollup(&[run("a", "SUCCESS", None), run("b", "FAILURE", None)]);
+        assert_eq!(pr.awaiting_approval, 0, "parse never fills it");
+        let jobs = pr.failed_jobs();
+        let runs = pr.failed_run_ids();
+        pr.awaiting_approval = 2;
+        let summary = pr.summary();
+        assert_eq!((summary.total, summary.passed, summary.failed), (4, 1, 3));
+        assert_eq!(pr.checks.len(), 2);
+        assert_eq!(pr.failed_jobs(), jobs);
+        assert_eq!(pr.failed_run_ids(), runs);
+        let only = PullRequest { checks: Vec::new(), awaiting_approval: 2, ..pr };
+        assert_eq!(only.summary().overall(), Some(CheckState::Failure));
+        assert!(only.failed_jobs().is_empty());
     }
 
     #[test]
