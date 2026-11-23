@@ -24,6 +24,7 @@ mod element;
 mod file_doc;
 mod file_view;
 mod paste_image;
+mod phone_cli;
 mod quick_command_dialogs;
 mod quick_commands;
 mod handoff;
@@ -116,8 +117,14 @@ fn main() -> anyhow::Result<()> {
         ["daemon"] => cli::run_daemon(&socket),
         ["daemon", "start"] => cli::start_daemon(&socket),
         ["daemon", "stop"] => cli::stop_daemon(&socket),
+        ["gateway"] => cli::run_gateway(&socket, false),
+        ["gateway", "--takeover"] => cli::run_gateway(&socket, true),
+        ["phone", rest @ ..] => {
+            let rest: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+            std::process::exit(phone_cli::run(&socket, &rest))
+        }
         _ => {
-            eprintln!("usage: sich [daemon [start|stop] | orch <cmd>]");
+            eprintln!("usage: sich [daemon [start|stop] | gateway [--takeover] | phone <cmd> | orch <cmd>]");
             std::process::exit(2);
         }
     }

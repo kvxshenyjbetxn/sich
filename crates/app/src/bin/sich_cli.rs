@@ -18,7 +18,7 @@ const USAGE: &str = "usage: sich-cli orch <command> [args]   (see: sich-cli orch
 /// Subcommands that are relayed to the GUI exe. Anything else (including no arguments, which
 /// would start the GUI) is refused.
 fn is_cli_subcommand(args: &[OsString]) -> bool {
-    matches!(args.first().and_then(|a| a.to_str()), Some("orch" | "daemon"))
+    matches!(args.first().and_then(|a| a.to_str()), Some("orch" | "daemon" | "phone"))
 }
 
 /// The exe to relay to: the `SICH_EXE` override when non-empty, else `sich.exe` next to us.
@@ -107,6 +107,7 @@ mod tests {
     fn classifies_cli_subcommands() {
         assert!(is_cli_subcommand(&a(&["orch", "list"])));
         assert!(is_cli_subcommand(&a(&["daemon", "stop"])));
+        assert!(is_cli_subcommand(&a(&["phone", "pair"])));
         assert!(!is_cli_subcommand(&a(&[])));
         assert!(!is_cli_subcommand(&a(&["--takeover"])));
         assert!(!is_cli_subcommand(&a(&["hook", "claude"])));
