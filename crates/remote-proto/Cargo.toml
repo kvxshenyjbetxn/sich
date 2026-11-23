@@ -1,0 +1,18 @@
+[package]
+name = "sich-remote-proto"
+version = "0.1.38"
+edition = "2024"
+description = "Phone <-> gateway wire types for Sich (platform independent)"
+
+# Explicit versions on purpose: the mobile workspace depends on this crate by
+# path and cannot inherit from the root workspace.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["use-std"] }
+thiserror = "2"
+bytes = { version = "1", optional = true }
+tokio-util = { version = "0.7", features = ["codec"], optional = true }
+
+[features]
+default = []
+tokio = ["dep:tokio-util", "dep:bytes"]

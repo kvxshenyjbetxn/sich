@@ -34,6 +34,7 @@ sich-term = { path = "crates/term" }
 sich-hooks = { path = "crates/hooks" }
 sich-git = { path = "crates/git" }
 sich-orch = { path = "crates/orch" }
+sich-remote-proto = { path = "crates/remote-proto" }
 
 # Smaller debug builds: line numbers in our code, no debug info for dependencies.
 [profile.dev]

@@ -6284,6 +6284,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sich-remote-proto"
+version = "0.1.38"
+dependencies = [
+ "bytes",
+ "postcard",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio-util",
+]
+
+[[package]]
 name = "sich-term"
 version = "0.1.38"
 dependencies = [
