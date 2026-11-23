@@ -613,6 +613,31 @@ pub enum Tr {
     HandoffSubmit,
     HandoffOpenFailed,
     HandoffTimeout,
+    AgentsTab,
+    AgentsSearch,
+    AgentsRefresh,
+    AgentsScopeWorktree,
+    AgentsScopeProject,
+    AgentsScopeAll,
+    AgentsResume,
+    AgentsGoToTerminal,
+    AgentsHandoff,
+    AgentsResumeNoDir,
+    AgentsResumeUnavailable,
+    AgentsResumeFailed,
+    AgentsMore,
+    AgentsEmpty,
+    AgentsScanning,
+    AgentsScanError,
+    AgentsOpenTranscript,
+    AgentsReveal,
+    AgentsCopyId,
+    AgentsCopyPath,
+    AgentsCopyResume,
+    AgentsYou,
+    AgentsAgent,
+    AgentsLoadingTurns,
+    AgentsNoTurns,
 }
 
 impl Tr {
@@ -1188,6 +1213,31 @@ impl Tr {
         Tr::HandoffSubmit,
         Tr::HandoffOpenFailed,
         Tr::HandoffTimeout,
+        Tr::AgentsTab,
+        Tr::AgentsSearch,
+        Tr::AgentsRefresh,
+        Tr::AgentsScopeWorktree,
+        Tr::AgentsScopeProject,
+        Tr::AgentsScopeAll,
+        Tr::AgentsResume,
+        Tr::AgentsGoToTerminal,
+        Tr::AgentsHandoff,
+        Tr::AgentsResumeNoDir,
+        Tr::AgentsResumeUnavailable,
+        Tr::AgentsResumeFailed,
+        Tr::AgentsMore,
+        Tr::AgentsEmpty,
+        Tr::AgentsScanning,
+        Tr::AgentsScanError,
+        Tr::AgentsOpenTranscript,
+        Tr::AgentsReveal,
+        Tr::AgentsCopyId,
+        Tr::AgentsCopyPath,
+        Tr::AgentsCopyResume,
+        Tr::AgentsYou,
+        Tr::AgentsAgent,
+        Tr::AgentsLoadingTurns,
+        Tr::AgentsNoTurns,
     ];
 }
 
@@ -2898,6 +2948,131 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "Агент не сообщил о готовности. Подсказка для передачи скопирована в буфер обмена.",
             En => "The agent did not report ready. The handoff prompt is in the clipboard.",
         },
+        Tr::AgentsTab => match lang {
+            Uk => "Агенти",
+            Ru => "Агенты",
+            En => "Agents",
+        },
+        Tr::AgentsSearch => match lang {
+            Uk => "Пошук сесій",
+            Ru => "Поиск сессий",
+            En => "Search sessions",
+        },
+        Tr::AgentsRefresh => match lang {
+            Uk => "Оновити",
+            Ru => "Обновить",
+            En => "Refresh",
+        },
+        Tr::AgentsScopeWorktree => match lang {
+            Uk => "Цей worktree",
+            Ru => "Этот worktree",
+            En => "This worktree",
+        },
+        Tr::AgentsScopeProject => match lang {
+            Uk => "Проєкт",
+            Ru => "Проект",
+            En => "Project",
+        },
+        Tr::AgentsScopeAll => match lang {
+            Uk => "Усі",
+            Ru => "Все",
+            En => "All",
+        },
+        Tr::AgentsResume => match lang {
+            Uk => "Відновити",
+            Ru => "Восстановить",
+            En => "Resume",
+        },
+        Tr::AgentsGoToTerminal => match lang {
+            Uk => "Перейти до термінала",
+            Ru => "Перейти к терминалу",
+            En => "Go to terminal",
+        },
+        Tr::AgentsHandoff => match lang {
+            Uk => "Передати контекст іншому агенту",
+            Ru => "Передать контекст другому агенту",
+            En => "Hand off to another agent",
+        },
+        Tr::AgentsResumeNoDir => match lang {
+            Uk => "Папки цієї сесії більше немає",
+            Ru => "Папки этой сессии больше нет",
+            En => "This session's folder no longer exists",
+        },
+        Tr::AgentsResumeUnavailable => match lang {
+            Uk => "Цю сесію не можна відновити: немає папки або ідентифікатор невірний.",
+            Ru => "Эту сессию нельзя восстановить: нет папки или идентификатор неверный.",
+            En => "This session cannot be resumed: its folder is missing or its id is invalid.",
+        },
+        Tr::AgentsResumeFailed => match lang {
+            Uk => "Не вдалося відкрити термінал для відновлення сесії.",
+            Ru => "Не удалось открыть терминал для восстановления сессии.",
+            En => "Could not open a terminal to resume the session.",
+        },
+        Tr::AgentsMore => match lang {
+            Uk => "Показати ще",
+            Ru => "Показать ещё",
+            En => "Show more",
+        },
+        Tr::AgentsEmpty => match lang {
+            Uk => "Сесій не знайдено",
+            Ru => "Сессий не найдено",
+            En => "No sessions found",
+        },
+        Tr::AgentsScanning => match lang {
+            Uk => "Пошук сесій…",
+            Ru => "Поиск сессий…",
+            En => "Scanning sessions…",
+        },
+        Tr::AgentsScanError => match lang {
+            Uk => "Не вдалося прочитати історію агентів",
+            Ru => "Не удалось прочитать историю агентов",
+            En => "Could not read the agents' history",
+        },
+        Tr::AgentsOpenTranscript => match lang {
+            Uk => "Відкрити транскрипт",
+            Ru => "Открыть транскрипт",
+            En => "Open transcript",
+        },
+        Tr::AgentsReveal => match lang {
+            Uk => "Показати у провіднику",
+            Ru => "Показать в проводнике",
+            En => "Reveal in file manager",
+        },
+        Tr::AgentsCopyId => match lang {
+            Uk => "Копіювати ID сесії",
+            Ru => "Копировать ID сессии",
+            En => "Copy session ID",
+        },
+        Tr::AgentsCopyPath => match lang {
+            Uk => "Копіювати шлях до транскрипту",
+            Ru => "Копировать путь к транскрипту",
+            En => "Copy transcript path",
+        },
+        Tr::AgentsCopyResume => match lang {
+            Uk => "Копіювати команду відновлення",
+            Ru => "Копировать команду восстановления",
+            En => "Copy resume command",
+        },
+        Tr::AgentsYou => match lang {
+            Uk => "Ви",
+            Ru => "Вы",
+            En => "You",
+        },
+        Tr::AgentsAgent => match lang {
+            Uk => "Агент",
+            Ru => "Агент",
+            En => "Agent",
+        },
+        Tr::AgentsLoadingTurns => match lang {
+            Uk => "Завантаження…",
+            Ru => "Загрузка…",
+            En => "Loading…",
+        },
+        Tr::AgentsNoTurns => match lang {
+            Uk => "У кінці сесії немає повідомлень",
+            Ru => "В конце сессии нет сообщений",
+            En => "No messages at the end of the session",
+        },
         Tr::ToastAgent => match lang {
             Uk => "Агент",
             Ru => "Агент",
@@ -4129,6 +4304,26 @@ pub fn download_progress(lang: Language, done: u64, total: u64) -> String {
         Language::En => "MB",
     };
     format!("{:.1} / {:.1} {unit} ({}%)", mb(done), mb(total), crate::updater::percent(done, total))
+}
+
+/// "N sessions" with the right plural form.
+pub fn agents_count(lang: Language, n: usize) -> String {
+    let (last, last2) = (n % 10, n % 100);
+    let word = match lang {
+        Language::Uk => match (last, last2) {
+            (1, l) if l != 11 => "сесія",
+            (2..=4, l) if !(12..=14).contains(&l) => "сесії",
+            _ => "сесій",
+        },
+        Language::Ru => match (last, last2) {
+            (1, l) if l != 11 => "сессия",
+            (2..=4, l) if !(12..=14).contains(&l) => "сессии",
+            _ => "сессий",
+        },
+        Language::En if n == 1 => "session",
+        Language::En => "sessions",
+    };
+    format!("{n} {word}")
 }
 
 pub fn handoff_write_failed(lang: Language, err: &str) -> String {

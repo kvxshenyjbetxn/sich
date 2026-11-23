@@ -14,7 +14,7 @@ use sich_proto::{AgentKind, TermId};
 
 use crate::agent_badge::agent_icon_element;
 use crate::app_view::AppView;
-use crate::handoff::{self, EntryKind, FolderChoice, FolderEntry, HandoffRequest};
+use crate::handoff::{self, EntryKind, FolderChoice, FolderEntry, HandoffOrigin, HandoffRequest};
 use crate::i18n::{Language, Tr, tr};
 use crate::settings;
 use crate::tab_bar::entry_title;
@@ -26,16 +26,32 @@ pub(crate) fn can_handoff(app: &AppView, id: TermId) -> bool {
 }
 
 pub(crate) fn open(app: Entity<AppView>, id: TermId, window: &mut Window, cx: &mut App) {
-    if window.has_active_dialog(cx) {
-        return;
-    }
     let snap = app.read(cx).client.snapshot();
     let Some(entry) = snap.terminals.iter().find(|e| e.info.id == id) else { return };
     let Some(status) = entry.info.agent.as_ref() else { return };
     let name = status.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| entry_title(entry));
-    let entries = handoff::folder_entries(&app.read(cx).projects, entry.info.worktree.as_deref(), &entry.info.cwd);
-    let (source_kind, term) = (status.kind, id);
-    let form = cx.new(|cx| HandoffDialog::new(app, term, source_kind, name, entries, window, cx));
+    let origin = HandoffOrigin {
+        kind: status.kind,
+        name,
+        cwd: entry.info.cwd.clone(),
+        worktree: entry.info.worktree.clone(),
+        session_id: status.session_id.clone(),
+        transcript: None,
+        prompt: status.prompt.clone(),
+        message: status.message.clone(),
+        model: status.model.clone(),
+        terminal: Some(id),
+    };
+    open_origin(app, origin, window, cx);
+}
+
+/// The dialog for any origin: a live terminal or a session from the agent history.
+pub(crate) fn open_origin(app: Entity<AppView>, origin: HandoffOrigin, window: &mut Window, cx: &mut App) {
+    if window.has_active_dialog(cx) {
+        return;
+    }
+    let entries = handoff::folder_entries(&app.read(cx).projects, origin.worktree.as_deref(), &origin.cwd);
+    let form = cx.new(|cx| HandoffDialog::new(app, origin, entries, window, cx));
     window.open_dialog(cx, move |dialog, _window, cx| {
         let lang = settings::language(cx);
         dialog.title(tr(lang, Tr::HandoffTitle)).w(px(480.)).child(form.clone())
@@ -44,9 +60,7 @@ pub(crate) fn open(app: Entity<AppView>, id: TermId, window: &mut Window, cx: &m
 
 struct HandoffDialog {
     app: Entity<AppView>,
-    term: TermId,
-    source_kind: AgentKind,
-    source_name: String,
+    origin: HandoffOrigin,
     entries: Vec<FolderEntry>,
     home: Option<PathBuf>,
     selected: usize,
@@ -58,9 +72,7 @@ struct HandoffDialog {
 impl HandoffDialog {
     fn new(
         app: Entity<AppView>,
-        term: TermId,
-        source_kind: AgentKind,
-        source_name: String,
+        origin: HandoffOrigin,
         entries: Vec<FolderEntry>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -73,13 +85,11 @@ impl HandoffDialog {
         });
         Self {
             app,
-            term,
-            source_kind,
-            source_name,
+            target: handoff::default_target(origin.kind),
+            origin,
             entries,
             home: dirs::home_dir(),
             selected: 0,
-            target: handoff::default_target(source_kind),
             note,
             _subscription: subscription,
         }
@@ -116,7 +126,7 @@ impl HandoffDialog {
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.entries.get(self.selected) else { return };
         let request = HandoffRequest {
-            term: self.term,
+            origin: self.origin.clone(),
             target: self.target,
             folder: entry.choice.clone(),
             note: self.note.read(cx).value().to_string(),
@@ -149,9 +159,9 @@ impl Render for HandoffDialog {
             .text_sm()
             .text_color(theme.muted_foreground)
             .child(format!("{}:", tr(lang, Tr::HandoffFrom)))
-            .child(agent_icon_element(self.source_kind, 14., theme.foreground, theme.muted_foreground))
+            .child(agent_icon_element(self.origin.kind, 14., theme.foreground, theme.muted_foreground))
             .child(div().min_w_0().truncate().child(format!(
-                "{} \u{b7} {}", handoff::kind_name(self.source_kind), self.source_name
+                "{} \u{b7} {}", handoff::kind_name(self.origin.kind), self.origin.name
             )));
 
         let mut agents = h_flex().gap_2();

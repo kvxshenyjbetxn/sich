@@ -100,9 +100,75 @@ pub(crate) fn handoff_step(tracked: Tracked<'_>, target: AgentKind, expired: boo
     }
 }
 
+/// Where a handoff comes from: a live terminal (`terminal` is set; the rest is what the dialog
+/// shows, `AppView::start_handoff` reads the live data itself) or a session from the history
+/// (everything is known up front and the transcript is the session file).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HandoffOrigin {
+    pub kind: AgentKind,
+    /// Shown in the dialog.
+    pub name: String,
+    pub cwd: PathBuf,
+    /// The worktree the origin belongs to; preselects the dialog's first folder.
+    pub worktree: Option<PathBuf>,
+    pub session_id: Option<String>,
+    pub transcript: Option<PathBuf>,
+    pub prompt: Option<String>,
+    pub message: Option<String>,
+    pub model: Option<String>,
+    pub terminal: Option<sich_proto::TermId>,
+}
+
+impl HandoffOrigin {
+    /// A session from the agent history (never has a terminal).
+    pub(crate) fn from_session(meta: &crate::agent_history::SessionMeta, projects: &[ProjectInfo]) -> Self {
+        let cwd = meta.cwd.clone().unwrap_or_default();
+        Self {
+            kind: meta.kind,
+            name: meta.display_title().to_owned(),
+            worktree: containing_worktree(projects, &cwd),
+            cwd,
+            session_id: Some(meta.id.clone()),
+            transcript: Some(meta.path.clone()),
+            prompt: Some(meta.last_prompt.clone()),
+            message: meta.last_assistant.clone(),
+            model: meta.model.clone(),
+            terminal: None,
+        }
+    }
+
+    /// The brief's source for a history origin: no terminal text, the session file as transcript.
+    pub(crate) fn history_source(&self) -> HandoffSource {
+        HandoffSource {
+            kind: self.kind,
+            model: self.model.clone(),
+            title: Some(self.name.clone()),
+            session_id: self.session_id.clone(),
+            cwd: self.cwd.clone(),
+            prompt: self.prompt.clone(),
+            message: self.message.clone(),
+            transcript: self.transcript.clone(),
+            terminal_text: None,
+        }
+    }
+}
+
+/// The known worktree that contains `cwd` (the deepest one when they nest).
+pub(crate) fn containing_worktree(projects: &[ProjectInfo], cwd: &Path) -> Option<PathBuf> {
+    if cwd.as_os_str().is_empty() {
+        return None;
+    }
+    projects
+        .iter()
+        .flat_map(|p| p.worktrees.iter())
+        .filter(|w| crate::agent_history::is_inside(cwd, &w.path))
+        .max_by_key(|w| crate::workspace::normalize_path(&w.path).len())
+        .map(|w| w.path.clone())
+}
+
 /// What the dialog hands to `AppView::start_handoff`.
 pub(crate) struct HandoffRequest {
-    pub term: sich_proto::TermId,
+    pub origin: HandoffOrigin,
     pub target: AgentKind,
     pub folder: FolderChoice,
     pub note: String,
@@ -753,5 +819,70 @@ mod tests {
         assert_eq!(bounded.chars().count(), 3);
         let big = "x".repeat(TERMINAL_MAX_BYTES + 500);
         assert_eq!(bound_terminal_text(&big, 10, TERMINAL_MAX_BYTES).len(), TERMINAL_MAX_BYTES);
+    }
+
+    fn session(cwd: Option<&str>) -> crate::agent_history::SessionMeta {
+        crate::agent_history::SessionMeta {
+            kind: AgentKind::Codex,
+            id: "0198a1b2-c3d4".into(),
+            path: PathBuf::from("/home/u/.codex/sessions/2026/11/02/rollout-x-0198a1b2-c3d4.jsonl"),
+            cwd: cwd.map(PathBuf::from),
+            cwd_exists: true,
+            branch: Some("feat".into()),
+            title: Some("Refactor auth".into()),
+            first_prompt: "first".into(),
+            last_prompt: "last prompt".into(),
+            last_assistant: Some("last answer".into()),
+            model: Some("gpt-5".into()),
+            created_ms: None,
+            updated_ms: 1,
+        }
+    }
+
+    #[test]
+    fn origin_from_a_history_session_points_at_the_session_file() {
+        let projects = vec![project("/w/app", &[("/w/app", Some("main")), ("/w/wt/feat", Some("feat"))])];
+        let origin = HandoffOrigin::from_session(&session(Some("/w/wt/feat/pkg")), &projects);
+        assert_eq!(origin.kind, AgentKind::Codex);
+        assert_eq!(origin.name, "Refactor auth");
+        assert_eq!(origin.cwd, PathBuf::from("/w/wt/feat/pkg"));
+        assert_eq!(origin.worktree, Some(PathBuf::from("/w/wt/feat")));
+        assert_eq!(origin.terminal, None);
+        let source = origin.history_source();
+        assert_eq!(source.transcript, Some(PathBuf::from("/home/u/.codex/sessions/2026/11/02/rollout-x-0198a1b2-c3d4.jsonl")));
+        assert_eq!(source.terminal_text, None);
+        assert_eq!(source.prompt.as_deref(), Some("last prompt"));
+        assert_eq!(source.message.as_deref(), Some("last answer"));
+        assert_eq!(source.session_id.as_deref(), Some("0198a1b2-c3d4"));
+        assert_eq!(source.model.as_deref(), Some("gpt-5"));
+        assert_eq!(source.title.as_deref(), Some("Refactor auth"));
+        let brief = build_brief(&source, &target("/w/wt/feat"), Some("go"));
+        assert!(brief.contains("Original agent: Codex (model gpt-5)\n"), "{brief}");
+        assert!(brief.contains("rollout-x-0198a1b2-c3d4.jsonl\n```"), "{brief}");
+        assert!(brief.contains("Last user prompt: last prompt\nLast assistant update: last answer\n"));
+        assert!(!brief.contains("Recent terminal output"));
+        assert!(brief.contains("Your working directory is different: /w/wt/feat."));
+    }
+
+    #[test]
+    fn history_origin_without_a_directory_or_known_worktree() {
+        let origin = HandoffOrigin::from_session(&session(None), &[]);
+        assert_eq!(origin.cwd, PathBuf::new());
+        assert_eq!(origin.worktree, None);
+        let entries = folder_entries(&[], origin.worktree.as_deref(), &origin.cwd);
+        assert_eq!(entries[0].choice, FolderChoice::Home);
+        let unknown = HandoffOrigin::from_session(&session(Some("/other/dir")), &[project("/w/app", &[("/w/app", None)])]);
+        assert_eq!(unknown.worktree, None);
+        let entries = folder_entries(&[], unknown.worktree.as_deref(), &unknown.cwd);
+        assert_eq!(entries[0].choice, FolderChoice::Path(PathBuf::from("/other/dir")));
+    }
+
+    #[test]
+    fn containing_worktree_prefers_the_deepest_match() {
+        let projects = vec![project("/w/app", &[("/w/app", Some("main")), ("/w/app/.wt/feat", Some("feat"))])];
+        assert_eq!(containing_worktree(&projects, Path::new("/w/app/.wt/feat/src")), Some(PathBuf::from("/w/app/.wt/feat")));
+        assert_eq!(containing_worktree(&projects, Path::new("/w/app/src")), Some(PathBuf::from("/w/app")));
+        assert_eq!(containing_worktree(&projects, Path::new("/w/other")), None);
+        assert_eq!(containing_worktree(&projects, Path::new("")), None);
     }
 }
