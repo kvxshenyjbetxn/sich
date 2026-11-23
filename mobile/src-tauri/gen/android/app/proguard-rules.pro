@@ -19,3 +19,11 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+# Tauri plugins (barcode scanner etc.) are called and their args parsed by reflection;
+# R8 renaming/stripping them crashed the QR scanner in release builds.
+-keep class app.tauri.** { *; }
+-keep @app.tauri.annotation.InvokeArg class * { *; }
+-keep class androidx.camera.** { *; }
+-keep class com.google.mlkit.** { *; }
+-keep class com.google.android.gms.internal.mlkit_vision_barcode** { *; }
+-keepattributes *Annotation*,Signature,InnerClasses,EnclosingMethod
