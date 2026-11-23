@@ -451,6 +451,17 @@ textarea:focus {
 .term-inner .xterm {
   padding: 2px;
 }
+.kitty-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 5;
+  overflow: hidden;
+}
+.kitty-strip {
+  position: absolute;
+  background-repeat: no-repeat;
+}
 
 .keys-row {
   display: flex;

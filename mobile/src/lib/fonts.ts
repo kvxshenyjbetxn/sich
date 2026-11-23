@@ -2,7 +2,7 @@
 // so symbol fallbacks are bundled (see main.tsx) and listed after the main monospace font.
 // Emoji deliberately stay with the system emoji font.
 export const MONO_FAMILIES = ["Cascadia Mono", "JetBrains Mono"];
-export const FALLBACK_FAMILIES = ["Noto Sans Symbols 2", "Noto Sans Symbols", "Noto Sans Math"];
+export const FALLBACK_FAMILIES = ["Noto Sans Symbols 2", "Noto Sans Symbols", "Noto Sans Math", "DejaVu Mono"];
 export const SYSTEM_FAMILIES = ["Menlo", "monospace"];
 
 const q = (f: string) => (f.includes(" ") ? `"${f}"` : f);
