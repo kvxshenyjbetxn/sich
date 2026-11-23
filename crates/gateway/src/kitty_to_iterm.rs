@@ -13,7 +13,7 @@
 //! - the U+10EEEE placeholder text passes through untouched.
 //! `C=1` (do not move the cursor) is ignored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::Path;
 
@@ -56,14 +56,19 @@ struct Cmd {
     rows: u32,
     delete: u8,
     explicit_action: bool,
+    /// Only `m=`/`q=` keys: a continuation chunk of a chunked transmission.
+    cont_only: bool,
 }
 
 fn parse_control(control: &[u8]) -> Cmd {
-    let mut c = Cmd { action: b't', format: 32, medium: b'd', delete: b'a', ..Cmd::default() };
+    let mut c = Cmd { action: b't', format: 32, medium: b'd', delete: b'a', cont_only: true, ..Cmd::default() };
     for pair in String::from_utf8_lossy(control).split(',') {
         let Some((k, v)) = pair.split_once('=') else { continue };
         let mut kc = k.chars();
         let (Some(key), None) = (kc.next(), kc.next()) else { continue };
+        if key != 'm' && key != 'q' {
+            c.cont_only = false;
+        }
         let first = v.bytes().next().unwrap_or(0);
         let num: u32 = v.parse().unwrap_or(0);
         match key {
@@ -109,10 +114,29 @@ struct Pending {
     overflow: bool,
 }
 
+/// Cell size and placement id of the last virtual (`U=1`) placement of an image.
+#[derive(Clone, Copy)]
+struct Virt {
+    placement: u32,
+    cols: u32,
+    rows: u32,
+}
+
 struct Stored {
     /// PNG/JPEG/GIF/WebP bytes, ready for the iTerm2 sequence.
     bytes: Vec<u8>,
     tick: u64,
+    /// The image has an explicit `i=` and was forwarded to the phone (`I=`-only ones are not).
+    forwarded: bool,
+    virt: Option<Virt>,
+}
+
+/// One piece of transformed output: terminal text (kept in the replay ring) or the normalized
+/// transmission of one image (sent live only; replays rebuild it from the image store).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Part {
+    Text(Vec<u8>),
+    Image { id: u32, bytes: Vec<u8> },
 }
 
 pub struct KittyToIterm {
@@ -127,6 +151,8 @@ pub struct KittyToIterm {
     next_synthetic: u32,
     max_image: usize,
     max_stored: usize,
+    /// `(start, end, id)` of the normalized transmissions inside the current `feed` output.
+    ranges: Vec<(usize, usize, u32)>,
 }
 
 impl Default for KittyToIterm {
@@ -149,6 +175,7 @@ impl KittyToIterm {
             next_synthetic: SYNTHETIC_BASE,
             max_image,
             max_stored,
+            ranges: Vec::new(),
         }
     }
 
@@ -168,8 +195,45 @@ impl KittyToIterm {
         self.pending = None;
     }
 
+    /// Like `feed`, but image transmissions come out as separate `Part::Image`s so the caller can
+    /// keep them out of its replay ring.
+    pub fn feed_split(&mut self, data: &[u8]) -> Vec<Part> {
+        let out = self.feed(data);
+        let ranges = std::mem::take(&mut self.ranges);
+        let mut parts = Vec::new();
+        let mut at = 0;
+        for (start, end, id) in ranges {
+            if start > at {
+                parts.push(Part::Text(out[at..start].to_vec()));
+            }
+            parts.push(Part::Image { id, bytes: out[start..end].to_vec() });
+            at = end;
+        }
+        if at < out.len() {
+            parts.push(Part::Text(out[at..].to_vec()));
+        }
+        parts
+    }
+
+    /// The normalized transmission (plus virtual placement) of every stored, forwarded image
+    /// whose id low 24 bits are in `ids`, oldest first. Used to rebuild images for a replay.
+    pub fn replay_images(&self, ids: &HashSet<u32>) -> Vec<u8> {
+        let mut found: Vec<(&u32, &Stored)> =
+            self.images.iter().filter(|(id, s)| s.forwarded && ids.contains(&(**id & 0xFF_FFFF))).collect();
+        found.sort_by_key(|(_, s)| s.tick);
+        let mut out = Vec::new();
+        for (id, s) in found {
+            emit_normalized(&mut out, *id, &s.bytes);
+            if let Some(v) = s.virt {
+                emit_virtual(&mut out, &Cmd { id: *id, placement: v.placement, cols: v.cols, rows: v.rows, ..Cmd::default() });
+            }
+        }
+        out
+    }
+
     /// Transforms one chunk. A trailing partial `ESC` / `ESC _` is held until the next chunk.
     pub fn feed(&mut self, data: &[u8]) -> Vec<u8> {
+        self.ranges.clear();
         let mut out = Vec::with_capacity(data.len());
         let mut i = 0;
         while i < data.len() {
@@ -295,6 +359,12 @@ impl KittyToIterm {
             return;
         }
         self.pending = None;
+        if !cmd.explicit_action && cmd.cont_only {
+            // Continuation of a transmission that started before we saw the stream (a replay
+            // that begins mid-image): nothing to attach it to.
+            tracing::debug!("kitty graphics: orphan continuation chunk dropped");
+            return;
+        }
         match cmd.action {
             b't' | b'T' => {
                 if payload.len() > self.max_image {
@@ -313,6 +383,9 @@ impl KittyToIterm {
             b'p' if cmd.unicode => {
                 if cmd.id != 0 {
                     emit_virtual(out, &cmd);
+                    if let Some(s) = self.images.get_mut(&cmd.id) {
+                        s.virt = Some(Virt { placement: cmd.placement, cols: cmd.cols, rows: cmd.rows });
+                    }
                 } else {
                     tracing::debug!("kitty graphics: virtual placement without i= dropped");
                 }
@@ -373,7 +446,7 @@ impl KittyToIterm {
         self.numbers.retain(|_, v| *v != id);
     }
 
-    fn store(&mut self, id: u32, number: u32, bytes: Vec<u8>) {
+    fn store(&mut self, id: u32, number: u32, bytes: Vec<u8>, forwarded: bool, virt: Option<Virt>) {
         if bytes.len() > self.max_stored {
             tracing::warn!("kitty graphics: image over the store cap not kept");
             return;
@@ -385,7 +458,7 @@ impl KittyToIterm {
         }
         self.tick += 1;
         self.stored_bytes += bytes.len();
-        self.images.insert(id, Stored { bytes, tick: self.tick });
+        self.images.insert(id, Stored { bytes, tick: self.tick, forwarded, virt });
         if number != 0 {
             self.numbers.insert(number, id);
         }
@@ -406,7 +479,9 @@ impl KittyToIterm {
             self.next_synthetic = self.next_synthetic.wrapping_add(1).max(SYNTHETIC_BASE);
         }
         if cmd.id != 0 {
+            let start = out.len();
             emit_normalized(out, cmd.id, &bytes);
+            self.ranges.push((start, out.len(), cmd.id));
         } else if cmd.action == b't' {
             tracing::debug!("kitty graphics: transmission without i= not forwarded");
         }
@@ -420,9 +495,86 @@ impl KittyToIterm {
             }
         }
         if id != 0 {
-            self.store(id, cmd.number, bytes);
+            let virt = (cmd.unicode && cmd.id != 0)
+                .then_some(Virt { placement: cmd.placement, cols: cmd.cols, rows: cmd.rows });
+            self.store(id, cmd.number, bytes, cmd.id != 0, virt);
         }
     }
+}
+
+/// Image ids (low 24 bits) of the U+10EEEE placeholder cells in `text`, read from the current
+/// foreground color (`38;2;r;g;b` or `38;5;n`; the id's high byte is ignored).
+pub fn referenced_ids(text: &[u8]) -> HashSet<u32> {
+    const PLACEHOLDER: [u8; 4] = [0xF4, 0x8E, 0xBB, 0xAE];
+    let mut ids = HashSet::new();
+    let mut fg: Option<u32> = None;
+    let mut i = 0;
+    while i < text.len() {
+        match text[i] {
+            ESC if text.get(i + 1) == Some(&b'[') => {
+                let Some(end) = text[i + 2..].iter().position(|b| (0x40..=0x7e).contains(b)) else { break };
+                if text[i + 2 + end] == b'm' {
+                    apply_sgr(&text[i + 2..i + 2 + end], &mut fg);
+                }
+                i += 2 + end + 1;
+            }
+            0xF4 if text[i..].starts_with(&PLACEHOLDER) => {
+                if let Some(id) = fg {
+                    ids.insert(id & 0xFF_FFFF);
+                }
+                i += 4;
+            }
+            _ => i += 1,
+        }
+    }
+    ids
+}
+
+fn apply_sgr(params: &[u8], fg: &mut Option<u32>) {
+    let text = String::from_utf8_lossy(params);
+    // `;` separates parameters; `:` separates the parts of one (`38:2::r:g:b`).
+    let nums: Vec<u32> = text.split([';', ':']).map(|p| p.parse().unwrap_or(0)).collect();
+    let mut i = 0;
+    while i < nums.len() {
+        match nums[i] {
+            0 | 30..=37 | 39 | 90..=97 => *fg = None,
+            38 => match nums.get(i + 1) {
+                Some(5) => {
+                    *fg = nums.get(i + 2).copied();
+                    i += 2;
+                }
+                Some(2) => {
+                    // `38:2::r:g:b` carries an empty color-space slot.
+                    let skip = usize::from(text.contains("::"));
+                    let rgb: Vec<u32> = nums.iter().skip(i + 2 + skip).take(3).copied().collect();
+                    if rgb.len() == 3 {
+                        *fg = Some(((rgb[0] & 0xFF) << 16) | ((rgb[1] & 0xFF) << 8) | (rgb[2] & 0xFF));
+                    }
+                    i += 4 + skip;
+                }
+                _ => {}
+            },
+            // Background colors: skip their arguments so they are not read as SGR codes.
+            48 | 58 => match nums.get(i + 1) {
+                Some(5) => i += 2,
+                Some(2) => i += 4,
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+/// Drops the tail of a Kitty APC whose start is missing (a stream or replay that begins inside
+/// `ESC _ G <control>;<base64> ESC \`): leading control/base64 text up to the first `ESC \`.
+/// Anything else is returned unchanged.
+pub fn strip_orphan_apc_tail(data: &[u8]) -> &[u8] {
+    let Some(esc) = data.iter().position(|&b| b == ESC) else { return data };
+    let orphan = esc > 0
+        && data.get(esc + 1) == Some(&b'\\')
+        && data[..esc].iter().all(|b| b.is_ascii_alphanumeric() || b"+/=,;_-".contains(b));
+    if orphan { &data[esc + 2..] } else { data }
 }
 
 fn load(cmd: &Cmd, payload: &[u8], max: usize) -> Result<Vec<u8>, String> {
@@ -522,6 +674,14 @@ fn emit_normalized(out: &mut Vec<u8>, id: u32, image: &[u8]) {
     let last = chunks.len().saturating_sub(1);
     for (n, chunk) in chunks.iter().enumerate() {
         let more = u8::from(n != last);
+        if n > 0 {
+            // Continuation chunks carry only `m`/`q`, as the Kitty protocol (and every phone
+            // build) expects; the keys are in the first chunk.
+            out.extend_from_slice(format!("\x1b_Gm={more},q=2;").as_bytes());
+            out.extend_from_slice(chunk);
+            out.extend_from_slice(b"\x1b\\");
+            continue;
+        }
         out.extend_from_slice(format!("_Ga=t,f=100,t=d,q=2,i={id},m={more};").as_bytes());
         out.extend_from_slice(chunk);
         out.extend_from_slice(b"\\");
@@ -706,7 +866,8 @@ mod tests {
         let mut out = Vec::new();
         for (n, c) in chunks.iter().enumerate() {
             let m = u8::from(n + 1 != chunks.len());
-            out.extend(format!("\x1b_Ga=t,f=100,t=d,q=2,i={id},m={m};{c}\x1b\\").into_bytes());
+            let ctl = if n == 0 { format!("a=t,f=100,t=d,q=2,i={id},m={m}") } else { format!("m={m},q=2") };
+            out.extend(format!("\x1b_G{ctl};{c}\x1b\\").into_bytes());
         }
         out
     }
@@ -772,7 +933,9 @@ mod tests {
         for (n, p) in parts.iter().enumerate() {
             let (ctl, data) = p.trim_start_matches("\x1b_G").split_once(';').unwrap();
             assert!(data.len() <= 4096);
-            assert!(ctl.ends_with(if n + 1 == parts.len() { "m=0" } else { "m=1" }));
+            let m = if n + 1 == parts.len() { "m=0" } else { "m=1" };
+            // Keys only on the first chunk; the rest are plain continuations.
+            assert_eq!(ctl, if n == 0 { format!("a=t,f=100,t=d,q=2,i=5,{m}") } else { format!("{m},q=2") });
             joined += data;
         }
         use base64::Engine as _;
@@ -825,6 +988,142 @@ mod tests {
         let mut f = KittyToIterm::with_limits(1 << 20, n - 1);
         assert!(!f.feed(&apc("a=T,f=100,i=1", &enc)).is_empty());
         assert_eq!(f.stored_count(), 0);
+    }
+
+    /// Claude Code (v2.x) sends images as: first chunk with all keys and `m=1`, the middle chunks
+    /// `m=1,q=2`, the last `m=0,q=2`, 4096 base64 chars each; `i` is a 24-bit id, `c`/`r` the size.
+    fn claude_image(id: u32, png: &[u8]) -> Vec<u8> {
+        let enc = b64(png);
+        let chunks: Vec<&str> = enc.as_bytes().chunks(4096).map(|c| std::str::from_utf8(c).unwrap()).collect();
+        let mut out = Vec::new();
+        for (n, c) in chunks.iter().enumerate() {
+            let more = u8::from(n + 1 != chunks.len());
+            let ctl = if n == 0 {
+                format!("a=T,U=1,q=2,f=100,i={id},c=9,r=10,m={more}")
+            } else {
+                format!("m={more},q=2")
+            };
+            out.extend(apc(&ctl, c));
+        }
+        out
+    }
+
+    fn big_png() -> Vec<u8> {
+        let raw: Vec<u8> = (0..45_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        encode_png(&raw, 100, 150, true).unwrap()
+    }
+
+    /// Placeholder rows as Claude Code prints them: truecolor foreground = image id, row and
+    /// column diacritics, no underline color.
+    fn claude_rows() -> String {
+        let marks = ['\u{305}', '\u{30D}', '\u{30E}'];
+        let mut s = String::new();
+        for r in marks {
+            s += "\x1b[49m  \x1b[38;2;237;19;168m";
+            for c in marks {
+                s.push('\u{10EEEE}');
+                s.push(r);
+                s.push(c);
+            }
+            s += "\x1b[39m\x1b[K\r\x1b[1B";
+        }
+        s
+    }
+
+    #[test]
+    fn claude_code_chunked_virtual_image_is_normalized_and_split_from_text() {
+        let png = big_png();
+        let id = 15_537_064;
+        let mut input = claude_image(id, &png);
+        input.extend(claude_rows().as_bytes());
+        let mut want_image = norm(id, &png);
+        want_image.extend(b"\x1b_Ga=p,U=1,q=2,i=15537064,c=9,r=10\x1b\\");
+        let mut whole = want_image.clone();
+        whole.extend(claude_rows().as_bytes());
+        // Any chunking of the daemon stream gives the same bytes and the same split.
+        for size in [1usize, 7, 4096, 5000, input.len()] {
+            let mut f = KittyToIterm::default();
+            let mut out = Vec::new();
+            let mut images = Vec::new();
+            for c in input.chunks(size) {
+                for part in f.feed_split(c) {
+                    match part {
+                        Part::Text(t) => out.extend(t),
+                        Part::Image { id: i, bytes } => {
+                            assert_eq!(i, id);
+                            images.extend(bytes);
+                        }
+                    }
+                }
+            }
+            assert_eq!(images, norm(id, &png), "chunk size {size}");
+            let mut text = b"\x1b_Ga=p,U=1,q=2,i=15537064,c=9,r=10\x1b\\".to_vec();
+            text.extend(claude_rows().as_bytes());
+            assert_eq!(out, text, "chunk size {size}");
+        }
+        let mut f = KittyToIterm::default();
+        assert_eq!(f.feed(&input), whole);
+    }
+
+    #[test]
+    fn orphan_continuation_chunks_are_dropped_silently() {
+        // A stream that starts in the middle of a transmission: only continuation chunks.
+        let png = big_png();
+        let input = claude_image(7, &png);
+        let first_end = input.windows(2).position(|w| w == b"\x1b\\").unwrap() + 2;
+        let mut f = KittyToIterm::default();
+        assert!(f.feed(&input[first_end..]).is_empty());
+        assert_eq!(f.stored_count(), 0);
+        assert_eq!(f.feed(b"ok"), b"ok");
+        // A real transmission right after still works.
+        assert_eq!(f.feed(&apc("a=t,f=100,i=9", &b64(&png_1x1()))), norm(9, &png_1x1()));
+    }
+
+    #[test]
+    fn replay_images_rebuilds_referenced_images_with_their_placement() {
+        let png = png_1x1();
+        let mut f = KittyToIterm::default();
+        f.feed(&apc("a=T,U=1,q=2,f=100,i=15537064,c=9,r=10", &b64(&png)));
+        f.feed(&apc("a=t,f=100,i=15537065", &b64(&png)));
+        f.feed(&apc("a=t,f=100,I=4", &b64(&png)));
+        let ids: HashSet<u32> = [15_537_064, 15_537_065, 77].into();
+        let mut want = norm(15_537_064, &png);
+        want.extend(b"\x1b_Ga=p,U=1,q=2,i=15537064,c=9,r=10\x1b\\");
+        let mut both = want.clone();
+        both.extend(norm(15_537_065, &png));
+        assert_eq!(f.replay_images(&ids), both, "oldest first, plain transmission without a placement");
+        // A later virtual placement updates the stored cell size.
+        f.feed(&apc("a=p,U=1,i=15537065,p=3,c=4,r=2", ""));
+        assert!(f.replay_images(&[15_537_065].into()).ends_with(b"\x1b_Ga=p,U=1,q=2,i=15537065,p=3,c=4,r=2\x1b\\"));
+        // Deleted images are gone; the high byte of an id does not matter for the lookup.
+        f.feed(&apc("a=d,d=I,i=15537064", ""));
+        assert!(f.replay_images(&[15_537_064].into()).is_empty());
+        f.feed(&apc("a=t,f=100,i=2181038081", &b64(&png)));
+        assert!(!f.replay_images(&[(2_181_038_081u32) & 0xFF_FFFF].into()).is_empty());
+    }
+
+    #[test]
+    fn referenced_ids_reads_truecolor_palette_and_colon_foregrounds() {
+        let ph = '\u{10EEEE}';
+        let text = format!(
+            "\x1b[38;2;237;19;168m{ph}\u{305}\u{305}{ph}\u{305}\u{30D}\x1b[39m{ph}\
+             \x1b[1;38;5;42m{ph}\x1b[0m{ph}\x1b[38:2::1:2:3m{ph}\x1b[38:2:4:5:6m{ph}\
+             \x1b[48;2;1;2;3m\x1b[31m{ph}\x1b[38;2;9;9;9mno placeholder here"
+        );
+        let ids = referenced_ids(text.as_bytes());
+        let want: HashSet<u32> = [15_537_064, 42, 0x010203, 0x040506].into();
+        assert_eq!(ids, want);
+        assert!(referenced_ids(b"plain \x1b[38;2;1;2;3m text \x1b[").is_empty());
+    }
+
+    #[test]
+    fn orphan_apc_tail_is_stripped_only_when_it_looks_like_one() {
+        assert_eq!(strip_orphan_apc_tail(b"AAAA/+==\x1b\\after"), b"after");
+        assert_eq!(strip_orphan_apc_tail(b"m=1,q=2;QUJD\x1b\\x"), b"x");
+        assert_eq!(strip_orphan_apc_tail(b"hello world\x1b\\x"), b"hello world\x1b\\x", "space is not base64");
+        assert_eq!(strip_orphan_apc_tail(b"\x1b\\x"), b"\x1b\\x", "no leading text");
+        assert_eq!(strip_orphan_apc_tail(b"abc\x1b[0m"), b"abc\x1b[0m");
+        assert_eq!(strip_orphan_apc_tail(b"plain"), b"plain");
     }
 
     #[test]

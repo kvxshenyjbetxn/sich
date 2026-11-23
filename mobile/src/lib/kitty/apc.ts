@@ -64,7 +64,12 @@ export class KittyCommandAssembler {
     const action = c.get("a");
     const more = c.get("m") === "1";
 
-    if (this.pending && action === undefined) {
+    // Chunks of one transfer carry only `m`/`q` per the Kitty protocol, but gateway builds up to
+    // 0.1.41 repeated `a=t,...,i=ID` on every chunk: the same id while a transfer is open is
+    // the next chunk, not a new image.
+    const repeated =
+      this.pending !== null && (action === "t" || action === "T") && num(c.get("i")) === this.pending.id;
+    if (this.pending && (action === undefined || repeated)) {
       // Continuation chunk of the transfer in progress.
       const p = this.pending;
       p.size += payload.length;
