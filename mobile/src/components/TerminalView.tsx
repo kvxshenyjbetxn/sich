@@ -5,8 +5,11 @@ import "@xterm/xterm/css/xterm.css";
 import { api } from "../api";
 import { WriteQueue, fontForWidth, pinchFont, type TermFrame } from "../lib/termLogic";
 import type { TermRef } from "../lib/types";
+import { KittyApcFilter } from "../lib/kitty/apc";
+import { ImageStore, applyEvent } from "../lib/kitty/store";
+import { attachImageOverlay } from "../lib/kitty/overlay";
 
-export const FONT_FAMILY = '"Cascadia Mono", "JetBrains Mono", Menlo, monospace';
+export const FONT_FAMILY = '"Cascadia Mono", "JetBrains Mono", "DejaVu Mono", Menlo, monospace';
 
 // Colors from crates/app/src/colors.rs (Gray scheme).
 const THEME = {
@@ -103,6 +106,8 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
   useEffect(() => {
     let disposed = false;
     const queue = new WriteQueue<TermFrame>();
+    const apc = new KittyApcFilter();
+    const images = new ImageStore();
     let x: XTerm | null = null;
     let ro: ResizeObserver | null = null;
     let timer: number | undefined;
@@ -133,6 +138,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
       x.open(inner);
       xRef.current = x;
       fitAddon.current = f;
+      cleanups.push(attachImageOverlay(x, images, THEME.background));
 
       x.onData((d) => {
         if (!live.current.disabled) live.current.onData(d);
@@ -144,10 +150,14 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
         if (!xt) return;
         if (frame.kind === "reset") {
           xt.reset();
+          apc.reset();
+          images.clear();
           live.current.onReset(frame.cols, frame.rows);
           layout.current();
         } else {
-          xt.write(frame.bytes);
+          const { out, events } = apc.feed(frame.bytes);
+          for (const ev of events) applyEvent(images, ev);
+          if (out.length > 0) xt.write(out);
         }
       });
 
@@ -195,6 +205,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
       ro?.disconnect();
       cleanups.forEach((c) => c());
       queue.detach();
+      images.clear();
       void api.unsubscribe(termRef);
       x?.dispose();
       xRef.current = null;
