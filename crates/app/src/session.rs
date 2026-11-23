@@ -45,10 +45,12 @@ pub enum RightTab {
     Context,
     /// Every image seen in the selected Claude session.
     Images,
+    /// History of the agents' sessions on disk (last in the enum: older session files still parse).
+    Agents,
 }
 
 impl RightTab {
-    pub const ALL: &'static [Self] = &[Self::Git, Self::Pr, Self::Context, Self::Images];
+    pub const ALL: &'static [Self] = &[Self::Git, Self::Pr, Self::Context, Self::Images, Self::Agents];
 
     /// The tab to actually show: the "Pull request" tab exists only while the PR section does,
     /// otherwise the panel falls back to Git (the saved choice is kept for when it returns).
@@ -671,7 +673,8 @@ mod tests {
         assert_eq!(RightTab::Pr.effective(false), RightTab::Git);
         assert_eq!(RightTab::Git.effective(true), RightTab::Git);
         assert_eq!(RightTab::Git.effective(false), RightTab::Git);
-        assert_eq!(RightTab::ALL, &[RightTab::Git, RightTab::Pr, RightTab::Context, RightTab::Images]);
+        assert_eq!(RightTab::ALL, &[RightTab::Git, RightTab::Pr, RightTab::Context, RightTab::Images, RightTab::Agents]);
+        assert_eq!(RightTab::Agents.effective(false), RightTab::Agents);
         assert_eq!(RightTab::Images.effective(false), RightTab::Images);
         assert_eq!(RightTab::Context.effective(false), RightTab::Context);
         assert_eq!(RightTab::Context.effective(true), RightTab::Context);
@@ -683,7 +686,7 @@ mod tests {
         let json = serde_json::to_string(&Session { right_panel: prefs, ..Default::default() }).unwrap();
         assert!(json.contains(r#""tab":"context""#), "{json}");
         assert_eq!(Session::parse(&json).unwrap().right_panel.tab, RightTab::Context);
-        for (raw, tab) in [("git", RightTab::Git), ("pr", RightTab::Pr), ("context", RightTab::Context), ("images", RightTab::Images)] {
+        for (raw, tab) in [("git", RightTab::Git), ("pr", RightTab::Pr), ("context", RightTab::Context), ("images", RightTab::Images), ("agents", RightTab::Agents)] {
             let session = Session::parse(&format!(r#"{{"right_panel":{{"tab":"{raw}"}}}}"#)).unwrap();
             assert_eq!(session.right_panel.tab, tab);
         }

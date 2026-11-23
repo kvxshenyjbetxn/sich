@@ -25,6 +25,7 @@ use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, Suba
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::context_panel::{self, ContextUi};
+use crate::agents_panel::{self, AgentsPanel};
 use crate::images_panel::{self, ImagesUi};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonPool, RestartResult, RestoreData, Snapshot};
 use crate::diff_view::DiffView;
@@ -90,6 +91,8 @@ enum TerminalOpenKind {
     Split { target: TermId, edge: Edge },
     QuickTab,
     Handoff,
+    /// "Resume" in the Agents tab: a terminal that runs `claude --resume` / `codex resume`.
+    Resume,
 }
 
 /// A handoff line waiting for the new agent terminal to become ready.
@@ -158,6 +161,9 @@ pub struct AppView {
     pub(crate) usage_bar: crate::usage_bar::UsageBar,
     pub(crate) ctx_ui: ContextUi,
     pub(crate) images_ui: ImagesUi,
+    pub(crate) agents_panel: Entity<AgentsPanel>,
+    /// What each terminal's agent looked like at the last check (re-read the history on changes).
+    agent_seen: HashMap<TermId, agents_panel::SeenAgent>,
     /// Whether the window has focus (kept by the activation observer and `sync`).
     window_active: bool,
     /// When the project list was last refreshed on window activation.
@@ -360,6 +366,11 @@ impl AppView {
             usage_bar: crate::usage_bar::UsageBar::default(),
             ctx_ui: ContextUi::default(),
             images_ui: ImagesUi::default(),
+            agents_panel: {
+                let app = cx.weak_entity();
+                cx.new(|cx| AgentsPanel::new(app, cx))
+            },
+            agent_seen: HashMap::new(),
             window_active: false,
             last_activation_refresh: None,
             hwnd: None,
@@ -504,7 +515,7 @@ impl AppView {
         let snap = self.client.snapshot();
         self.finish_restore_targets(&snap);
         let prefs = settings::get(cx);
-        self.track_agents(&snap, &prefs);
+        self.track_agents(&snap, &prefs, cx);
         // The window may be hidden in the tray (no renders), so keep these going from here too.
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
         self.tick_quick_terminals(&snap, prefs.orch_auto_close_workers, sich_orch::paths::now_ms());
@@ -581,6 +592,7 @@ impl AppView {
             let active = window.is_window_active();
             if active {
                 this.git_panel.update(cx, GitPanel::refresh);
+                this.agents_panel.update(cx, AgentsPanel::on_activated);
                 let now = Instant::now();
                 if should_refresh_on_activation(this.last_activation_refresh, now) {
                     this.last_activation_refresh = Some(now);
@@ -589,23 +601,28 @@ impl AppView {
             }
             this.window_active = active;
             let snap = this.client.snapshot();
-            this.track_agents(&snap, &settings::get(cx));
+            this.track_agents(&snap, &settings::get(cx), cx);
             cx.notify();
         })
         .detach();
     }
 
     /// Flash and notify on attention transitions, then mark the visible terminal seen.
-    fn track_agents(&mut self, snap: &Snapshot, prefs: &settings::AppSettings) {
+    fn track_agents(&mut self, snap: &Snapshot, prefs: &settings::AppSettings, cx: &mut Context<Self>) {
         let infos: Vec<TerminalInfo> = snap.terminals.iter().map(|t| t.info.clone()).collect();
         let ws_ids = self.workspace_ids(&infos);
         let active = if self.active_tab().is_none() { self.ws.active_in(&self.ws.selected, &ws_ids) } else { None };
         let window_active = self.window_active && !self.hidden_to_tray;
         let mut flash = false;
+        let mut history_changed = false;
         let instant = Instant::now();
         for t in &snap.terminals {
             let id = t.info.id;
             let status = t.info.agent.as_ref();
+            let seen = agents_panel::seen_agent(&t.info);
+            if let Some(prev) = self.agent_seen.insert(id, seen.clone().unwrap_or(agents_panel::SeenAgent { session_id: None, settled: false })) {
+                history_changed |= agents_panel::history_changed(Some(&prev), seen.as_ref());
+            }
             let now = kind_of(status);
             // The first snapshot of a terminal only seeds its state.
             if let Some(prev) = self.attention.insert(id, now) {
@@ -635,6 +652,10 @@ impl AppView {
         }
         let alive: HashSet<TermId> = infos.iter().map(|t| t.id).collect();
         self.attention.retain(|id, _| alive.contains(id));
+        self.agent_seen.retain(|id, _| alive.contains(id));
+        if history_changed {
+            self.agents_panel.update(cx, |panel, cx| panel.agent_activity(cx));
+        }
         self.seen_sent.retain(|id, _| alive.contains(id));
         self.toast_cooldown.retain(|id| alive.contains(&id));
         self.unseen_toasts.retain(|id| alive.contains(id));
@@ -1652,7 +1673,7 @@ impl AppView {
                 window.blur(cx);
             }
         }
-        self.track_agents(snap, &settings::get(cx));
+        self.track_agents(snap, &settings::get(cx), cx);
         self.sync_pr_tracking(cx);
         self.update_tray(infos, cx);
         self.touch_session(infos, cx);
@@ -1727,45 +1748,53 @@ impl AppView {
         self.track_terminal_open(token, workspace, TerminalOpenKind::QuickTab, cx);
     }
 
-    /// Writes the brief for `request.term`, opens the target agent in a new terminal and queues
+    /// Writes the brief for `request.origin`, opens the target agent in a new terminal and queues
     /// the one-line prompt for when that agent reports ready. Never presses Enter.
     pub(crate) fn start_handoff(&mut self, request: crate::handoff::HandoffRequest, window: &mut Window, cx: &mut Context<Self>) {
         use crate::handoff::{self, HandoffSource, HandoffTarget};
         let snap = self.client.snapshot();
-        let Some(entry) = snap.terminals.iter().find(|e| e.info.id == request.term && e.info.exited.is_none()) else { return };
-        let Some(status) = entry.info.agent.clone() else { return };
         let lang = settings::language(cx);
         let Some(command) = handoff::launch_command(request.target) else { return };
         let resolved = handoff::resolve_target(&request.folder, &self.projects, dirs::home_dir().as_deref());
-        let terminal_text = handoff::bound_terminal_text(
-            &entry.session.recent_text(handoff::TERMINAL_READ_ROWS),
-            handoff::TERMINAL_MAX_LINES,
-            handoff::TERMINAL_MAX_BYTES,
-        );
-        let hint = self.ctx_ui.view(request.term).and_then(|view| view.transcript_path.clone());
-        let size = entry.session.size();
-        let source = HandoffSource {
-            kind: status.kind,
-            model: status.model.clone(),
-            title: status.title.clone(),
-            session_id: status.session_id.clone(),
-            cwd: entry.info.cwd.clone(),
-            prompt: status.prompt.clone(),
-            message: status.message.clone(),
-            transcript: None,
-            terminal_text: Some(terminal_text),
+        let (source, hint, size) = match request.origin.terminal {
+            Some(term) => {
+                let Some(entry) = snap.terminals.iter().find(|e| e.info.id == term && e.info.exited.is_none()) else { return };
+                let Some(status) = entry.info.agent.clone() else { return };
+                let terminal_text = handoff::bound_terminal_text(
+                    &entry.session.recent_text(handoff::TERMINAL_READ_ROWS),
+                    handoff::TERMINAL_MAX_LINES,
+                    handoff::TERMINAL_MAX_BYTES,
+                );
+                let hint = self.ctx_ui.view(term).and_then(|view| view.transcript_path.clone());
+                let source = HandoffSource {
+                    kind: status.kind,
+                    model: status.model.clone(),
+                    title: status.title.clone(),
+                    session_id: status.session_id.clone(),
+                    cwd: entry.info.cwd.clone(),
+                    prompt: status.prompt.clone(),
+                    message: status.message.clone(),
+                    transcript: None,
+                    terminal_text: Some(terminal_text),
+                };
+                (source, hint, entry.session.size())
+            }
+            // A session from the history: everything is known, the transcript is its file.
+            None => (request.origin.history_source(), None, self.default_terminal_size(&snap)),
         };
         let target = HandoffTarget { dir: resolved.cwd.clone().unwrap_or_default() };
         let note = request.note.clone();
         let target_kind = request.target;
         let job = cx.background_spawn(async move {
             let mut source = source;
-            source.transcript = handoff::find_transcript(
-                source.kind,
-                source.session_id.as_deref(),
-                hint.as_deref(),
-                &handoff::TranscriptDirs::from_system(),
-            );
+            if source.transcript.is_none() {
+                source.transcript = handoff::find_transcript(
+                    source.kind,
+                    source.session_id.as_deref(),
+                    hint.as_deref(),
+                    &handoff::TranscriptDirs::from_system(),
+                );
+            }
             let brief = handoff::build_brief(&source, &target, Some(&note));
             let dir = handoff::agent_prompts_dir().ok_or_else(|| "no data directory".to_owned())?;
             handoff::write_brief(&dir, sich_orch::paths::now_ms() as u128, &brief)
@@ -1804,6 +1833,35 @@ impl AppView {
                 }
             });
         }).detach();
+    }
+
+    /// Size for a terminal that has no sibling to copy it from (actions of the Agents tab).
+    fn default_terminal_size(&self, snap: &Snapshot) -> (u16, u16) {
+        snap.terminals.iter().find(|e| e.info.exited.is_none()).map_or((120, 30), |e| e.session.size())
+    }
+
+    /// Opens a terminal in the session's directory and types the official resume command.
+    pub(crate) fn resume_history_session(
+        &mut self,
+        meta: &crate::agent_history::SessionMeta,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let lang = settings::language(cx);
+        let exists = meta.cwd.as_deref().is_some_and(std::path::Path::is_dir);
+        let Some(plan) = crate::agents_panel::resume_plan(meta, &self.projects, dirs::home_dir().as_deref(), exists) else {
+            notifications::show_error(tr(lang, Tr::AgentsResumeUnavailable).to_owned(), window, cx);
+            return;
+        };
+        let size = self.default_terminal_size(&self.client.snapshot());
+        self.next_restore_token += 1;
+        let token = self.next_restore_token;
+        let worktree = plan.resolved.workspace.path().map(PathBuf::from);
+        if !self.client.open_command_tab(worktree, plan.resolved.cwd.clone(), size, token, &plan.command) {
+            notifications::show_error(tr(lang, Tr::AgentsResumeFailed).to_owned(), window, cx);
+            return;
+        }
+        self.track_terminal_open(token, plan.resolved.workspace.clone(), TerminalOpenKind::Resume, cx);
     }
 
     /// Decides for every pending handoff whether to wait, schedule the paste, give up or drop it.
@@ -1890,12 +1948,13 @@ impl AppView {
 
     fn finish_pending_terminal_opens(&mut self, snap: &Snapshot, window: &mut Window, cx: &mut Context<Self>) {
         let failures = self.client.take_failed_terminal_opens();
-        let (mut failed_split, mut failed_quick, mut failed_handoff) = (false, false, false);
+        let (mut failed_split, mut failed_quick, mut failed_handoff, mut failed_resume) = (false, false, false, false);
         self.pending_terminal_opens.retain(|request| {
             if failures.contains(&request.token) {
                 match request.kind {
                     TerminalOpenKind::Split { .. } => failed_split = true,
                     TerminalOpenKind::QuickTab => failed_quick = true,
+                    TerminalOpenKind::Resume => failed_resume = true,
                     TerminalOpenKind::Handoff => {
                         failed_handoff = true;
                         self.pending_handoffs.retain(|handoff| handoff.token != request.token);
@@ -1906,10 +1965,10 @@ impl AppView {
             request.started.elapsed() <= RESTORE_TIMEOUT && match request.kind {
                 TerminalOpenKind::Split { target, .. } => self.terminal_layouts
                     .get(&request.workspace).is_some_and(|layout| layout.contains(target)),
-                TerminalOpenKind::QuickTab | TerminalOpenKind::Handoff => true,
+                TerminalOpenKind::QuickTab | TerminalOpenKind::Handoff | TerminalOpenKind::Resume => true,
             }
         });
-        for (failed, key) in [(failed_split, Tr::TerminalSplitFailed), (failed_quick, Tr::QuickCommandOpenFailed), (failed_handoff, Tr::HandoffOpenFailed)] {
+        for (failed, key) in [(failed_split, Tr::TerminalSplitFailed), (failed_quick, Tr::QuickCommandOpenFailed), (failed_handoff, Tr::HandoffOpenFailed), (failed_resume, Tr::AgentsResumeFailed)] {
             if failed {
                 let message = tr(settings::language(cx), key);
                 cx.defer_in(window, move |_, window, cx| {
@@ -1938,7 +1997,7 @@ impl AppView {
                     command.observe(entry.info.exited.is_some(), sich_orch::paths::now_ms());
                     self.quick_terminals.insert(entry.info.id, command);
                 }
-                TerminalOpenKind::Handoff => {
+                TerminalOpenKind::Handoff | TerminalOpenKind::Resume => {
                     self.activate_terminal_in(key.clone(), entry.info.id, window, cx);
                 }
             }
@@ -2199,6 +2258,7 @@ impl AppView {
         let pane = match active_tab {
             RightTab::Context => self.render_context_panel(lang, cx),
             RightTab::Images => self.render_images_panel(width, lang, cx),
+            RightTab::Agents => self.agents_panel.clone().into_any_element(),
             _ => self.git_panel.clone().into_any_element(),
         };
         let tabs = RightTab::ALL.iter().copied().filter(|&tab| tab != RightTab::Pr || pr_visible).map(|tab| {
@@ -2207,6 +2267,7 @@ impl AppView {
                 RightTab::Pr => ("right-tab-pr", Ic::GitPullRequest, Tr::PrTabLabel),
                 RightTab::Context => ("right-tab-context", Ic::Layers, Tr::CtxTab),
                 RightTab::Images => ("right-tab-images", Ic::Image, Tr::ImgTab),
+                RightTab::Agents => ("right-tab-agents", Ic::Bot, Tr::AgentsTab),
             };
             let active = active_tab == tab;
             let dot = glyph
@@ -2437,6 +2498,8 @@ impl AppView {
             panel.set_pane(tab, cx);
             panel.select(path, cx);
         });
+        let agents_visible = visible && tab == RightTab::Agents;
+        self.agents_panel.update(cx, |panel, cx| panel.set_visible(agents_visible, cx));
     }
 
     /// The "Pull request" tab exists only while the PR section of the selected worktree does.

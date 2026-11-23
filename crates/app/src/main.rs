@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent_badge;
+mod agent_history;
 mod agent_hooks;
+mod agents_panel;
 mod app_view;
 mod assets;
 mod claude_ctx;
