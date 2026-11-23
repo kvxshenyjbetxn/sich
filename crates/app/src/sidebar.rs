@@ -315,6 +315,9 @@ fn chevron(expanded: bool, color: Hsla) -> Icon {
     Icon::new(if expanded { Ic::ChevronDown } else { Ic::ChevronRight }).small().text_color(color)
 }
 
+/// Width of the hover-only trash button slot on worktree rows (an xsmall icon button).
+const TRASH_SLOT_W: f32 = 20.;
+
 fn dot(id: impl Into<gpui_kit::ElementId>, color: Hsla) -> Stateful<Div> {
     div().id(id).flex_shrink_0().size(px(7.)).rounded_full().bg(color)
 }
@@ -775,6 +778,15 @@ impl AppView {
             );
         }
         row = row.child(div().flex_1());
+        // Dirty dot sits before the PR glyph and the trash slot has a fixed width on every
+        // row, so PR glyphs line up in one column.
+        if w.dirty {
+            let text = tr(lang, Tr::UncommittedChanges);
+            row = row.child(
+                dot(SharedString::from(format!("wt-dirty:{uid}")), theme.warning)
+                    .tooltip(move |window, cx| Tooltip::new(text).build(window, cx)),
+            );
+        }
         if let Some(glyph) = self.pr_store.read(cx).glyph_for(&w.path) {
             let color = crate::pr_store::tone_color(glyph.tone, &theme);
             let tip: SharedString = glyph.tooltip(lang).into();
@@ -794,13 +806,6 @@ impl AppView {
                     .child(Icon::new(glyph.icon.icon()).size(px(13.)).text_color(color)),
             );
         }
-        if w.dirty {
-            let text = tr(lang, Tr::UncommittedChanges);
-            row = row.child(
-                dot(SharedString::from(format!("wt-dirty:{uid}")), theme.warning)
-                    .tooltip(move |window, cx| Tooltip::new(text).build(window, cx)),
-            );
-        }
         let badge_x = left_badge_x(base + INDENT);
         if let Some(b) = agent.filter(|_| badge_x >= 0.) {
             let el = badge_element(&b, false, lang, SharedString::from(format!("wt-agent:{uid}")), cx);
@@ -808,10 +813,13 @@ impl AppView {
                 div().absolute().left(px(badge_x)).top(px((ROW_H - BADGE_W) / 2.)).child(el),
             );
         }
-        if !w.is_main {
+        if w.is_main {
+            row = row.child(div().flex_shrink_0().w(px(TRASH_SLOT_W)));
+        } else {
             let (app, wref) = (app.clone(), wref.clone());
+            let slot = div().flex_shrink_0().w(px(TRASH_SLOT_W)).invisible();
             row = row.child(
-                div().invisible().group_hover(group, |s| s.visible()).child(
+                slot.group_hover(group, |s| s.visible()).child(
                     Button::new(SharedString::from(format!("wt-remove:{uid}")))
                         .ghost()
                         .xsmall()
