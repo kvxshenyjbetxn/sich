@@ -480,6 +480,37 @@ pub enum Tr {
     // ---- end history ----
 
     // ---- compare keys: append below ----
+    CmpVs,
+    CmpAheadOf,
+    CmpBehindOf,
+    CmpBaseTooltip,
+    CmpChangeBase,
+    CmpBaseMissing,
+    CmpNoCommonHistory,
+    CmpResetBase,
+    CmpBranchChanges,
+    CmpMergeConflicts,
+    CmpRebaseConflicts,
+    CmpCherryPickConflicts,
+    CmpRevertConflicts,
+    CmpUnresolved,
+    CmpResolveWithAgent,
+    CmpAbortMerge,
+    CmpAbortRebase,
+    CmpAbortCherryPick,
+    CmpAbortRevert,
+    CmpBothModified,
+    CmpBothAdded,
+    CmpBothDeleted,
+    CmpAddedByUs,
+    CmpAddedByThem,
+    CmpDeletedByUs,
+    CmpDeletedByThem,
+    CmpMarkResolved,
+    CmpKeepFile,
+    CmpKeepDeletion,
+    CmpCompleteMerge,
+    CmpAlreadyApplied,
     // ---- end compare ----
 
     // ---- prwt keys: append below ----
@@ -930,6 +961,37 @@ impl Tr {
         // ---- end history ----
 
         // ---- compare keys: append below ----
+        Tr::CmpVs,
+        Tr::CmpAheadOf,
+        Tr::CmpBehindOf,
+        Tr::CmpBaseTooltip,
+        Tr::CmpChangeBase,
+        Tr::CmpBaseMissing,
+        Tr::CmpNoCommonHistory,
+        Tr::CmpResetBase,
+        Tr::CmpBranchChanges,
+        Tr::CmpMergeConflicts,
+        Tr::CmpRebaseConflicts,
+        Tr::CmpCherryPickConflicts,
+        Tr::CmpRevertConflicts,
+        Tr::CmpUnresolved,
+        Tr::CmpResolveWithAgent,
+        Tr::CmpAbortMerge,
+        Tr::CmpAbortRebase,
+        Tr::CmpAbortCherryPick,
+        Tr::CmpAbortRevert,
+        Tr::CmpBothModified,
+        Tr::CmpBothAdded,
+        Tr::CmpBothDeleted,
+        Tr::CmpAddedByUs,
+        Tr::CmpAddedByThem,
+        Tr::CmpDeletedByUs,
+        Tr::CmpDeletedByThem,
+        Tr::CmpMarkResolved,
+        Tr::CmpKeepFile,
+        Tr::CmpKeepDeletion,
+        Tr::CmpCompleteMerge,
+        Tr::CmpAlreadyApplied,
         // ---- end compare ----
 
         // ---- prwt keys: append below ----
@@ -3075,6 +3137,161 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
         // ---- end history ----
 
         // ---- compare keys: append below ----
+        Tr::CmpVs => match lang {
+            Uk => "відносно",
+            Ru => "относительно",
+            En => "vs",
+        },
+        Tr::CmpAheadOf => match lang {
+            Uk => "комітів попереду",
+            Ru => "коммитов впереди",
+            En => "commits ahead of",
+        },
+        Tr::CmpBehindOf => match lang {
+            Uk => "комітів позаду",
+            Ru => "коммитов позади",
+            En => "commits behind",
+        },
+        Tr::CmpBaseTooltip => match lang {
+            Uk => "Базова гілка порівняння. Натисніть, щоб змінити",
+            Ru => "Базовая ветка сравнения. Нажмите, чтобы изменить",
+            En => "Comparison base. Click to change",
+        },
+        Tr::CmpChangeBase => match lang {
+            Uk => "Змінити базу",
+            Ru => "Изменить базу",
+            En => "Change base",
+        },
+        Tr::CmpBaseMissing => match lang {
+            Uk => "Базу не знайдено",
+            Ru => "База не найдена",
+            En => "Base not found",
+        },
+        Tr::CmpNoCommonHistory => match lang {
+            Uk => "Немає спільної історії з базою",
+            Ru => "Нет общей истории с базой",
+            En => "No common history with the base",
+        },
+        Tr::CmpResetBase => match lang {
+            Uk => "Скинути до типової",
+            Ru => "Сбросить на стандартную",
+            En => "Reset to default",
+        },
+        Tr::CmpBranchChanges => match lang {
+            Uk => "Зміни гілки",
+            Ru => "Изменения ветки",
+            En => "Branch changes",
+        },
+        Tr::CmpMergeConflicts => match lang {
+            Uk => "Конфлікти злиття",
+            Ru => "Конфликты слияния",
+            En => "Merge conflicts",
+        },
+        Tr::CmpRebaseConflicts => match lang {
+            Uk => "Конфлікти ребейзу",
+            Ru => "Конфликты ребейза",
+            En => "Rebase conflicts",
+        },
+        Tr::CmpCherryPickConflicts => match lang {
+            Uk => "Конфлікти cherry-pick",
+            Ru => "Конфликты cherry-pick",
+            En => "Cherry-pick conflicts",
+        },
+        Tr::CmpRevertConflicts => match lang {
+            Uk => "Конфлікти revert",
+            Ru => "Конфликты revert",
+            En => "Revert conflicts",
+        },
+        Tr::CmpUnresolved => match lang {
+            Uk => "не розв'язано",
+            Ru => "не разрешено",
+            En => "unresolved",
+        },
+        Tr::CmpResolveWithAgent => match lang {
+            Uk => "Розв'язати агентом",
+            Ru => "Разрешить агентом",
+            En => "Resolve with agent",
+        },
+        Tr::CmpAbortMerge => match lang {
+            Uk => "Перервати злиття",
+            Ru => "Прервать слияние",
+            En => "Abort merge",
+        },
+        Tr::CmpAbortRebase => match lang {
+            Uk => "Перервати ребейз",
+            Ru => "Прервать ребейз",
+            En => "Abort rebase",
+        },
+        Tr::CmpAbortCherryPick => match lang {
+            Uk => "Перервати cherry-pick",
+            Ru => "Прервать cherry-pick",
+            En => "Abort cherry-pick",
+        },
+        Tr::CmpAbortRevert => match lang {
+            Uk => "Перервати revert",
+            Ru => "Прервать revert",
+            En => "Abort revert",
+        },
+        Tr::CmpBothModified => match lang {
+            Uk => "змінено обома",
+            Ru => "изменено обеими",
+            En => "both modified",
+        },
+        Tr::CmpBothAdded => match lang {
+            Uk => "додано обома",
+            Ru => "добавлено обеими",
+            En => "both added",
+        },
+        Tr::CmpBothDeleted => match lang {
+            Uk => "видалено обома",
+            Ru => "удалено обеими",
+            En => "both deleted",
+        },
+        Tr::CmpAddedByUs => match lang {
+            Uk => "додано нами",
+            Ru => "добавлено нами",
+            En => "added by us",
+        },
+        Tr::CmpAddedByThem => match lang {
+            Uk => "додано ними",
+            Ru => "добавлено ими",
+            En => "added by them",
+        },
+        Tr::CmpDeletedByUs => match lang {
+            Uk => "видалено нами",
+            Ru => "удалено нами",
+            En => "deleted by us",
+        },
+        Tr::CmpDeletedByThem => match lang {
+            Uk => "видалено ними",
+            Ru => "удалено ими",
+            En => "deleted by them",
+        },
+        Tr::CmpMarkResolved => match lang {
+            Uk => "Розв'язано",
+            Ru => "Разрешено",
+            En => "Mark resolved",
+        },
+        Tr::CmpKeepFile => match lang {
+            Uk => "Залишити файл",
+            Ru => "Оставить файл",
+            En => "Keep file",
+        },
+        Tr::CmpKeepDeletion => match lang {
+            Uk => "Видалити",
+            Ru => "Удалить",
+            En => "Keep deletion",
+        },
+        Tr::CmpCompleteMerge => match lang {
+            Uk => "Завершити злиття",
+            Ru => "Завершить слияние",
+            En => "Complete merge",
+        },
+        Tr::CmpAlreadyApplied => match lang {
+            Uk => "Вже застосовано: крок нічого не змінив і був пропущений",
+            Ru => "Уже применено: шаг ничего не изменил и был пропущен",
+            En => "Already applied: the step changed nothing and was skipped",
+        },
         // ---- end compare ----
 
         // ---- prwt keys: append below ----

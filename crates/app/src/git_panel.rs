@@ -148,6 +148,7 @@ enum Operation {
     Abort,
     CherryPick,
     Revert,
+    Resolve,
 }
 
 impl Operation {
@@ -155,7 +156,7 @@ impl Operation {
     fn changes_history(self) -> bool {
         !matches!(
             self,
-            Self::Stage | Self::Unstage | Self::Discard | Self::Stash
+            Self::Stage | Self::Unstage | Self::Discard | Self::Stash | Self::Resolve
         )
     }
 
@@ -204,6 +205,17 @@ enum Mutation {
     Abort(InProgress),
     CherryPick(String),
     Revert(String),
+    ResolveConflict { path: String, resolution: sich_git::Resolution },
+    CompleteMerge,
+}
+
+/// What a finished mutation reports back besides success.
+#[derive(Default)]
+struct Done {
+    undone: Option<String>,
+    already_applied: bool,
+    /// Cherry-pick/revert had nothing to apply.
+    nothing_to_apply: bool,
 }
 
 impl Mutation {
@@ -217,8 +229,15 @@ impl Mutation {
         }
     }
 
-    /// Runs the mutation; `Some(message)` is the commit message that `Undo` took off HEAD.
-    fn run_full(self, repo: &Repo) -> Result<(Option<String>, bool), GitError> {
+    /// Runs the mutation; `Done::undone` is the commit message that `Undo` took off HEAD.
+    fn run_full(self, repo: &Repo) -> Result<Done, GitError> {
+        if let Self::Continue(op) = &self {
+            let outcome = repo.continue_or_skip(*op)?;
+            return Ok(Done {
+                already_applied: outcome == sich_git::ContinueOutcome::AlreadyApplied,
+                ..Done::default()
+            });
+        }
         let undone = if matches!(self, Self::Undo) {
             repo.last_commit_message().ok().flatten()
         } else {
@@ -232,8 +251,8 @@ impl Mutation {
         match outcome {
             Some(CommitOpOutcome::Refused(message)) => Err(GitError::Failed(message)),
             // A conflict leaves the operation open: the in-progress banner takes over.
-            Some(outcome) => Ok((None, outcome == CommitOpOutcome::Empty)),
-            None => self.run(repo).map(|()| (undone, false)),
+            Some(outcome) => Ok(Done { nothing_to_apply: outcome == CommitOpOutcome::Empty, ..Done::default() }),
+            None => self.run(repo).map(|()| Done { undone, ..Done::default() }),
         }
     }
 
@@ -255,7 +274,8 @@ impl Mutation {
             Self::StashPush | Self::StashApply(_) | Self::StashPop(_) | Self::StashDrop(_) => {
                 Operation::Stash
             }
-            Self::Continue(_) => Operation::Continue,
+            Self::Continue(_) | Self::CompleteMerge => Operation::Continue,
+            Self::ResolveConflict { .. } => Operation::Resolve,
             Self::Abort(_) => Operation::Abort,
             Self::CherryPick(_) => Operation::CherryPick,
             Self::Revert(_) => Operation::Revert,
@@ -299,7 +319,9 @@ impl Mutation {
             Self::StashApply(stash) => repo.stash_apply(&stash),
             Self::StashPop(stash) => repo.stash_pop(&stash),
             Self::StashDrop(stash) => repo.stash_drop(&stash),
-            Self::Continue(op) => repo.continue_in_progress(op),
+            Self::Continue(op) => repo.continue_or_skip(op).map(|_| ()),
+            Self::ResolveConflict { path, resolution } => repo.resolve_conflict(&path, resolution),
+            Self::CompleteMerge => repo.complete_merge(),
             Self::Abort(op) => repo.abort_in_progress(op),
             // Handled in `run_full`, which needs the outcome.
             Self::CherryPick(_) | Self::Revert(_) => Ok(()),
@@ -427,6 +449,8 @@ pub(crate) struct GitPanel {
     pane: RightTab,
     /// State of the PR tab's details and files sections.
     pr_extras: pr_details::PrExtras,
+    /// Branch compare against the base ref (row and "Branch changes").
+    compare: branch_compare::CompareState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -475,6 +499,7 @@ impl GitPanel {
             comments,
             pane: RightTab::Git,
             pr_extras: pr_details::PrExtras::default(),
+            compare: branch_compare::CompareState::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -533,6 +558,7 @@ impl GitPanel {
         self.refreshing_history = false;
         self.history = History::default();
         self.collapsed.clear();
+        self.compare.reset();
         self.input = None;
         self.branch_picker = None;
         self.scheduler = Scheduler::default();
@@ -615,6 +641,7 @@ impl GitPanel {
                     cx.emit(GitPanelEvent::Refreshed(worktree.clone()));
                 }
                 self.pr_sync_status(cx);
+                self.compare_sync(cx);
             }
             Err(error @ (GitError::NotRepository | GitError::GitMissing)) => {
                 self.repo = None;
@@ -798,7 +825,7 @@ impl GitPanel {
                     }
                 }
                 // Undo hands the removed commit message back for editing.
-                if let Ok((Some(undone), _)) = &result
+                if let Ok(Done { undone: Some(undone), .. }) = &result
                     && panel.draft_of(&path).trim().is_empty()
                 {
                     panel.drafts.insert(path.clone(), undone.clone());
@@ -808,8 +835,17 @@ impl GitPanel {
                         }
                     }
                 }
-                if matches!(result, Ok((_, true))) {
+                if matches!(&result, Ok(Done { nothing_to_apply: true, .. })) {
                     history_graph::show_info(tr(crate::settings::language(cx), Tr::GitNothingToApply), window, cx);
+                }
+                if matches!(&result, Ok(Done { already_applied: true, .. })) {
+                    use gpui_kit::component::WindowExt as _;
+                    use gpui_kit::component::notification::Notification;
+                    let lang = crate::settings::language(cx);
+                    window.push_notification(Notification::info(tr(lang, Tr::CmpAlreadyApplied)), cx);
+                }
+                if operation.changes_history() {
+                    panel.compare.invalidate();
                 }
                 let error = result.err().map(|error| error.to_string());
                 if operation == Operation::SwitchBranch && let Some(error) = &error {
@@ -1151,6 +1187,7 @@ mod tests {
             status: ChangeKind::Modified,
             added: None,
             removed: None,
+            conflict: None,
         };
         status.unstaged.push(file.clone());
         assert_eq!(commit_action(&status, "message", false), CommitAction::All);

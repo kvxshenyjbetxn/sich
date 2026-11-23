@@ -35,6 +35,33 @@ impl ChangeKind {
     }
 }
 
+/// Why a path is unmerged, from the `XY` code of a porcelain v2 `u` record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictKind {
+    BothDeleted,
+    AddedByUs,
+    DeletedByThem,
+    AddedByThem,
+    DeletedByUs,
+    BothAdded,
+    BothModified,
+}
+
+impl ConflictKind {
+    pub(crate) fn parse(xy: &[u8]) -> Option<Self> {
+        Some(match xy {
+            b"DD" => Self::BothDeleted,
+            b"AU" => Self::AddedByUs,
+            b"UD" => Self::DeletedByThem,
+            b"UA" => Self::AddedByThem,
+            b"DU" => Self::DeletedByUs,
+            b"AA" => Self::BothAdded,
+            b"UU" => Self::BothModified,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileChange {
     pub path: String,
@@ -42,6 +69,8 @@ pub struct FileChange {
     pub status: ChangeKind,
     pub added: Option<u32>,
     pub removed: Option<u32>,
+    /// Set for entries of `RepoStatus::conflicted`.
+    pub conflict: Option<ConflictKind>,
 }
 
 impl FileChange {
@@ -52,6 +81,7 @@ impl FileChange {
             status,
             added: None,
             removed: None,
+            conflict: None,
         }
     }
 }
@@ -187,9 +217,11 @@ pub(crate) fn parse_status(bytes: &[u8], limit: usize) -> RepoStatus {
             b'?' => status
                 .unstaged
                 .push(FileChange::new(path, None, ChangeKind::Untracked)),
-            b'u' => status
-                .conflicted
-                .push(FileChange::new(path, None, ChangeKind::Conflicted)),
+            b'u' => {
+                let mut change = FileChange::new(path, None, ChangeKind::Conflicted);
+                change.conflict = ConflictKind::parse(tail.get(..2).unwrap_or_default());
+                status.conflicted.push(change);
+            }
             _ => {
                 for (code, list) in tail
                     .iter()
@@ -282,6 +314,31 @@ mod tests {
         assert_eq!(parsed.staged[0].orig_path.as_deref(), Some("old name"));
         assert_eq!(parsed.unstaged[0].orig_path, None);
         assert_eq!(parsed.unstaged[0].path, "new name");
+    }
+
+    #[test]
+    fn conflict_kind_comes_from_the_xy_code_of_u_records() {
+        let record = |xy: &str, name: &str| {
+            format!("u {xy} N... 100644 100644 100644 100644 a b c {name}\0").into_bytes()
+        };
+        let cases = [
+            ("DD", ConflictKind::BothDeleted),
+            ("AU", ConflictKind::AddedByUs),
+            ("UD", ConflictKind::DeletedByThem),
+            ("UA", ConflictKind::AddedByThem),
+            ("DU", ConflictKind::DeletedByUs),
+            ("AA", ConflictKind::BothAdded),
+            ("UU", ConflictKind::BothModified),
+        ];
+        for (xy, kind) in cases {
+            let parsed = parse_status(&record(xy, "a b.txt"), STATUS_LIMIT);
+            assert_eq!(parsed.conflicted[0].conflict, Some(kind), "{xy}");
+            assert_eq!(parsed.conflicted[0].path, "a b.txt");
+        }
+        let unknown = parse_status(&record("ZZ", "x"), STATUS_LIMIT);
+        assert_eq!(unknown.conflicted[0].conflict, None);
+        let plain = parse_status(b"? new\0", STATUS_LIMIT);
+        assert_eq!(plain.unstaged[0].conflict, None);
     }
 
     #[test]
