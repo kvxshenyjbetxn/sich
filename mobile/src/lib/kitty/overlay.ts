@@ -8,8 +8,9 @@
 import type { Terminal } from "@xterm/xterm";
 import { coverBox, imageCells, scanCover, scanLine, stripBox, type CoverRun, type LineLike, type Strip } from "./placeholder";
 import type { ImageStore } from "./store";
+import type { StripRect } from "./hit";
 
-export function attachImageOverlay(term: Terminal, store: ImageStore, background: string): () => void {
+export function attachImageOverlay(term: Terminal, store: ImageStore, background: string, onLayout?: (rects: StripRect[], screen: HTMLElement) => void): () => void {
   let layer: HTMLDivElement | null = null;
   let raf = 0;
   let disposed = false;
@@ -46,6 +47,7 @@ export function attachImageOverlay(term: Terminal, store: ImageStore, background
       });
     }
 
+    const rects: StripRect[] = [];
     const frag = document.createDocumentFragment();
     // Background boxes first: every placeholder cell is hidden, even without a loaded image.
     for (const c of covers) {
@@ -77,8 +79,10 @@ export function attachImageOverlay(term: Terminal, store: ImageStore, background
       st.backgroundSize = `${b.bgWidth}px ${b.bgHeight}px`;
       st.backgroundPosition = `${b.bgX}px ${b.bgY}px`;
       frag.appendChild(d);
+      rects.push({ image: s.image, left: b.left, top: b.top, width: b.width, height: b.height });
     }
     el.replaceChildren(frag);
+    onLayout?.(rects, screen);
   };
 
   const schedule = () => {

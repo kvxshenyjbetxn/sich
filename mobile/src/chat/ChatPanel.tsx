@@ -6,7 +6,7 @@ import { Composer } from "../components/Composer";
 import { badgeFor, stateKey } from "../lib/agent";
 import type { Agent, TermRef } from "../lib/types";
 import { ChatItemView } from "./ChatItems";
-import { ImageViewer } from "./ImageViewer";
+import { ImageViewer } from "../components/ImageViewer";
 import { buildItems, isNearBottom, toggleSet } from "./messages";
 import { useChat } from "./useChat";
 import "./chat.css";

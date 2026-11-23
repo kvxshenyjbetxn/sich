@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { ImageAddon } from "@xterm/addon-image";
@@ -10,6 +10,8 @@ import type { TermRef } from "../lib/types";
 import { KittyApcFilter } from "../lib/kitty/apc";
 import { ImageStore, applyEvent } from "../lib/kitty/store";
 import { attachImageOverlay } from "../lib/kitty/overlay";
+import { hitStrip, isTap, type PointerSample, type StripRect } from "../lib/kitty/hit";
+import { ImageViewer } from "./ImageViewer";
 
 import { FONT_FAMILY, loadTermFonts } from "../lib/fonts";
 export { FONT_FAMILY };
@@ -77,6 +79,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
   const xRef = useRef<XTerm | null>(null);
   const fitAddon = useRef<FitAddon | null>(null);
   const lastSent = useRef({ cols: 0, rows: 0 });
+  const [viewer, setViewer] = useState<string | null>(null);
 
   // Latest props for callbacks created once per terminal.
   const live = useRef({ fit, baseFont, ptyCols, ptyRows, onData, onPinchFont, onReset, disabled, term, paused });
@@ -148,7 +151,14 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
       }
       xRef.current = x;
       fitAddon.current = f;
-      cleanups.push(attachImageOverlay(x, images, THEME.background));
+      let strips: StripRect[] = [];
+      let screenEl: HTMLElement | null = null;
+      cleanups.push(
+        attachImageOverlay(x, images, THEME.background, (r, scr) => {
+          strips = r;
+          screenEl = scr;
+        }),
+      );
 
       x.onData((d) => {
         if (!live.current.disabled) live.current.onData(d);
@@ -203,6 +213,49 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
       };
       host.addEventListener("touchstart", ts, { passive: true });
       host.addEventListener("touchmove", tm, { passive: false });
+
+      // Tap on a drawn inline image opens the fullscreen viewer (the overlay ignores pointers).
+      let down: PointerSample | null = null;
+      const pd = (e: PointerEvent) => {
+        down = e.isPrimary ? { x: e.clientX, y: e.clientY, t: e.timeStamp } : null;
+      };
+      const pu = (e: PointerEvent) => {
+        const d = down;
+        down = null;
+        if (!d || !screenEl || strips.length === 0) return;
+        if (!isTap(d, { x: e.clientX, y: e.clientY, t: e.timeStamp })) return;
+        if (window.getSelection()?.toString()) return;
+        const box = screenEl.getBoundingClientRect();
+        const id = hitStrip(strips, e.clientX - box.left, e.clientY - box.top);
+        const img = id === null ? undefined : images.get(id);
+        if (!img) return;
+        e.preventDefault();
+        e.stopPropagation();
+        (document.activeElement as HTMLElement | null)?.blur?.();
+        setViewer(img.url);
+      };
+      // The click that follows would focus xterm's textarea (keyboard): swallow it over an image.
+      const ck = (e: MouseEvent) => {
+        if (!screenEl) return;
+        const box = screenEl.getBoundingClientRect();
+        if (hitStrip(strips, e.clientX - box.left, e.clientY - box.top) !== null) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      };
+      const pc = () => {
+        down = null;
+      };
+      host.addEventListener("pointerdown", pd, true);
+      host.addEventListener("pointerup", pu, true);
+      host.addEventListener("pointercancel", pc, true);
+      host.addEventListener("click", ck, true);
+      cleanups.push(() => {
+        host.removeEventListener("pointerdown", pd, true);
+        host.removeEventListener("pointerup", pu, true);
+        host.removeEventListener("pointercancel", pc, true);
+        host.removeEventListener("click", ck, true);
+      });
       cleanups.push(() => {
         host.removeEventListener("touchstart", ts);
         host.removeEventListener("touchmove", tm);
@@ -239,6 +292,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
   return (
     <div ref={hostRef} className={`term-host ${fit ? "fit" : "free"}`}>
       <div ref={innerRef} className="term-inner" />
+      {viewer && <ImageViewer src={viewer} alt="" onClose={() => setViewer(null)} />}
     </div>
   );
 }
