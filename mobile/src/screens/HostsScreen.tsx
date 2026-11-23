@@ -57,19 +57,19 @@ export function HostsScreen({ hosts, conn, onBack, onPaired, onChanged }: Props)
         return;
       }
       setMode("scanning");
-      document.body.classList.add("scanning");
+      document.documentElement.classList.add("scanning");
       const res = await scan({ windowed: true, formats: [Format.QRCode] });
-      document.body.classList.remove("scanning");
+      document.documentElement.classList.remove("scanning");
       await startPair(res.content);
     } catch {
-      document.body.classList.remove("scanning");
+      document.documentElement.classList.remove("scanning");
       setMode((m) => (m === "scanning" ? "add" : m));
       setError((e) => e ?? t("scan_failed"));
     }
   };
 
   const cancelScan = async () => {
-    document.body.classList.remove("scanning");
+    document.documentElement.classList.remove("scanning");
     try {
       await cancel();
     } catch {

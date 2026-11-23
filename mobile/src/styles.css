@@ -36,11 +36,11 @@ body,
 }
 
 /* While the camera is shown (barcode scanner "windowed" mode) everything must be transparent. */
-body.scanning,
-body.scanning html,
-body.scanning #root,
-body.scanning .app,
-body.scanning .scan-screen {
+html.scanning,
+html.scanning body,
+html.scanning #root,
+html.scanning .app,
+html.scanning .scan-screen {
   background: transparent !important;
 }
 
