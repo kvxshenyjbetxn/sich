@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Phone variant of crates/app/assets/icon.svg: full-bleed background (the OS applies its
+       own mask shape), stakes scaled into the adaptive-icon safe zone. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#202329"/>
+      <stop offset="1" stop-color="#0a0b0d"/>
+    </linearGradient>
+    <linearGradient id="stake" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8db8ff"/>
+      <stop offset="1" stop-color="#3574f0"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" fill="url(#bg)"/>
+  <g transform="translate(128 128) scale(0.8) translate(-128 -128)">
+    <g fill="url(#stake)">
+      <path d="M58 116 L76 94 L94 116 L94 194 L58 194 Z"/>
+      <path d="M110 86 L128 62 L146 86 L146 194 L110 194 Z"/>
+      <path d="M162 116 L180 94 L198 116 L198 194 L162 194 Z"/>
+    </g>
+    <rect x="46" y="140" width="164" height="12" rx="4" fill="#d6e4ff"/>
+    <rect x="46" y="140" width="164" height="12" rx="4" fill="none" stroke="#0e1013" stroke-width="5"/>
+  </g>
+</svg>

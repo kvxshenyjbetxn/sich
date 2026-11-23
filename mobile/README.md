@@ -54,3 +54,10 @@ Desktop smoke run of the UI (no camera, no Android): `npx tauri dev` (set `SICH_
 
 - The phone's iroh secret key is a plain file in the app data dir (TODO: Android Keystore / iOS Keychain).
 - Pairing needs the desktop confirmation (Sich gateway). Scan the QR code or paste the `sich://pair?...` link.
+
+## Releasing the phone app (signing)
+
+- Release APKs are signed with `%USERPROFILE%\.sich-android\sich-release.jks`, configured by `%USERPROFILE%\.sich-android\keystore.properties` (override the path with env `SICH_ANDROID_KEYSTORE_PROPS`). Without that file the release build is unsigned.
+- Bump `version` in `src-tauri/tauri.conf.json` (and `Cargo.toml`) on every phone release: Tauri derives the Android versionCode from it, and it must increase for updates to install.
+- Keep the keystore and properties file backed up and never commit them. If they are lost, users must uninstall the app before they can install an update.
+- Build: `npx tauri android build --apk --target aarch64`.

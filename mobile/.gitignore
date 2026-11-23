@@ -10,3 +10,6 @@ src-tauri/gen/android/buildSrc/.gradle/
 src-tauri/gen/android/local.properties
 src-tauri/gen/apple/
 *.log
+keystore.properties
+*.jks
+*.keystore
