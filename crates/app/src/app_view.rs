@@ -25,6 +25,7 @@ use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, Suba
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
 use crate::context_panel::{self, ContextUi};
+use crate::images_panel::{self, ImagesUi};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonPool, RestartResult, RestoreData, Snapshot};
 use crate::diff_view::DiffView;
 use crate::file_view::FileView;
@@ -144,6 +145,7 @@ pub struct AppView {
     focused: Option<TermId>,
     pub(crate) usage_bar: crate::usage_bar::UsageBar,
     pub(crate) ctx_ui: ContextUi,
+    pub(crate) images_ui: ImagesUi,
     /// Whether the window has focus (kept by the activation observer and `sync`).
     window_active: bool,
     /// When the project list was last refreshed on window activation.
@@ -344,6 +346,7 @@ impl AppView {
             focused: None,
             usage_bar: crate::usage_bar::UsageBar::default(),
             ctx_ui: ContextUi::default(),
+            images_ui: ImagesUi::default(),
             window_active: false,
             last_activation_refresh: None,
             hwnd: None,
@@ -503,6 +506,7 @@ impl AppView {
     pub fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.usage_bar.watch(window, cx);
         ContextUi::watch(window, cx);
+        ImagesUi::watch(self.images_ui.receiver(), window, cx);
         Self::start_update_checks(window, cx);
         cx.observe(&self.git_panel, |this, panel, cx| {
             let panel = panel.read(cx);
@@ -2005,19 +2009,34 @@ impl AppView {
         self.sidebar_changed(cx);
     }
 
-    fn render_context_panel(&self, lang: i18n::Language, cx: &Context<Self>) -> gpui_kit::AnyElement {
+    /// The Claude terminals of the selected workspace and what is focused (Context and Images tabs).
+    fn ctx_panel_input(&self) -> context_panel::PanelInput {
         let key = self.ws.selected.clone();
         let targets: Vec<_> = self.ctx_targets().into_iter().filter(|t| key.contains(t.worktree.as_deref())).collect();
         let ids: Vec<TermId> = targets.iter().map(|t| t.key).collect();
         let active = self.ws.active_in(&key, &ids);
-        let input = context_panel::PanelInput {
-            targets,
-            key,
-            focused: self.focused,
-            active,
-            now_ms: crate::claude_ctx::now_ms(),
-        };
-        context_panel::render_panel(&self.ctx_ui, input, lang, cx)
+        context_panel::PanelInput { targets, key, focused: self.focused, active, now_ms: crate::claude_ctx::now_ms() }
+    }
+
+    fn render_context_panel(&self, lang: i18n::Language, cx: &Context<Self>) -> gpui_kit::AnyElement {
+        context_panel::render_panel(&self.ctx_ui, self.ctx_panel_input(), lang, cx)
+    }
+
+    fn render_images_panel(&self, lang: i18n::Language, cx: &Context<Self>) -> gpui_kit::AnyElement {
+        images_panel::render_panel(&self.ctx_ui, &self.images_ui, self.ctx_panel_input(), lang, cx)
+    }
+
+    /// What the Images poller should do now (it only reads while its tab is on screen).
+    pub(crate) fn images_poll(&self, window: &Window) -> images_panel::Poll {
+        let visible = self.right_panel.open && self.right_panel.tab == RightTab::Images && !self.hidden_to_tray;
+        if !visible {
+            return images_panel::Poll::Skip;
+        }
+        let input = self.ctx_panel_input();
+        let target = context_panel::selection(&self.ctx_ui, &input)
+            .0
+            .and_then(|id| input.targets.into_iter().find(|t| t.key == id));
+        images_panel::poll_decision(visible, window.is_window_active(), target)
     }
 
     fn render_right_panel(&self, width: f32, lang: i18n::Language, cx: &Context<Self>) -> impl IntoElement + use<> {
@@ -2026,16 +2045,17 @@ impl AppView {
         let active_tab = self.right_panel.tab.effective(pr_visible);
         let glyph = self.ws.selected.path().and_then(|path| self.pr_store.read(cx).glyph_for(path));
         // Both tabs are views of the same panel entity (it needs the status for either).
-        let pane = if active_tab == RightTab::Context {
-            self.render_context_panel(lang, cx)
-        } else {
-            self.git_panel.clone().into_any_element()
+        let pane = match active_tab {
+            RightTab::Context => self.render_context_panel(lang, cx),
+            RightTab::Images => self.render_images_panel(lang, cx),
+            _ => self.git_panel.clone().into_any_element(),
         };
         let tabs = RightTab::ALL.iter().copied().filter(|&tab| tab != RightTab::Pr || pr_visible).map(|tab| {
             let (id, icon, label) = match tab {
                 RightTab::Git => ("right-tab-git", Ic::GitBranch, Tr::Git),
                 RightTab::Pr => ("right-tab-pr", Ic::GitPullRequest, Tr::PrTabLabel),
                 RightTab::Context => ("right-tab-context", Ic::Layers, Tr::CtxTab),
+                RightTab::Images => ("right-tab-images", Ic::Image, Tr::ImgTab),
             };
             let active = active_tab == tab;
             let dot = glyph
@@ -2052,6 +2072,7 @@ impl AppView {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.right_panel.tab != tab {
                         this.right_panel.tab = tab;
+                        this.images_ui.poke();
                         this.sync_right_worktree(cx);
                         this.sidebar_changed(cx);
                     }

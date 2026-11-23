@@ -42,6 +42,8 @@ gpui_kit::assets::icon_assets!(ExtraIcons, [
     Pencil,
     Reply,
     Send,
+    Image,
+    ImageOff,
 ]);
 
 /// Agent icons (single-color SVGs, tinted at render time): `(asset path, bytes)`.

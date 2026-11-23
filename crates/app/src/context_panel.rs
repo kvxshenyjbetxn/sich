@@ -275,11 +275,11 @@ impl ContextUi {
         self.views.get(&id)
     }
 
-    fn pinned(&self, key: &WorkspaceKey) -> Option<TermId> {
+    pub(crate) fn pinned(&self, key: &WorkspaceKey) -> Option<TermId> {
         self.pins.iter().find(|(k, _)| k == key).map(|&(_, id)| id)
     }
 
-    fn set_pin(&mut self, key: WorkspaceKey, id: Option<TermId>) {
+    pub(crate) fn set_pin(&mut self, key: WorkspaceKey, id: Option<TermId>) {
         self.pins.retain(|(k, _)| *k != key);
         if let Some(id) = id {
             self.pins.push((key, id));
@@ -318,7 +318,9 @@ impl ContextUi {
         cx.background_executor()
             .spawn(async {
                 if let Some(dir) = claude_ctx::data_dir() {
-                    claude_ctx::prune_dir(&dir, std::time::SystemTime::now(), claude_ctx::PRUNE_AGE);
+                    let now = std::time::SystemTime::now();
+                    claude_ctx::prune_dir(&dir, now, claude_ctx::PRUNE_AGE);
+                    crate::claude_images::prune_img_dirs(&dir, now, claude_ctx::PRUNE_AGE);
                 }
             })
             .detach();
@@ -748,7 +750,7 @@ fn divider(label: &'static str, theme: &Theme) -> Div {
     div().w_full().pt_2().border_t_1().border_color(theme.border).text_size(px(12.)).font_semibold().child(label)
 }
 
-fn centered(text: &'static str, theme: &Theme) -> AnyElement {
+pub(crate) fn centered(text: &'static str, theme: &Theme) -> AnyElement {
     div().flex_1().w_full().p_4().text_size(px(12.5)).text_color(theme.muted_foreground).child(text).into_any_element()
 }
 
@@ -761,16 +763,25 @@ pub(crate) struct PanelInput {
     pub now_ms: u64,
 }
 
-pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx: &Context<AppView>) -> AnyElement {
-    let theme = cx.theme().clone();
-    let theme = &theme;
+/// The selected Claude terminal of the panel and the pinned one (`None` = "Auto"). The pin is
+/// per workspace and shared by every tab that shows a Claude session (Context, Images).
+pub(crate) fn selection(ui: &ContextUi, input: &PanelInput) -> (Option<TermId>, Option<TermId>) {
     let ids: Vec<TermId> = input.targets.iter().map(|t| t.key).collect();
     let pinned = ui.pinned(&input.key).filter(|id| ids.contains(id));
-    let Some(selected) = selected_terminal(&ids, pinned, input.focused, input.active) else {
-        return centered(tr(lang, Tr::CtxNoClaude), theme);
-    };
+    (selected_terminal(&ids, pinned, input.focused, input.active), pinned)
+}
 
-    let switcher = switcher_visible(ids.len()).then(|| {
+/// The agent dropdown (only when there is more than one Claude terminal to choose from).
+pub(crate) fn render_switcher(
+    button_id: &'static str,
+    ui: &ContextUi,
+    input: &PanelInput,
+    selected: TermId,
+    pinned: Option<TermId>,
+    lang: Language,
+    cx: &Context<AppView>,
+) -> Option<Div> {
+    switcher_visible(input.targets.len()).then(|| {
         let selected_title = input.targets.iter().find(|t| t.key == selected).map_or("", |t| t.title.as_str());
         let label = switcher_label(tr(lang, Tr::CtxAuto), pinned.is_some(), selected_title);
         let auto = tr(lang, Tr::CtxAuto).to_string();
@@ -780,7 +791,7 @@ pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx
             .map(|t| (t.key, switcher_item_label(&t.title, ui.view(t.key).and_then(|v| v.percent))))
             .collect();
         let (app, key) = (cx.weak_entity(), input.key.clone());
-        let button = Button::new("ctx-switcher")
+        let button = Button::new(button_id)
             .ghost()
             .small()
             .max_w_full()
@@ -798,6 +809,7 @@ pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx
                     move |_: &ClickEvent, _: &mut Window, cx: &mut gpui_kit::App| {
                         let _ = app.update(cx, |this, cx| {
                             this.ctx_ui.set_pin(key.clone(), id);
+                            this.images_ui.poke();
                             cx.notify();
                         });
                     }
@@ -809,7 +821,18 @@ pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx
                 menu
             });
         div().flex_1().min_w_0().child(button)
-    });
+    })
+}
+
+pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx: &Context<AppView>) -> AnyElement {
+    let theme = cx.theme().clone();
+    let theme = &theme;
+    let (selected, pinned) = selection(ui, &input);
+    let Some(selected) = selected else {
+        return centered(tr(lang, Tr::CtxNoClaude), theme);
+    };
+
+    let switcher = render_switcher("ctx-switcher", ui, &input, selected, pinned, lang, cx);
     let updated = ui.view(selected).map(|view| {
         div().flex_shrink_0().text_size(px(11.)).text_color(theme.muted_foreground).child(updated_ago(lang, view, input.now_ms))
     });
@@ -972,6 +995,30 @@ mod tests {
         assert!(section_open(Section::Mcp, &ui.toggled));
         ui.toggle(Section::Mcp);
         assert!(!section_open(Section::Mcp, &ui.toggled));
+    }
+
+    #[test]
+    fn selection_follows_the_shared_per_workspace_pin() {
+        let targets = ["a", "b", "c"].iter().enumerate().map(|(i, t)| Target {
+            key: i as u64 + 1,
+            session_id: None,
+            raw_id: i.to_string(),
+            socket: "s".into(),
+            title: (*t).into(),
+            worktree: None,
+        });
+        let input = PanelInput { targets: targets.collect(), key: WorkspaceKey::Home, focused: Some(2), active: Some(3), now_ms: 0 };
+        let mut ui = ContextUi::default();
+        assert_eq!(selection(&ui, &input), (Some(2), None));
+        ui.set_pin(WorkspaceKey::Home, Some(3));
+        assert_eq!(selection(&ui, &input), (Some(3), Some(3)));
+        // A pin on a terminal that is gone, or on another workspace, is ignored.
+        ui.set_pin(WorkspaceKey::Home, Some(9));
+        assert_eq!(selection(&ui, &input), (Some(2), None));
+        ui.set_pin(WorkspaceKey::Worktree("/w".into()), Some(1));
+        assert_eq!(selection(&ui, &input), (Some(2), None));
+        let empty = PanelInput { targets: Vec::new(), ..input };
+        assert_eq!(selection(&ui, &empty), (None, None));
     }
 
     #[test]

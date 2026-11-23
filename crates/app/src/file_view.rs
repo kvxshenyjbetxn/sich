@@ -12,7 +12,7 @@ use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
     AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ParentElement as _, Render, Styled as _, Subscription, Window, div, px,
+    ObjectFit, ParentElement as _, Render, Styled as _, StyledImage as _, Subscription, Window, div, img, px,
 };
 
 use crate::file_doc::{self, DiskAction, Eol, LoadError, Stamp};
@@ -27,6 +27,8 @@ const PATH_CHARS: usize = 90;
 enum Phase {
     Loading,
     Ready,
+    /// An image file: shown scaled to fit, never loaded as text. Natural size in pixels.
+    Image { width: u32, height: u32 },
     Failed(LoadError),
 }
 
@@ -82,9 +84,29 @@ impl FileView {
             focus: cx.focus_handle(),
             _edits: edits,
         };
-        view.start_load(window, cx);
-        view.start_polling(window, cx);
+        if file_doc::is_image(&view.path) {
+            view.start_image(window, cx);
+        } else {
+            view.start_load(window, cx);
+            view.start_polling(window, cx);
+        }
         view
+    }
+
+    /// Reads the size of an image file (header only); the pixels are loaded by the image element.
+    fn start_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.path.clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx.background_executor().spawn(async move { file_doc::image_size(&path) }).await;
+            let _ = view.update_in(cx, |view, _, cx| {
+                view.phase = match result {
+                    Ok((width, height)) => Phase::Image { width, height },
+                    Err(error) => Phase::Failed(error),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -322,6 +344,18 @@ impl Render for FileView {
                 .w_full()
                 .child(Editor::new(&self.editor).size_full().bordered(false))
                 .into_any_element(),
+            Phase::Image { width, height } => {
+                // Natural size, shrunk (never enlarged) to fit; `Contain` keeps the aspect ratio
+                // when the box is clamped on one axis only.
+                let natural = div()
+                    .w(px(*width as f32))
+                    .h(px(*height as f32))
+                    .max_w_full()
+                    .max_h_full()
+                    .flex_shrink(1.)
+                    .child(img(self.path.clone()).size_full().object_fit(ObjectFit::Contain));
+                h_flex().flex_1().min_h_0().w_full().p_3().items_center().justify_center().child(natural).into_any_element()
+            }
             Phase::Failed(error) => {
                 let key = match error {
                     LoadError::TooLarge => Tr::FileTooLarge,
