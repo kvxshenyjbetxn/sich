@@ -124,7 +124,7 @@ async fn session(hub: Arc<Hub>, conn: Connection) -> anyhow::Result<()> {
         min_compatible: MIN_COMPATIBLE,
         host_name: hub.host_name().to_string(),
         gateway_version: env!("CARGO_PKG_VERSION").to_string(),
-        capabilities: vec!["fit".into(), "images".into()],
+        capabilities: vec!["fit".into(), "images".into(), "chat".into()],
     });
     let mut last_workspace = hub.workspace();
     outbox.push(GatewayMsg::Workspace(last_workspace.clone()));
@@ -219,7 +219,9 @@ async fn handle_msg(hub: &Arc<Hub>, sess: &mut Session, msg: PhoneMsg) {
             let result = hub.upload(data).await;
             sess.outbox.push(GatewayMsg::Uploaded { req_id, result });
         }
-        // TODO: chat handled in gateway chat module
-        PhoneMsg::ChatSubscribe { .. } | PhoneMsg::ChatUnsubscribe { .. } | PhoneMsg::ChatLoadEarlier { .. } | PhoneMsg::ChatImage { .. } => {}
+        PhoneMsg::ChatSubscribe { term, limit } => hub.chat_subscribe(sess, term, limit),
+        PhoneMsg::ChatUnsubscribe { term } => hub.chat_unsubscribe(sess, &term),
+        PhoneMsg::ChatLoadEarlier { term, before_order, limit } => hub.chat_load_earlier(sess, &term, before_order, limit),
+        PhoneMsg::ChatImage { req_id, term, image_ref } => hub.chat_image(sess, req_id, &term, image_ref),
     }
 }

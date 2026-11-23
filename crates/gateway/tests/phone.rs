@@ -8,7 +8,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use iroh::endpoint::{Connection, RecvStream, SendStream, presets};
 use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr};
 use sich_gateway::{ControlClient, Opts};
-use sich_proto::{ClientMsg, PROTO_VERSION, ServerMsg};
+use sich_proto::{AgentKind, ClientMsg, PROTO_VERSION, ServerMsg};
 use sich_remote_proto::{
     ALPN, MIN_COMPATIBLE, GatewayMsg, PairUrl, PhoneMsg, REMOTE_PROTO_VERSION, RejectReason, TermRef, Workspace, decode_frame, encode_frame, frame_codec,
 };
@@ -34,6 +34,8 @@ fn isolate() {
             std::env::set_var("SICH_WORKTREE_ROOT", dir.path().join("worktrees"));
             std::env::set_var("SICH_GATEWAY_RELAY", "disabled");
             std::env::set_var("SICH_GATEWAY_PORT", "0");
+            std::env::set_var("CLAUDE_CONFIG_DIR", dir.path().join("claude"));
+            std::env::set_var("CODEX_HOME", dir.path().join("codex"));
         }
         dir
     });
@@ -741,5 +743,139 @@ async fn kitty_graphics_reach_the_phone_as_an_iterm_inline_image() {
     let normalized = format!("\x1b_Ga=t,f=100,t=d,q=2,i=7,m=0;{b64}\x1b\\\x1b_Ga=p,U=1,q=2,i=7,c=4,r=2\x1b\\");
     assert!(contains(&out, normalized.as_bytes()), "normalized APC missing in {:?}", String::from_utf8_lossy(&out));
     assert!(!contains(&out, b"i=7,U=1"), "original control data must not leak");
+    h.stop().await;
+}
+
+// ----- chat view -----
+
+fn claude_transcript_path(session: &str) -> std::path::PathBuf {
+    // The terminal's cwd is not known to the test: the gateway finds the file by scanning buckets.
+    std::path::PathBuf::from(std::env::var_os("CLAUDE_CONFIG_DIR").unwrap()).join("projects").join("some-bucket").join(format!("{session}.jsonl"))
+}
+
+fn user_line(n: u32, text: &str) -> String {
+    format!(r#"{{"type":"user","uuid":"u{n}","message":{{"role":"user","content":"{text}"}}}}"#)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_snapshot_live_update_paging_and_image_over_the_phone_link() {
+    use base64::Engine as _;
+    use sich_remote_proto::{ChatBlock, ChatStatus};
+    use std::io::Write as _;
+
+    let h = Harness::start().await;
+    let term = h.interactive_shell().await;
+    let session = format!("chat-it-{}", std::process::id());
+    // Give the terminal a Claude session id the official way: a hook event.
+    let mut daemon = h.daemon_conn().await;
+    let payload = format!(r#"{{"session_id":"{session}","cwd":"C:\\dev","hook_event_name":"SessionStart"}}"#);
+    daemon_send(&mut daemon, ClientMsg::AgentHook { term_id: term.id, agent: AgentKind::Claude, payload }).await;
+
+    let key = SecretKey::generate();
+    let mut phone = h.pair(&key, "Chatter", true).await;
+    let GatewayMsg::Welcome { capabilities, .. } = phone.recv().await else { panic!("Welcome first") };
+    assert!(capabilities.iter().any(|c| c == "chat"), "{capabilities:?}");
+    phone.until(|m| matches!(m, GatewayMsg::Workspace(ws) if ws.terminals.iter().any(|t| t.term == term && t.agent.is_some())).then_some(())).await;
+
+    // No transcript yet: Pending.
+    phone.send(PhoneMsg::ChatSubscribe { term: term.clone(), limit: 2 }).await;
+    let status = phone
+        .until(|m| match m {
+            GatewayMsg::ChatSnapshot { term: t, status, .. } if t == &term => Some(status.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(status, ChatStatus::Pending);
+
+    // The file appears: a fresh Ready snapshot with the last `limit` messages.
+    let path = claude_transcript_path(&session);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut png_bytes = Vec::new();
+    ::image::DynamicImage::new_rgb8(6, 3).write_to(&mut std::io::Cursor::new(&mut png_bytes), ::image::ImageFormat::Png).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    let image_line = format!(
+        r#"{{"type":"user","uuid":"img","message":{{"content":[{{"type":"image","source":{{"type":"base64","media_type":"image/png","data":"{b64}"}}}}]}}}}"#
+    );
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "{}\n{}\n{}", user_line(0, "first"), user_line(1, "second"), image_line).unwrap();
+    f.flush().unwrap();
+    let (messages, has_more) = phone
+        .until(|m| match m {
+            GatewayMsg::ChatSnapshot { term: t, status: ChatStatus::Ready, messages, has_more } if t == &term => Some((messages.clone(), *has_more)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["u1", "img"]);
+    assert!(has_more);
+
+    // Live update.
+    writeln!(f, "{}", user_line(2, "third")).unwrap();
+    f.flush().unwrap();
+    let update = phone
+        .until(|m| match m {
+            GatewayMsg::ChatUpdate { term: t, messages } if t == &term => Some(messages.clone()),
+            _ => None,
+        })
+        .await;
+    assert_eq!(update.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["u2"]);
+
+    // Paging back.
+    phone.send(PhoneMsg::ChatLoadEarlier { term: term.clone(), before_order: messages[0].order, limit: 5 }).await;
+    let (earlier, more) = phone
+        .until(|m| match m {
+            GatewayMsg::ChatEarlier { term: t, messages, has_more } if t == &term => Some((messages.clone(), *has_more)),
+            _ => None,
+        })
+        .await;
+    assert_eq!(earlier.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["u0"]);
+    assert!(!more);
+
+    // Image by ref, and an unknown ref.
+    let ChatBlock::Image { image_ref, .. } = messages[1].blocks[0].clone() else { panic!("image block") };
+    phone.send(PhoneMsg::ChatImage { req_id: 7, term: term.clone(), image_ref }).await;
+    phone.send(PhoneMsg::ChatImage { req_id: 8, term: term.clone(), image_ref: "i1.9".into() }).await;
+    let mut results = std::collections::HashMap::new();
+    while results.len() < 2 {
+        if let GatewayMsg::ChatImageData { req_id, result } = phone.recv().await {
+            results.insert(req_id, result);
+        }
+    }
+    let ok = results[&7].as_ref().expect("image bytes");
+    assert_eq!(ok.mime, "image/png");
+    assert_eq!(::image::load_from_memory(&ok.data).unwrap().width(), 6);
+    assert!(results[&8].is_err());
+
+    // After unsubscribing, image requests for the closed chat fail.
+    phone.send(PhoneMsg::ChatUnsubscribe { term: term.clone() }).await;
+    phone.send(PhoneMsg::ChatImage { req_id: 9, term: term.clone(), image_ref: "i0.0".into() }).await;
+    let closed = phone
+        .until(|m| match m {
+            GatewayMsg::ChatImageData { req_id: 9, result } => Some(result.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(closed.is_err());
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn chat_for_a_terminal_without_an_agent_is_unavailable() {
+    use sich_remote_proto::ChatStatus;
+    let h = Harness::start().await;
+    let term = h.interactive_shell().await;
+    let (mut phone, _) = h.paired_phone("NoAgent").await;
+    phone.workspace_with(&term).await;
+    phone.send(PhoneMsg::ChatSubscribe { term: term.clone(), limit: 10 }).await;
+    let status = phone
+        .until(|m| match m {
+            GatewayMsg::ChatSnapshot { status, .. } => Some(status.clone()),
+            _ => None,
+        })
+        .await;
+    assert!(matches!(status, ChatStatus::Unavailable { .. }), "{status:?}");
+    // A terminal that does not exist is an error, not a hang.
+    let ghost = TermRef { daemon: term.daemon.clone(), id: term.id + 1000 };
+    phone.send(PhoneMsg::ChatSubscribe { term: ghost, limit: 10 }).await;
+    phone.until(|m| matches!(m, GatewayMsg::Error { .. }).then_some(())).await;
     h.stop().await;
 }

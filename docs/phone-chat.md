@@ -75,3 +75,12 @@ Variants are appended after the existing ones.
 - Mobile:
   - vitest for message list merge (id replace, order sort, earlier pages);
   - markdown sanitizing (no raw HTML), tool summary formatting, image fetch queue (max 2).
+
+## Gateway implementation notes (crates/gateway/src/chat/)
+- Modules: `locate` (transcript lookup), `decode` (line decoders), `tail` (incremental reader), `state` (decoded messages, paging), `image` (refs -> bytes), `session` (async watcher per phone+terminal). Wiring: `Hub::chat_*` and `phone.rs`.
+- Message ids: Claude = line `uuid`; Codex = `c<offset>`. A line with several roles (e.g. thinking + text + tool_use) yields several messages `id`, `id#1`, ... that share the line's `order`; paging never splits them. Pages are also capped by `limit <= 300` and about 6 MiB.
+- Roles: Claude `tool_use`/`tool_result` -> `Tool`; `thinking` -> `Reasoning`. Codex `reasoning` summary -> `Reasoning`; `function_call`, `custom_tool_call`, `local_shell_call`, `web_search_call` and their outputs -> `Tool`. Sidechain (subagent) Claude lines and developer/injected context are skipped.
+- Codex dedupe: only `response_item` records are decoded; `event_msg` duplicates (and newer `item_completed`) are ignored.
+- `image_ref` = `i<line offset>.<n>`: the n-th image of the transcript line at that byte offset. The gateway keeps no image data: `ChatImage` re-reads and decodes that line (inline base64, or a file path the transcript names, e.g. `[Image: source: ...]`, Codex `input_image` paths), then downsizes (<= 1600 px, <= 2 MiB, PNG/JPEG). Refs that do not resolve to an image are errors.
+- Status: the resolver is re-run every 2 s; `Pending`/`Unavailable` snapshots are sent only when the status changes. A shown transcript stays until another one is ready (new session id after /clear). File truncation or replacement sends a fresh `ChatSnapshot`.
+- One tailer per (phone, terminal), not shared across phones.
