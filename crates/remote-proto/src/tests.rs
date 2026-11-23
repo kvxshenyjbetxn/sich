@@ -193,6 +193,65 @@ fn hello_and_welcome_are_variant_zero() {
     assert_eq!(encode(&GatewayMsg::Error { message: String::new() })[0], 10);
 }
 
+fn chat_msg(order: u64, role: ChatRole, blocks: Vec<ChatBlock>) -> ChatMessage {
+    ChatMessage { id: format!("m{order}"), order, role, timestamp_ms: Some(1_700_000_000_000), blocks }
+}
+
+fn chat_blocks() -> Vec<ChatBlock> {
+    vec![
+        ChatBlock::Text { markdown: "hi **there**".into() },
+        ChatBlock::ToolCall { call_id: "c1".into(), name: "Bash".into(), summary: "ls".into() },
+        ChatBlock::ToolResult { call_id: "c1".into(), output: "ok".into(), is_error: false },
+        ChatBlock::ToolResult { call_id: "c2".into(), output: "boom".into(), is_error: true },
+        ChatBlock::Image { image_ref: "ref".into(), alt: "pic".into() },
+    ]
+}
+
+#[test]
+fn chat_types_round_trip() {
+    for b in chat_blocks() {
+        rt(b);
+    }
+    for r in [ChatRole::User, ChatRole::Assistant, ChatRole::Tool, ChatRole::Reasoning, ChatRole::System] {
+        rt(r);
+    }
+    for s in [ChatStatus::Ready, ChatStatus::Unavailable { reason: "no file".into() }, ChatStatus::Pending] {
+        rt(s);
+    }
+    rt(ChatImageBytes { mime: "image/png".into(), data: vec![1, 2, 3] });
+    rt(chat_msg(5, ChatRole::Assistant, chat_blocks()));
+    let mut m = chat_msg(0, ChatRole::User, vec![]);
+    m.timestamp_ms = None;
+    rt(m);
+}
+
+#[test]
+fn chat_msgs_round_trip_and_indexes() {
+    let msgs = vec![chat_msg(1, ChatRole::User, chat_blocks()), chat_msg(2, ChatRole::Reasoning, vec![])];
+    let phone = [
+        PhoneMsg::ChatSubscribe { term: t(1), limit: 50 },
+        PhoneMsg::ChatUnsubscribe { term: t(1) },
+        PhoneMsg::ChatLoadEarlier { term: t(1), before_order: 99, limit: 30 },
+        PhoneMsg::ChatImage { req_id: 7, term: t(1), image_ref: "r".into() },
+    ];
+    for (i, m) in phone.into_iter().enumerate() {
+        assert_eq!(encode(&m)[0], 10 + i as u8);
+        rt(m);
+    }
+    let gw = [
+        GatewayMsg::ChatSnapshot { term: t(1), status: ChatStatus::Ready, messages: msgs.clone(), has_more: true },
+        GatewayMsg::ChatUpdate { term: t(1), messages: msgs.clone() },
+        GatewayMsg::ChatEarlier { term: t(1), messages: msgs, has_more: false },
+        GatewayMsg::ChatImageData { req_id: 7, result: Ok(ChatImageBytes { mime: "image/jpeg".into(), data: vec![9; 10] }) },
+        GatewayMsg::ChatImageData { req_id: 8, result: Err("gone".into()) },
+    ];
+    for (i, m) in gw.into_iter().enumerate() {
+        assert_eq!(encode(&m)[0], 11 + (i.min(3)) as u8);
+        rt(m);
+    }
+    rt(GatewayMsg::ChatSnapshot { term: t(2), status: ChatStatus::Pending, messages: vec![], has_more: false });
+}
+
 #[test]
 fn decode_garbage_errors() {
     assert!(decode::<PhoneMsg>(&[]).is_err());
@@ -214,15 +273,15 @@ fn termref_ordering_and_hash() {
 #[test]
 fn constants() {
     assert_eq!(ALPN, b"sich/remote/1");
-    assert_eq!(REMOTE_PROTO_VERSION, 1);
-    assert_eq!(MIN_COMPATIBLE, 1);
+    assert_eq!(REMOTE_PROTO_VERSION, 2);
+    assert_eq!(MIN_COMPATIBLE, 2);
     assert_eq!(MAX_FRAME, 16 * 1024 * 1024);
 }
 
 #[test]
 fn compatible_table() {
-    // (their_version, their_min, expected) with mine = (1, 1)
-    for (v, m, ok) in [(1, 1, true), (2, 1, true), (5, 1, true), (2, 2, false), (3, 2, false), (0, 0, false), (1, 0, true)] {
+    // (their_version, their_min, expected) with mine = (2, 2)
+    for (v, m, ok) in [(1, 1, false), (1, 0, false), (2, 1, true), (2, 2, true), (3, 2, true), (5, 1, true), (3, 3, false), (0, 0, false)] {
         assert_eq!(compatible(v, m), ok, "v={v} min={m}");
     }
 }

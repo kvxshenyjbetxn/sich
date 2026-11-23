@@ -219,5 +219,7 @@ async fn handle_msg(hub: &Arc<Hub>, sess: &mut Session, msg: PhoneMsg) {
             let result = hub.upload(data).await;
             sess.outbox.push(GatewayMsg::Uploaded { req_id, result });
         }
+        // TODO: chat handled in gateway chat module
+        PhoneMsg::ChatSubscribe { .. } | PhoneMsg::ChatUnsubscribe { .. } | PhoneMsg::ChatLoadEarlier { .. } | PhoneMsg::ChatImage { .. } => {}
     }
 }

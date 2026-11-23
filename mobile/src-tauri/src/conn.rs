@@ -632,6 +632,8 @@ impl Actor {
                         }
                         GatewayMsg::Exited { term, code } => self.ui.term_exited(&term, code),
                         GatewayMsg::Error { message } => self.ui.gateway_error(&message),
+                        // TODO: chat handled in mobile chat module
+                        GatewayMsg::ChatSnapshot { .. } | GatewayMsg::ChatUpdate { .. } | GatewayMsg::ChatEarlier { .. } | GatewayMsg::ChatImageData { .. } => {}
                     }
                 }
                 cmd = rx.recv() => {

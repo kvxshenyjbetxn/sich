@@ -30,6 +30,14 @@ pub enum PhoneMsg {
     MarkSeen { term: TermRef },
     /// Phone downsizes to <= 2048 px before sending.
     UploadImage { req_id: u64, file_name: String, data: Vec<u8> },
+    /// Chat view: snapshot of the last `limit` messages, then live updates.
+    ChatSubscribe { term: TermRef, limit: u32 },
+    /// Chat view: stop updates.
+    ChatUnsubscribe { term: TermRef },
+    /// Chat view: page of messages older than `before_order`.
+    ChatLoadEarlier { term: TermRef, before_order: u64, limit: u32 },
+    /// Chat view: fetch image bytes by opaque `image_ref`.
+    ChatImage { req_id: u64, term: TermRef, image_ref: String },
 }
 
 /// Gateway -> phone. Variant order is wire format: append only, `Welcome` stays 0.
@@ -63,6 +71,60 @@ pub enum GatewayMsg {
     Exited { term: TermRef, code: Option<i32> },
     /// Non-fatal error.
     Error { message: String },
+    /// Chat view: initial messages plus status.
+    ChatSnapshot { term: TermRef, status: ChatStatus, messages: Vec<ChatMessage>, has_more: bool },
+    /// Chat view: new or replaced messages (matched by `id`, ordered by `order`).
+    ChatUpdate { term: TermRef, messages: Vec<ChatMessage> },
+    /// Chat view: reply to `ChatLoadEarlier`.
+    ChatEarlier { term: TermRef, messages: Vec<ChatMessage>, has_more: bool },
+    /// Chat view: reply to `ChatImage`.
+    ChatImageData { req_id: u64, result: Result<ChatImageBytes, String> },
+}
+
+/// One chat message built from the agent transcript.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub id: String,
+    /// Byte offset of the JSONL line.
+    pub order: u64,
+    pub role: ChatRole,
+    pub timestamp_ms: Option<u64>,
+    pub blocks: Vec<ChatBlock>,
+}
+
+/// Who a chat message belongs to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ChatRole {
+    User,
+    Assistant,
+    Tool,
+    Reasoning,
+    System,
+}
+
+/// Content block of a chat message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ChatBlock {
+    Text { markdown: String },
+    ToolCall { call_id: String, name: String, summary: String },
+    ToolResult { call_id: String, output: String, is_error: bool },
+    Image { image_ref: String, alt: String },
+}
+
+/// Whether a chat transcript is available for a terminal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ChatStatus {
+    Ready,
+    Unavailable { reason: String },
+    /// Agent has no session id or file yet.
+    Pending,
+}
+
+/// Image bytes returned for `ChatImage`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatImageBytes {
+    pub mime: String,
+    pub data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

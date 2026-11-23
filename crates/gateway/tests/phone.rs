@@ -10,7 +10,7 @@ use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr};
 use sich_gateway::{ControlClient, Opts};
 use sich_proto::{ClientMsg, PROTO_VERSION, ServerMsg};
 use sich_remote_proto::{
-    ALPN, GatewayMsg, PairUrl, PhoneMsg, REMOTE_PROTO_VERSION, RejectReason, TermRef, Workspace, decode_frame, encode_frame, frame_codec,
+    ALPN, MIN_COMPATIBLE, GatewayMsg, PairUrl, PhoneMsg, REMOTE_PROTO_VERSION, RejectReason, TermRef, Workspace, decode_frame, encode_frame, frame_codec,
 };
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
@@ -278,7 +278,7 @@ impl Phone {
     async fn hello(&mut self, name: &str, secret: Option<String>) {
         self.send(PhoneMsg::Hello {
             proto_version: REMOTE_PROTO_VERSION,
-            min_compatible: 1,
+            min_compatible: MIN_COMPATIBLE,
             app_version: "test".into(),
             device_name: name.into(),
             capabilities: vec![],
@@ -512,7 +512,7 @@ async fn incompatible_protocol_is_rejected() {
             pair_secret: None,
         })
         .await;
-    phone.expect_rejected(RejectReason::Incompatible { gateway_version: REMOTE_PROTO_VERSION, gateway_min: 1 }).await;
+    phone.expect_rejected(RejectReason::Incompatible { gateway_version: REMOTE_PROTO_VERSION, gateway_min: MIN_COMPATIBLE }).await;
     h.stop().await;
 }
 

@@ -20,8 +20,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 pub const ALPN: &[u8] = b"sich/remote/1";
-pub const REMOTE_PROTO_VERSION: u32 = 1;
-pub const MIN_COMPATIBLE: u32 = 1;
+pub const REMOTE_PROTO_VERSION: u32 = 2;
+pub const MIN_COMPATIBLE: u32 = 2;
 /// Maximum frame body size (16 MiB).
 pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
