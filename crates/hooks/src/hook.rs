@@ -13,7 +13,10 @@ use tokio_util::codec::Framed;
 /// The hook's stdin is read up to this many bytes.
 pub const MAX_STDIN_BYTES: usize = 1024 * 1024;
 const TOTAL_BUDGET: Duration = Duration::from_secs(2);
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Overall connect deadline, including retries. Leaves room in the 2 s budget for the send.
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(1200);
+const RETRY_FIRST_DELAY: Duration = Duration::from_millis(25);
+const RETRY_MAX_DELAY: Duration = Duration::from_millis(200);
 const WELCOME_WAIT: Duration = Duration::from_millis(300);
 const MAX_LOG_BYTES: u64 = 1024 * 1024;
 
@@ -80,12 +83,49 @@ pub fn run_hook(
     }
 }
 
-/// Real delivery: connects with a 500 ms timeout, sends the frames and closes.
+/// True for connect errors that mean "the listener is momentarily not ready": a Windows pipe with
+/// no free instance between two accepts (os error 2 / 231) or a Unix socket file being recreated.
+pub fn is_transient_connect_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused)
+        || matches!(e.raw_os_error(), Some(2 | 231))
+}
+
+/// Calls `connect` until it succeeds, fails with a non-transient error, or `deadline` passes.
+/// Transient failures back off 25 ms, doubling up to 200 ms; the last error is returned.
+pub async fn connect_with_retry<T, F, Fut>(mut connect: F, deadline: Duration) -> std::io::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let start = tokio::time::Instant::now();
+    let mut delay = RETRY_FIRST_DELAY;
+    loop {
+        match connect().await {
+            Ok(v) => return Ok(v),
+            Err(e) if is_transient_connect_error(&e) => {
+                let left = deadline.saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    return Err(e);
+                }
+                tokio::time::sleep(delay.min(left)).await;
+                delay = (delay * 2).min(RETRY_MAX_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Real delivery: connects (retrying while the daemon is briefly not accepting, 1.2 s overall),
+/// sends the frames and closes.
 pub fn send_to_daemon(socket: &str, msgs: Vec<ClientMsg>) -> anyhow::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
-        let stream = tokio::time::timeout(CONNECT_TIMEOUT, sich_daemon::connect(socket))
-            .await
+        let stream = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            connect_with_retry(|| sich_daemon::connect(socket), CONNECT_TIMEOUT),
+        )
+        .await
             .context("connect timed out")?
             .context("connect")?;
         let mut framed = Framed::new(stream, frame_codec());
@@ -261,6 +301,103 @@ mod tests {
         .unwrap();
         assert!(matches!(out, HookOutcome::DaemonUnreachable(_)));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    fn err(kind: std::io::ErrorKind) -> std::io::Error {
+        std::io::Error::from(kind)
+    }
+
+    #[test]
+    fn transient_classification() {
+        assert!(is_transient_connect_error(&err(std::io::ErrorKind::NotFound)));
+        assert!(is_transient_connect_error(&err(std::io::ErrorKind::ConnectionRefused)));
+        assert!(is_transient_connect_error(&std::io::Error::from_raw_os_error(2)));
+        assert!(is_transient_connect_error(&std::io::Error::from_raw_os_error(231)));
+        assert!(!is_transient_connect_error(&err(std::io::ErrorKind::PermissionDenied)));
+        assert!(!is_transient_connect_error(&err(std::io::ErrorKind::InvalidInput)));
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_transient_failures() {
+        let mut calls = 0;
+        let r = connect_with_retry(
+            || {
+                calls += 1;
+                let n = calls;
+                async move { if n < 4 { Err(err(std::io::ErrorKind::NotFound)) } else { Ok(n) } }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(r.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_repeat_non_transient_errors() {
+        let mut calls = 0;
+        let r: std::io::Result<()> = connect_with_retry(
+            || {
+                calls += 1;
+                async { Err(err(std::io::ErrorKind::PermissionDenied)) }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn retry_respects_deadline_and_returns_last_error() {
+        let started = std::time::Instant::now();
+        let mut calls = 0;
+        let r: std::io::Result<()> = connect_with_retry(
+            || {
+                calls += 1;
+                async { Err(std::io::Error::from_raw_os_error(2)) }
+            },
+            Duration::from_millis(150),
+        )
+        .await;
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(2));
+        assert!(calls >= 2, "must have retried, got {calls}");
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert!(started.elapsed() < Duration::from_millis(1000));
+    }
+
+    /// The burst scenario: the hook starts while no listener exists yet and the daemon appears
+    /// a bit later. Delivery must still succeed.
+    #[test]
+    fn delivery_succeeds_when_listener_appears_late() {
+        use interprocess::local_socket::tokio::prelude::*;
+        use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ListenerOptions};
+        let name = format!("sich-hook-test-late-{}", std::process::id());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let server_name = name.clone();
+        let server = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let n = if GenericNamespaced::is_supported() {
+                    server_name.clone().to_ns_name::<GenericNamespaced>().unwrap()
+                } else {
+                    std::env::temp_dir().join(format!("{server_name}.sock")).to_fs_name::<GenericFilePath>().unwrap()
+                };
+                let listener = ListenerOptions::new().name(n).create_tokio().unwrap();
+                let stream = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+                    .await
+                    .expect("hook never connected")
+                    .unwrap();
+                let mut framed = Framed::new(stream, frame_codec());
+                let first = framed.next().await.unwrap().unwrap();
+                let _ = tx.send(decode::<ClientMsg>(&first).unwrap());
+            });
+        });
+        let msgs = vec![ClientMsg::Hello { proto_version: PROTO_VERSION, client_name: "t".into() }];
+        send_to_daemon(&name, msgs).expect("delivery must survive a late listener");
+        let got = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(got, ClientMsg::Hello { .. }));
+        server.join().unwrap();
     }
 
     #[test]
