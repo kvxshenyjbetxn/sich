@@ -25,6 +25,8 @@ mod file_doc;
 mod file_view;
 mod paste_image;
 mod phone_cli;
+#[cfg(windows)]
+mod phone_firewall;
 mod phone_settings;
 mod quick_command_dialogs;
 mod quick_commands;

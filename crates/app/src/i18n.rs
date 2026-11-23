@@ -655,6 +655,13 @@ pub enum Tr {
     PhoneGettingCode,
     PhoneRevoke,
     PhoneNoDevices,
+    PhoneFwDirect,
+    PhoneFwAllowed,
+    PhoneFwBlocked,
+    PhoneFwAdd,
+    PhoneFwRemove,
+    PhoneFwHint,
+    PhoneFwCancelled,
 }
 
 impl Tr {
@@ -1272,6 +1279,13 @@ impl Tr {
         Tr::PhoneGettingCode,
         Tr::PhoneRevoke,
         Tr::PhoneNoDevices,
+        Tr::PhoneFwDirect,
+        Tr::PhoneFwAllowed,
+        Tr::PhoneFwBlocked,
+        Tr::PhoneFwAdd,
+        Tr::PhoneFwRemove,
+        Tr::PhoneFwHint,
+        Tr::PhoneFwCancelled,
     ];
 }
 
@@ -3186,6 +3200,41 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Uk => "Немає підключених телефонів",
             Ru => "Нет подключённых телефонов",
             En => "No phones connected",
+        },
+        Tr::PhoneFwDirect => match lang {
+            Uk => "Пряме підключення в локальній мережі",
+            Ru => "Прямое подключение в локальной сети",
+            En => "Direct connection on the local network",
+        },
+        Tr::PhoneFwAllowed => match lang {
+            Uk => "дозволено ✓",
+            Ru => "разрешено ✓",
+            En => "allowed ✓",
+        },
+        Tr::PhoneFwBlocked => match lang {
+            Uk => "заблоковано брандмауером",
+            Ru => "заблокировано брандмауэром",
+            En => "blocked by the firewall",
+        },
+        Tr::PhoneFwAdd => match lang {
+            Uk => "Дозволити в брандмауері",
+            Ru => "Разрешить в брандмауэре",
+            En => "Allow in firewall",
+        },
+        Tr::PhoneFwRemove => match lang {
+            Uk => "Прибрати правило",
+            Ru => "Убрать правило",
+            En => "Remove rule",
+        },
+        Tr::PhoneFwHint => match lang {
+            Uk => "Без цього телефон працює через relay — повільніше й з лімітами.",
+            Ru => "Без этого телефон работает через relay — медленнее и с лимитами.",
+            En => "Without this the phone goes through a relay: slower and rate-limited.",
+        },
+        Tr::PhoneFwCancelled => match lang {
+            Uk => "Скасовано",
+            Ru => "Отменено",
+            En => "Cancelled",
         },
         Tr::AgentsNoTurns => match lang {
             Uk => "У кінці сесії немає повідомлень",

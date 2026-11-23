@@ -93,6 +93,8 @@ The crate also provides `encode(&T) -> Vec<u8>` / `decode` helpers, the compatib
   - `<config>/sich/phone/devices.json` (`[{endpoint_id, name, paired_unix_ms, last_seen_unix_ms}]`, atomic tmp+rename; unreadable → refuse all, never overwrite);
   - uploads go to `%TEMP%/sich-paste/phone-<ms>-<n>.<ext>` (same dir as desktop paste), files older than 7 days are pruned on start.
 - iroh endpoint: n0 preset (n0 relays + discovery) by default. `SICH_GATEWAY_RELAY=disabled` → no relay, no discovery (tests, LAN-only). A custom relay URL setting comes later.
+- UDP port: fixed `6769` on `0.0.0.0` and `[::]` (IPv6 optional), override `SICH_GATEWAY_PORT` (`0` = random; tests use it). A busy port logs a warning and falls back to a random one. The bound port is in the control `Status.port` and in `sich phone status`.
+- Windows Firewall: the gateway runs from a per-build copy, so the rule is port-based, not program-based: inbound UDP 6769, allow, any profile, named `Sich phone sync (UDP 6769)`. Without it the phone falls back to the n0 relay (slow, rate-limited). The settings "Телефон" section checks it with `netsh` (no elevation) and adds/removes it through one UAC prompt (elevated hidden PowerShell); cancelling UAC is not an error. The row is Windows-only.
 - Control pipe `<base>-gateway` (`<base>` = `sich_daemon::socket_name_from_env()`), postcard frames:
   - Hello (build id);
   - Status (endpoint id, devices, connected count);

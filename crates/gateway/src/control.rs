@@ -32,6 +32,8 @@ pub struct Status {
     /// Direct addresses the gateway is reachable at.
     pub addrs: Vec<String>,
     pub relay: Option<String>,
+    /// UDP port the endpoint is bound to.
+    pub port: u16,
     /// Set when `devices.json` is unreadable (all phones are refused).
     pub device_list_error: Option<String>,
 }
@@ -383,6 +385,7 @@ mod tests {
             connected: 2,
             addrs: vec!["1.2.3.4:5".into()],
             relay: Some("https://r".into()),
+            port: 6769,
             device_list_error: None,
         };
         let resps = [

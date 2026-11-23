@@ -519,6 +519,7 @@ impl Hub {
             connected: self.connected_count(),
             addrs: self.direct_addrs(),
             relay: self.endpoint.addr().relay_urls().next().map(|u| u.to_string()),
+            port: crate::pick_port(&self.endpoint.bound_sockets()),
             device_list_error,
         }
     }

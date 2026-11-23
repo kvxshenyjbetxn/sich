@@ -14,12 +14,13 @@ pub mod store;
 pub mod stream;
 pub mod uploads;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use interprocess::local_socket::ListenerOptions;
-use iroh::endpoint::{QuicTransportConfig, presets};
+use iroh::endpoint::{BindOpts, QuicTransportConfig, presets};
 use iroh::{Endpoint, SecretKey};
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +33,24 @@ const KEEP_ALIVE: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const TAKEOVER_WAIT: Duration = Duration::from_secs(5);
 
+/// Fixed UDP port of the gateway, so one firewall rule keeps working across builds.
+pub const DEFAULT_PORT: u16 = 6769;
+
+/// Port requested through `SICH_GATEWAY_PORT` (`0` = random); unset or invalid = `DEFAULT_PORT`.
+pub fn port_from_env(value: Option<&str>) -> u16 {
+    value.and_then(|v| v.trim().parse::<u16>().ok()).unwrap_or(DEFAULT_PORT)
+}
+
+/// Ports to try in order: the requested one, then a random one (`0`) when it is busy.
+pub fn ports_to_try(requested: u16) -> Vec<u16> {
+    if requested == 0 { vec![0] } else { vec![requested, 0] }
+}
+
+/// The port the endpoint is reachable on: the IPv4 socket's, else the first one; `0` if none.
+pub fn pick_port(sockets: &[SocketAddr]) -> u16 {
+    sockets.iter().find(|a| a.is_ipv4()).or_else(|| sockets.first()).map_or(0, |a| a.port())
+}
+
 pub struct Opts {
     /// Daemon base name (`sich_daemon::socket_name_from_env()`); the control pipe is `<base>-gateway`.
     pub base: String,
@@ -43,6 +62,8 @@ pub struct Opts {
     pub upload_dir: PathBuf,
     /// No relay and no address discovery (tests, LAN only).
     pub relay_disabled: bool,
+    /// Requested UDP port (`0` = random). A busy port falls back to a random one.
+    pub port: u16,
     pub host_name: String,
     /// How long the desktop user has to confirm a pair request.
     pub confirm_timeout: Duration,
@@ -70,6 +91,7 @@ impl Opts {
             phone_dir: config_dir().context("no config dir")?.join("sich").join("phone"),
             upload_dir: uploads::default_dir(),
             relay_disabled: std::env::var("SICH_GATEWAY_RELAY").is_ok_and(|v| v.eq_ignore_ascii_case("disabled")),
+            port: port_from_env(std::env::var("SICH_GATEWAY_PORT").ok().as_deref()),
             host_name: computer_name(),
             confirm_timeout: pairing::CONFIRM_TIMEOUT,
         })
@@ -93,6 +115,20 @@ pub fn init_logging() -> anyhow::Result<tracing_appender::non_blocking::WorkerGu
 }
 
 async fn bind_endpoint(opts: &Opts, key: [u8; 32]) -> anyhow::Result<Endpoint> {
+    let mut last_err = None;
+    for port in ports_to_try(opts.port) {
+        match bind_endpoint_on(opts, key, port).await {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(e) => {
+                tracing::warn!(port, "could not bind the gateway port: {e:#}");
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no port to bind")))
+}
+
+async fn bind_endpoint_on(opts: &Opts, key: [u8; 32], port: u16) -> anyhow::Result<Endpoint> {
     let transport = QuicTransportConfig::builder()
         .keep_alive_interval(KEEP_ALIVE)
         .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().context("idle timeout")?))
@@ -102,6 +138,12 @@ async fn bind_endpoint(opts: &Opts, key: [u8; 32]) -> anyhow::Result<Endpoint> {
         .secret_key(SecretKey::from_bytes(&key))
         .alpns(vec![sich_remote_proto::ALPN.to_vec()])
         .transport_config(transport)
+        .clear_ip_transports()
+        .bind_addr(SocketAddr::from(([0, 0, 0, 0], port)))
+        .context("IPv4 bind address")?
+        // IPv6 may be unavailable or its port taken: not required.
+        .bind_addr_with_opts(SocketAddr::from(([0u16; 8], port)), BindOpts::default().set_is_required(false))
+        .context("IPv6 bind address")?
         .bind()
         .await
         .context("bind iroh endpoint")
@@ -148,7 +190,7 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
         uploads::prune(&upload_dir, std::time::SystemTime::now(), uploads::MAX_AGE);
     });
     let endpoint = bind_endpoint(&opts, key).await?;
-    tracing::info!(id = %endpoint.id(), base = %opts.base, relay_disabled = opts.relay_disabled, "gateway started");
+    tracing::info!(id = %endpoint.id(), base = %opts.base, port = pick_port(&endpoint.bound_sockets()), relay_disabled = opts.relay_disabled, "gateway started");
 
     let shutdown = CancellationToken::new();
     let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -186,4 +228,34 @@ pub async fn run(opts: Opts) -> anyhow::Result<()> {
     pool.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.close()).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_from_env_defaults_and_overrides() {
+        assert_eq!(port_from_env(None), DEFAULT_PORT);
+        assert_eq!(port_from_env(Some("")), DEFAULT_PORT);
+        assert_eq!(port_from_env(Some("junk")), DEFAULT_PORT);
+        assert_eq!(port_from_env(Some("70000")), DEFAULT_PORT);
+        assert_eq!(port_from_env(Some("0")), 0);
+        assert_eq!(port_from_env(Some(" 7000 ")), 7000);
+    }
+
+    #[test]
+    fn busy_fixed_port_falls_back_to_random() {
+        assert_eq!(ports_to_try(6769), vec![6769, 0]);
+        assert_eq!(ports_to_try(0), vec![0]);
+    }
+
+    #[test]
+    fn pick_port_prefers_ipv4() {
+        let v4: SocketAddr = "0.0.0.0:6769".parse().unwrap();
+        let v6: SocketAddr = "[::]:7000".parse().unwrap();
+        assert_eq!(pick_port(&[v6, v4]), 6769);
+        assert_eq!(pick_port(&[v6]), 7000);
+        assert_eq!(pick_port(&[]), 0);
+    }
 }

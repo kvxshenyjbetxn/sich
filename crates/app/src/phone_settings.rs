@@ -67,6 +67,58 @@ pub fn status_line(lang: Language, status: &GatewayStatus) -> (String, bool) {
     }
 }
 
+/// What the settings row knows about the firewall rule (Windows only).
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FirewallUi {
+    /// Not checked yet.
+    #[default]
+    Unknown,
+    Allowed,
+    Blocked,
+    /// A check or the UAC flow is running.
+    Busy,
+}
+
+/// Outcome note shown next to the firewall line.
+#[cfg(windows)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FirewallNote {
+    #[default]
+    None,
+    Cancelled,
+    Error(String),
+}
+
+/// Text of the firewall row and whether it is an error.
+#[cfg(windows)]
+pub fn firewall_line(lang: Language, state: FirewallUi, note: &FirewallNote) -> (String, bool) {
+    let head = tr(lang, Tr::PhoneFwDirect);
+    let value = match state {
+        FirewallUi::Allowed => tr(lang, Tr::PhoneFwAllowed),
+        FirewallUi::Blocked => tr(lang, Tr::PhoneFwBlocked),
+        FirewallUi::Unknown | FirewallUi::Busy => "…",
+    };
+    match note {
+        FirewallNote::None => (format!("{head}: {value}"), false),
+        FirewallNote::Cancelled => (format!("{head}: {value} · {}", tr(lang, Tr::PhoneFwCancelled)), false),
+        FirewallNote::Error(e) => (format!("{head}: {value} · {e}"), true),
+    }
+}
+
+/// Maps the result of an elevated action plus the re-check to what the row shows.
+#[cfg(windows)]
+pub fn firewall_after(outcome: crate::phone_firewall::Outcome, present: bool) -> (FirewallUi, FirewallNote) {
+    use crate::phone_firewall::Outcome;
+    let state = if present { FirewallUi::Allowed } else { FirewallUi::Blocked };
+    let note = match outcome {
+        Outcome::Done => FirewallNote::None,
+        Outcome::Cancelled => FirewallNote::Cancelled,
+        Outcome::Failed(e) => FirewallNote::Error(e),
+    };
+    (state, note)
+}
+
 /// `m:ss` of the time left; zero once expired.
 pub fn format_countdown(remaining_ms: u64) -> String {
     let secs = remaining_ms.div_ceil(1000);
@@ -244,6 +296,8 @@ enum Msg {
     Devices(Vec<Device>),
     DevicesError(String),
     Pair(PairEvent),
+    #[cfg(windows)]
+    Firewall(FirewallUi, FirewallNote),
 }
 
 struct PhoneRt {
@@ -261,6 +315,10 @@ struct PhoneState {
     dialog: PairDialogState,
     cmd: Option<UnboundedSender<PairCmd>>,
     polling: bool,
+    #[cfg(windows)]
+    firewall: FirewallUi,
+    #[cfg(windows)]
+    firewall_note: FirewallNote,
 }
 impl Global for PhoneState {}
 
@@ -281,6 +339,11 @@ fn apply(state: &mut PhoneState, msg: Msg) {
             state.devices_error = None;
         }
         Msg::DevicesError(error) => state.devices_error = Some(error),
+        #[cfg(windows)]
+        Msg::Firewall(ui, note) => {
+            state.firewall = ui;
+            state.firewall_note = note;
+        }
         Msg::Pair(event) => {
             state.dialog = transition(std::mem::take(&mut state.dialog), event);
             if state.dialog == PairDialogState::Closed {
@@ -410,9 +473,47 @@ fn revoke(endpoint_id: String, cx: &mut App) {
     });
 }
 
+/// Reads whether the firewall rule exists (off the UI thread; `netsh`, no elevation).
+#[cfg(windows)]
+fn check_firewall(cx: &mut App) {
+    let Some((handle, _, tx)) = rt(cx) else { return };
+    if cx.default_global::<PhoneState>().firewall == FirewallUi::Busy {
+        return;
+    }
+    handle.spawn_blocking(move || {
+        let ui = if crate::phone_firewall::is_present(crate::phone_firewall::rule_port()) {
+            FirewallUi::Allowed
+        } else {
+            FirewallUi::Blocked
+        };
+        let _ = tx.unbounded_send(Msg::Firewall(ui, FirewallNote::None));
+    });
+}
+
+/// Adds or removes the rule through one UAC prompt, then re-checks.
+#[cfg(windows)]
+fn change_firewall(action: crate::phone_firewall::Action, cx: &mut App) {
+    let Some((handle, _, tx)) = rt(cx) else { return };
+    let state = cx.default_global::<PhoneState>();
+    if state.firewall == FirewallUi::Busy {
+        return;
+    }
+    state.firewall = FirewallUi::Busy;
+    state.firewall_note = FirewallNote::None;
+    cx.refresh_windows();
+    handle.spawn_blocking(move || {
+        let port = crate::phone_firewall::rule_port();
+        let outcome = crate::phone_firewall::run_elevated(action, port);
+        let (ui, note) = firewall_after(outcome, crate::phone_firewall::is_present(port));
+        let _ = tx.unbounded_send(Msg::Firewall(ui, note));
+    });
+}
+
 /// Called when the settings dialog opens: refreshes now and every 3 s while any dialog is open.
 pub fn on_settings_open(window: &Window, cx: &mut App) {
     refresh(cx);
+    #[cfg(windows)]
+    check_firewall(cx);
     if cx.default_global::<PhoneState>().polling {
         return;
     }
@@ -647,6 +748,44 @@ pub fn section(lang: Language, cx: &App) -> impl IntoElement {
         );
     }
 
+    #[cfg(windows)]
+    let firewall = {
+        let (fw, note) = match cx.try_global::<PhoneState>() {
+            Some(s) => (s.firewall, s.firewall_note.clone()),
+            None => (FirewallUi::Unknown, FirewallNote::None),
+        };
+        let (text, fw_error) = firewall_line(lang, fw, &note);
+        let button = match fw {
+            FirewallUi::Allowed => Some(
+                Button::new("phone-fw-remove")
+                    .xsmall()
+                    .link()
+                    .label(tr(lang, Tr::PhoneFwRemove))
+                    .on_click(|_, _, cx| change_firewall(crate::phone_firewall::Action::Remove, cx)),
+            ),
+            FirewallUi::Blocked => Some(
+                Button::new("phone-fw-add")
+                    .xsmall()
+                    .primary()
+                    .label(tr(lang, Tr::PhoneFwAdd))
+                    .on_click(|_, _, cx| change_firewall(crate::phone_firewall::Action::Add, cx)),
+            ),
+            FirewallUi::Unknown | FirewallUi::Busy => None,
+        };
+        v_flex()
+            .gap_1()
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(div().text_xs().text_color(if fw_error { theme.danger } else { theme.muted_foreground }).child(text))
+                    .children(button),
+            )
+            .child(div().text_xs().text_color(theme.muted_foreground).child(tr(lang, Tr::PhoneFwHint)))
+    };
+    #[cfg(not(windows))]
+    let firewall = div();
+
     v_flex()
         .gap_1p5()
         .child(
@@ -657,6 +796,7 @@ pub fn section(lang: Language, cx: &App) -> impl IntoElement {
         )
         .child(div().text_xs().text_color(theme.muted_foreground).child(tr(lang, Tr::PhoneSyncDesc)))
         .child(div().text_xs().text_color(if is_error { theme.danger } else { theme.muted_foreground }).child(status))
+        .child(firewall)
         .child(
             h_flex().child(
                 Button::new("phone-add")
@@ -824,6 +964,28 @@ mod tests {
         assert!(text.ends_with("never connected"), "{text}");
         let seen = Device { last_seen_unix_ms: 1_700_000_000_000, ..d };
         assert!(device_meta(Language::En, &seen, 1_700_000_300_000).ends_with("last seen 5 min ago"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn firewall_lines_and_outcomes() {
+        use crate::phone_firewall::Outcome;
+        let none = FirewallNote::None;
+        assert_eq!(
+            firewall_line(Language::Uk, FirewallUi::Allowed, &none),
+            ("Пряме підключення в локальній мережі: дозволено ✓".to_string(), false)
+        );
+        assert!(firewall_line(Language::Uk, FirewallUi::Blocked, &none).0.ends_with("заблоковано брандмауером"));
+        assert!(firewall_line(Language::En, FirewallUi::Busy, &none).0.ends_with("…"));
+        assert!(firewall_line(Language::Uk, FirewallUi::Blocked, &FirewallNote::Cancelled).0.ends_with("Скасовано"));
+        let (text, is_error) = firewall_line(Language::En, FirewallUi::Blocked, &FirewallNote::Error("boom".into()));
+        assert!(is_error && text.ends_with("boom"));
+        assert_eq!(firewall_after(Outcome::Done, true), (FirewallUi::Allowed, FirewallNote::None));
+        assert_eq!(firewall_after(Outcome::Cancelled, false), (FirewallUi::Blocked, FirewallNote::Cancelled));
+        assert_eq!(
+            firewall_after(Outcome::Failed("x".into()), false),
+            (FirewallUi::Blocked, FirewallNote::Error("x".into()))
+        );
     }
 
     #[test]

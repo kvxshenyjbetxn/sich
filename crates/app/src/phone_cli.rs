@@ -124,6 +124,7 @@ async fn status(base: &str) -> anyhow::Result<i32> {
     println!("Комп'ютер: {}", s.host_name);
     println!("Endpoint id: {}", s.endpoint_id);
     println!("Адреси: {}", if s.addrs.is_empty() { "-".to_string() } else { s.addrs.join(", ") });
+    println!("UDP-порт: {}", s.port);
     println!("Relay: {}", s.relay.as_deref().unwrap_or("-"));
     println!("Підключено телефонів: {}", s.connected);
     println!("Спарено пристроїв: {}", s.devices.len());

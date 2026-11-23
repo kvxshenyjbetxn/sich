@@ -33,6 +33,7 @@ fn isolate() {
             std::env::set_var("SICH_DATA_DIR", dir.path().join("data"));
             std::env::set_var("SICH_WORKTREE_ROOT", dir.path().join("worktrees"));
             std::env::set_var("SICH_GATEWAY_RELAY", "disabled");
+            std::env::set_var("SICH_GATEWAY_PORT", "0");
         }
         dir
     });
@@ -47,6 +48,7 @@ struct Harness {
     upload_dir: TempDir,
     daemon: JoinHandle<anyhow::Result<()>>,
     gateway: Option<JoinHandle<anyhow::Result<()>>>,
+    port: u16,
 }
 
 impl Harness {
@@ -55,6 +57,10 @@ impl Harness {
     }
 
     async fn start_with(confirm_timeout: Duration) -> Harness {
+        Self::start_full(confirm_timeout, 0).await
+    }
+
+    async fn start_full(confirm_timeout: Duration, port: u16) -> Harness {
         isolate();
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -71,6 +77,7 @@ impl Harness {
             upload_dir: tempfile::tempdir().unwrap(),
             daemon,
             gateway: None,
+            port,
         };
         let opts = h.opts(false, "build-one", confirm_timeout);
         h.gateway = Some(tokio::spawn(sich_gateway::run(opts)));
@@ -87,6 +94,7 @@ impl Harness {
             phone_dir: self.phone_dir.path().to_path_buf(),
             upload_dir: self.upload_dir.path().to_path_buf(),
             relay_disabled: true,
+            port: self.port,
             host_name: "TEST-HOST".into(),
             confirm_timeout,
         }
@@ -368,6 +376,15 @@ fn png() -> Vec<u8> {
 
 fn devices_json(h: &Harness) -> String {
     std::fs::read_to_string(h.phone_dir.path().join("devices.json")).unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_reports_the_requested_port() {
+    let port = std::net::UdpSocket::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port();
+    let h = Harness::start_full(Duration::from_secs(120), port).await;
+    let status = h.control().await.status().await.unwrap();
+    assert_eq!(status.port, port);
+    h.stop().await;
 }
 
 // ----- pairing -----
