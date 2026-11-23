@@ -849,6 +849,7 @@ impl AppView {
     ) -> Vec<AnyElement> {
         let theme = cx.theme().clone();
         let muted = theme.muted_foreground;
+        let app = cx.entity();
         let active = self.ws.active_in(key, ids);
         let ws_selected = self.ws.selected == *key;
         ids.iter()
@@ -881,6 +882,25 @@ impl AppView {
                     .map(|button| button.size(px(16.)));
                 let key_for_sub = key.clone();
                 let key = key.clone();
+                let can_hand_off = crate::handoff_dialog::can_handoff(self, id);
+                let (menu_app, menu_handoff_app) = (app.clone(), app.clone());
+                let with_menu = move |row: Stateful<Div>| {
+                    row.context_menu(move |mut menu, _w, _cx| {
+                            if can_hand_off {
+                                let handoff_app = menu_handoff_app.clone();
+                                menu = menu.item(PopupMenuItem::new(tr(lang, Tr::HandoffMenu)).on_click(
+                                    move |_, window, cx| {
+                                        crate::handoff_dialog::open(handoff_app.clone(), id, window, cx);
+                                    },
+                                ));
+                                menu = menu.separator();
+                            }
+                            let close_app = menu_app.clone();
+                            menu.item(PopupMenuItem::new(tr(lang, Tr::CloseTerminal)).on_click(move |_, _, cx| {
+                                close_app.read(cx).client.kill_terminal(id);
+                            }))
+                        })
+                };
                 let row = row_base(("side-term", id), selected, indent, &theme)
                     .group(group.clone())
                     .text_color(if exited { muted } else { theme.sidebar_foreground })
@@ -896,12 +916,12 @@ impl AppView {
                     );
                 let Some(status) = entry.info.agent.as_ref() else {
                     return Some(
-                        row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
+                        with_menu(row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
                             .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
                             .children(coord_chip(self.orch.is_coordinator(id), lang, &theme))
                             .children(badge)
                             .child(close)
-                            .children(restart)
+                            .children(restart))
                             .into_any_element(),
                     );
                 };
@@ -955,6 +975,19 @@ impl AppView {
                             .text_color(muted)
                             .child(relative_time(lang, now_unix_ms(), status.since_unix_ms)),
                     )
+                    .children(can_hand_off.then(|| {
+                        let handoff_app = app.clone();
+                        let button = Button::new(("side-term-handoff", id))
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(Ic::Send).size(px(14.)).text_color(muted))
+                            .tooltip(tr(lang, Tr::HandoffMenu))
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                crate::handoff_dialog::open(handoff_app.clone(), id, window, cx);
+                            });
+                        div().invisible().group_hover(group.clone(), |s| s.visible()).child(button)
+                    }))
                     .child(close)
                     .children(restart);
                 // No preview -> keep the plain single-line height.
@@ -973,6 +1006,7 @@ impl AppView {
                 let row = row
                     .h(px(height))
                     .child(v_flex().flex_1().min_w_0().gap(px(2.)).child(line1).children(line2));
+                let row = with_menu(row);
                 if status.subagents.is_empty() {
                     return Some(row.into_any_element());
                 }
