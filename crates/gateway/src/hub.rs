@@ -80,6 +80,8 @@ pub struct Hub {
     phones: Mutex<HashMap<u64, PhoneEntry>>,
     next_id: AtomicU64,
     uploads: Mutex<HashMap<String, PathBuf>>,
+    /// Per terminal: resolves when the last queued `SendText` has finished writing.
+    send_tails: Mutex<HashMap<TermRef, oneshot::Receiver<()>>>,
     requester: Mutex<Option<Requester>>,
     waiters: Mutex<HashMap<u64, oneshot::Sender<bool>>>,
     changed: watch::Receiver<u64>,
@@ -131,6 +133,7 @@ impl Hub {
             phones: Mutex::default(),
             next_id: AtomicU64::new(1),
             uploads: Mutex::default(),
+            send_tails: Mutex::default(),
             requester: Mutex::default(),
             waiters: Mutex::default(),
             changed,
@@ -382,18 +385,27 @@ impl Hub {
             paths
         };
         let kind = info.agent.as_ref().map(|a| a.kind);
-        let plan = compose::plan(text, &paths, kind, submit);
-        if !plan.payload.is_empty() {
-            self.pool.input(term, plan.payload);
+        let steps = compose::plan(text, &paths, kind, submit);
+        if steps.is_empty() {
+            return Ok(());
         }
-        if plan.submit {
-            let hub = self.clone();
-            let term = term.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(compose::SUBMIT_DELAY).await;
-                hub.pool.input(&term, b"\r".to_vec());
-            });
-        }
+        // Chain behind the previous message to this terminal so steps never interleave.
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let prev = self.send_tails.lock().insert(term.clone(), done_rx);
+        let hub = self.clone();
+        let term = term.clone();
+        tokio::spawn(async move {
+            if let Some(prev) = prev {
+                let _ = prev.await;
+            }
+            for step in steps {
+                if !step.delay_before.is_zero() {
+                    tokio::time::sleep(step.delay_before).await;
+                }
+                hub.pool.input(&term, step.bytes);
+            }
+            let _ = done_tx.send(());
+        });
         Ok(())
     }
 
