@@ -433,10 +433,12 @@ pub(crate) fn status_item(view: &CtxView, lang: Language, now_ms: u64, theme: &T
         .gap_1()
         .items_center()
         .cursor_pointer()
-        .text_size(px(11.))
+        // Same text size as the other status-bar items, so the baselines line up.
+        .text_xs()
         .child(div().text_color(theme.muted_foreground).child("ctx"))
         .child(
-            div().w(px(64.)).h(px(6.)).rounded_full().bg(theme.muted_foreground.opacity(0.25)).overflow_hidden()
+            // 1 px down: centred on the lowercase label rather than the line box.
+            div().mt(px(1.)).w(px(64.)).h(px(6.)).rounded_full().bg(theme.muted_foreground.opacity(0.25)).overflow_hidden()
                 .child(div().h_full().w(relative(fill)).rounded_full().bg(color)),
         )
         .child(div().text_color(color).child(label))
