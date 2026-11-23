@@ -76,6 +76,64 @@ pub async fn ensure_daemon(base: &str) -> anyhow::Result<()> {
     }
 }
 
+/// `sich gateway [--takeover]`: runs the phone gateway in this process until a control client
+/// sends `Shutdown`.
+pub fn run_gateway(base: &str, takeover: bool) -> anyhow::Result<()> {
+    let _guard = match sich_gateway::init_logging() {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("warning: logging disabled: {e:#}");
+            None
+        }
+    };
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let opts = sich_gateway::Opts::from_env(base.to_string(), takeover, sich_app::build_id())?;
+    let res = rt.block_on(sich_gateway::run(opts));
+    if let Err(e) = &res {
+        tracing::error!("gateway failed: {e:#}");
+    }
+    res
+}
+
+/// Makes sure a phone gateway of this build is reachable, starting a detached one if needed.
+/// A gateway of another build is replaced (`--takeover`). Waits up to ~5 s (10 s when replacing).
+/// The GUI calls this too.
+pub async fn ensure_gateway(base: &str) -> anyhow::Result<()> {
+    let own = sich_app::build_id();
+    let takeover = match sich_gateway::ControlClient::connect_as(base, own).await {
+        Ok(running) if running.gateway_build_id() == own => return Ok(()),
+        Ok(_) => true,
+        Err(_) => false,
+    };
+    spawn_detached_gateway(base, takeover)?;
+    let limit = if takeover { START_TIMEOUT * 2 } else { START_TIMEOUT };
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Ok(running) = sich_gateway::ControlClient::connect_as(base, own).await {
+            if running.gateway_build_id() == own {
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("gateway did not start within {} s", limit.as_secs());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn spawn_detached_gateway(base: &str, takeover: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locate current executable")?;
+    let host = crate::daemon_host::spawn_path(&exe);
+    let args: &[&str] = if takeover { &["gateway", "--takeover"] } else { &["gateway"] };
+    match spawn_detached_args(&host, args, Some(base)) {
+        Err(err) if host != exe => {
+            tracing::warn!("could not launch relocated gateway: {err:#}");
+            spawn_detached_args(&exe, args, Some(base))
+        }
+        result => result,
+    }
+}
+
 pub fn spawn_replacement_ui() -> anyhow::Result<()> {
     // The user-facing exe, so a freshly built one is picked up (it relocates itself).
     let exe = crate::daemon_host::launcher_exe().context("locate sich executable")?;
@@ -95,10 +153,15 @@ fn spawn_detached_daemon(base: &str) -> anyhow::Result<()> {
 }
 
 fn spawn_detached(exe: &std::path::Path, arg: &str, base: Option<&str>) -> anyhow::Result<()> {
+    spawn_detached_args(exe, &[arg], base)
+}
+
+fn spawn_detached_args(exe: &std::path::Path, args: &[&str], base: Option<&str>) -> anyhow::Result<()> {
+    let arg = args.join(" ");
     let mut cmd = Command::new(exe);
     // Never leak the launcher marker: a replacement UI must relocate itself, and terminals
     // spawned by the daemon must not inherit a stale value.
-    cmd.arg(arg).env_remove(crate::daemon_host::LAUNCHER_ENV).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.args(args).env_remove(crate::daemon_host::LAUNCHER_ENV).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     if let Some(base) = base {
         cmd.env("SICH_SOCKET", base);
     }

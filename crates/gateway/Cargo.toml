@@ -1,0 +1,28 @@
+[package]
+name = "sich-gateway"
+version.workspace = true
+edition.workspace = true
+description = "Sich phone gateway: bridges the daemon(s) to paired phones over iroh"
+
+[dependencies]
+sich-proto.workspace = true
+sich-daemon.workspace = true
+sich-remote-proto = { path = "../remote-proto", features = ["tokio"] }
+iroh = "1"
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+bytes.workspace = true
+interprocess.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+parking_lot.workspace = true
+dirs.workspace = true
+rand = "0.9"
+base64 = "0.22"
+tempfile = "3"
