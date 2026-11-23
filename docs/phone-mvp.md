@@ -123,6 +123,16 @@ The crate also provides `encode(&T) -> Vec<u8>` / `decode` helpers, the compatib
   - if the agent is Claude or Codex → bracketed paste (`ESC[200~ … ESC[201~`, `\n`→`\r`, strip ESC), like `paste_image::force_bracketed` + `sich_term::keys::paste_bytes`;
   - otherwise raw with `\n`→`\r`;
   - then, if `submit`, a separate `Input "\r"` ~30 ms later.
+- Phone image stream contract (`crates/gateway/src/kitty_to_iterm.rs`):
+  - a stateful per-terminal transformer runs on daemon output BEFORE the ring, so replays are converted too; non-image bytes stay byte-exact and in order (a trailing partial `ESC` / `ESC _` is held until the next chunk);
+  - `Output.seq` is an offset in the TRANSFORMED stream (ring coordinates), not the daemon's; the phone treats it as an opaque marker. Daemon offsets are only used inside the gateway to skip re-subscribe replays;
+  - Kitty transmissions (`t=d/f/t`, `f=100/24/32`, `o=z`, chunked or not, `a=t` or `a=T`) with an explicit `i=` are resolved to PNG and emitted as `ESC _ G a=t,f=100,t=d,q=2,i=<id>,m=<1|0> ; <base64, ≤4096 chars> ESC \` chunks (`m=1` on all but the last). `I=`-only transmissions are not forwarded. `t=t` files are read, never deleted (the desktop GUI owns that);
+  - virtual placements (`a=p` or `a=T` with `U=1`) → `ESC _ G a=p,U=1,q=2,i=<id>[,p=<pid>][,c=<cols>][,r=<rows>] ESC \` after the image data; the U+10EEEE placeholder text passes through untouched;
+  - regular displays (`a=T`, `a=p` of a stored image without `U=1`) → iTerm2 `ESC ] 1337 ; File=inline=1;size=N[;width=C][;height=R];preserveAspectRatio=1:<base64> BEL` (Kitty `c`/`r` as cell width/height; `C=1` is ignored);
+  - `a=d` → `ESC _ G a=d,q=2,d=<d>[,i=<id>][,p=<pid>] ESC \` (only those keys); `a=q` queries are dropped; the gateway never writes replies to the PTY;
+  - iTerm2 OSC 1337, Sixel and everything else pass through unchanged;
+  - caps per terminal: 32 MiB per in-progress image, 64 MiB stored images (LRU evict); oversized images are dropped silently (tracing warn);
+  - the integration test is Unix-only: Windows ConPTY swallows APC sequences before the daemon sees them.
 - `MarkSeen` → daemon `MarkSeen`.
 - Logs: `<data>/sich/logs/gateway.log` (same tracing setup as the daemon).
 

@@ -5,6 +5,7 @@ pub mod compose;
 pub mod control;
 pub mod convert;
 pub mod fit;
+pub mod kitty_to_iterm;
 mod hub;
 pub mod outbox;
 pub mod pairing;
