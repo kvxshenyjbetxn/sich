@@ -11,6 +11,10 @@ import { KIND_COLOR, badgeFor, stateKey } from "../lib/agent";
 import { applyCtrl, toBytes } from "../lib/keys";
 import { loadFit, saveFit } from "../lib/termLogic";
 import { sameTerm, type ConnState, type TermRef, type Terminal } from "../lib/types";
+import { ChatPanel } from "../chat/ChatPanel";
+import { ModeToggle } from "../chat/ModeToggle";
+import { chatSupported, loadMode, saveMode, type ViewMode } from "../chat/chatApi";
+import { useGatewayCaps } from "../chat/useCaps";
 
 interface Props {
   term: TermRef;
@@ -30,6 +34,17 @@ export function TerminalScreen({ term, info, workspaceLoaded, conn, baseFont, on
   const [ctrl, setCtrl] = useState(false);
   const ctrlRef = useRef(false);
   ctrlRef.current = ctrl;
+
+  // Chat / terminal view, remembered per terminal.
+  const caps = useGatewayCaps(conn);
+  const canChat = chatSupported(info?.agent?.kind, caps);
+  const [storedMode, setStoredMode] = useState<ViewMode>(() => loadMode(term));
+  useEffect(() => setStoredMode(loadMode(term)), [term.daemon, term.id]);
+  const mode: ViewMode = canChat ? storedMode : "terminal";
+  const changeMode = (m: ViewMode) => {
+    saveMode(term, m);
+    setStoredMode(m);
+  };
 
   // Each terminal starts from its own desktop size.
   useEffect(() => {
@@ -114,17 +129,22 @@ export function TerminalScreen({ term, info, workspaceLoaded, conn, baseFont, on
             </span>
           )}
         </div>
-        <button className="icon-btn" onClick={toggleFit} aria-label={t("fit_toggle")} title={fit ? t("fit_phone") : t("fit_desktop")}>
-          {fit ? <Smartphone size={18} /> : <Monitor size={18} />}
-        </button>
+        {canChat && <ModeToggle mode={mode} onChange={changeMode} />}
+        {mode === "terminal" && (
+          <button className="icon-btn" onClick={toggleFit} aria-label={t("fit_toggle")} title={fit ? t("fit_phone") : t("fit_desktop")}>
+            {fit ? <Smartphone size={18} /> : <Monitor size={18} />}
+          </button>
+        )}
         <ConnDot conn={conn} />
       </header>
 
       {offline && <div className="banner">{t("offline_hint")}</div>}
       {exited && <div className="banner">{info?.exit_code != null ? t("exited_code", { code: info.exit_code }) : t("exited")}</div>}
 
+      <div className="term-slot" style={mode === "chat" ? { display: "none" } : undefined}>
       <TerminalView
         key={`${term.daemon}#${term.id}`}
+        paused={mode === "chat"}
         term={term}
         fit={fit}
         baseFont={baseFont}
@@ -135,9 +155,10 @@ export function TerminalScreen({ term, info, workspaceLoaded, conn, baseFont, on
         onPinchFont={onFont}
         onReset={(cols, rows) => setPty({ cols, rows })}
       />
-
       <KeysRow ctrl={ctrl} disabled={exited} onToggleCtrl={() => setCtrl((c) => !c)} onKey={sendRaw} />
       <Composer disabled={exited} onSend={(text, ids) => void api.sendText(term, text, ids, true)} />
+      </div>
+      {mode === "chat" && <ChatPanel key={`${term.daemon}#${term.id}`} term={term} agent={agent} disabled={exited} />}
     </div>
   );
 }

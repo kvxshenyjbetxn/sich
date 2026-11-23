@@ -2,6 +2,7 @@
 //! the host; `commands` is the thin Tauri layer.
 
 pub mod backoff;
+pub mod chat;
 pub mod commands;
 pub mod conn;
 pub mod hosts;
@@ -57,6 +58,11 @@ pub fn run() {
             commands::mark_seen,
             commands::connection_state,
             commands::workspace_snapshot,
+            commands::gateway_capabilities,
+            commands::chat_subscribe,
+            commands::chat_unsubscribe,
+            commands::chat_load_earlier,
+            commands::chat_image,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the Sich app");

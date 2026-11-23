@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { LoaderCircle, Paperclip, SendHorizontal, X, TriangleAlert } from "lucide-react";
+import { LoaderCircle, Paperclip, SendHorizontal, Square, X, TriangleAlert } from "lucide-react";
 import { api } from "../api";
 import { useI18n } from "../ctx";
 import { prepareImage } from "../imageUpload";
@@ -16,6 +16,8 @@ interface Attachment {
 interface Props {
   disabled: boolean;
   onSend: (text: string, imageIds: string[]) => void;
+  /** Chat view: shows a "Stop" button (sends Esc) while the agent works. */
+  onStop?: () => void;
 }
 
 const MAX_ROWS_PX = 140;
@@ -30,7 +32,7 @@ function errorText(e: unknown): string {
   }
 }
 
-export function Composer({ disabled, onSend }: Props) {
+export function Composer({ disabled, onSend, onStop }: Props) {
   const { t } = useI18n();
   const [text, setText] = useState("");
   const [items, setItems] = useState<Attachment[]>([]);
@@ -141,6 +143,12 @@ export function Composer({ disabled, onSend }: Props) {
           autoCapitalize="sentences"
           spellCheck={false}
         />
+        {onStop && (
+          <button className="stop-btn" aria-label={t("chat_stop")} onClick={onStop}>
+            <Square size={14} fill="currentColor" />
+            {t("chat_stop")}
+          </button>
+        )}
         <button className="send-btn" aria-label={t("send")} disabled={!canSend} onClick={send}>
           <SendHorizontal size={18} />
         </button>

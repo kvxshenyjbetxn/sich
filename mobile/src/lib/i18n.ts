@@ -1,3 +1,5 @@
+import { CHAT_STRINGS } from "../chat/strings";
+
 export type Lang = "uk" | "ru" | "en";
 export const LANGS: Lang[] = ["uk", "ru", "en"];
 
@@ -119,6 +121,7 @@ export const DICT = {
   uploading: { uk: "Завантаження…", ru: "Загрузка…", en: "Uploading…" },
   term_gone: { uk: "Термінал більше не існує", ru: "Терминал больше не существует", en: "This terminal no longer exists" },
   offline_hint: { uk: "Немає зв'язку з комп'ютером", ru: "Нет связи с компьютером", en: "No connection to the computer" },
+  ...CHAT_STRINGS,
 } as const satisfies Record<string, Entry>;
 
 export type Key = keyof typeof DICT;
