@@ -9,14 +9,16 @@ use std::time::Duration;
 use gpui_kit::assets::IconName as Ic;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    AppContext as _, Context, Entity, FocusHandle, InteractiveElement as _, IntoElement, KeyDownEvent,
-    ObjectFit, ParentElement as _, Render, Styled as _, StyledImage as _, Subscription, Window, div, img, px,
+    AppContext as _, Context, CursorStyle, DispatchPhase, Entity, FocusHandle, HitboxBehavior, InteractiveElement as _,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    ParentElement as _, Render, ScrollEvent, Styled as _, StyledImage as _, Subscription, Window, canvas, div, img, px,
 };
 
 use crate::file_doc::{self, DiskAction, Eol, LoadError, Stamp};
 use crate::i18n::{Language, Tr, tr};
+use crate::image_viewer::{self, ImageViewer, KeyAction};
 use crate::settings;
 
 /// How often the file is checked for changes on disk.
@@ -27,8 +29,8 @@ const PATH_CHARS: usize = 90;
 enum Phase {
     Loading,
     Ready,
-    /// An image file: shown scaled to fit, never loaded as text. Natural size in pixels.
-    Image { width: u32, height: u32 },
+    /// An image file: shown in the zoom/pan viewer, never loaded as text. The size lives in the viewer state.
+    Image,
     Failed(LoadError),
 }
 
@@ -49,6 +51,10 @@ pub(crate) struct FileView {
     saving: bool,
     error: Option<String>,
     focus: FocusHandle,
+    /// Zoom/pan state while the file is an image.
+    viewer: Option<ImageViewer>,
+    /// Last mouse position (window coordinates) of a pan drag in progress.
+    drag: Option<(f32, f32)>,
     _edits: Subscription,
 }
 
@@ -82,6 +88,8 @@ impl FileView {
             saving: false,
             error: None,
             focus: cx.focus_handle(),
+            viewer: None,
+            drag: None,
             _edits: edits,
         };
         if file_doc::is_image(&view.path) {
@@ -100,13 +108,156 @@ impl FileView {
             let result = cx.background_executor().spawn(async move { file_doc::image_size(&path) }).await;
             let _ = view.update_in(cx, |view, _, cx| {
                 view.phase = match result {
-                    Ok((width, height)) => Phase::Image { width, height },
+                    Ok((width, height)) => {
+                        view.viewer = Some(ImageViewer::new(width, height));
+                        Phase::Image
+                    }
                     Err(error) => Phase::Failed(error),
                 };
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Applies `change` to the image viewer and redraws when it moved.
+    fn with_viewer(&mut self, cx: &mut Context<Self>, change: impl FnOnce(&mut ImageViewer)) {
+        if let Some(viewer) = self.viewer.as_mut() {
+            let before = *viewer;
+            change(viewer);
+            if *viewer != before {
+                cx.notify();
+            }
+        }
+    }
+
+    fn apply_key_action(&mut self, action: KeyAction, cx: &mut Context<Self>) {
+        self.with_viewer(cx, |viewer| match action {
+            KeyAction::ZoomIn => viewer.zoom_step(true),
+            KeyAction::ZoomOut => viewer.zoom_step(false),
+            KeyAction::Fit => viewer.set_fit(),
+            KeyAction::Actual => viewer.set_actual(),
+        });
+    }
+
+    /// The viewport element: measures itself every frame and owns the mouse input of the viewer.
+    fn image_viewport(&self, viewer: ImageViewer, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let theme = cx.theme().clone();
+        let (measure, owner) = (cx.weak_entity(), cx.weak_entity());
+        let last = viewer.viewport();
+        let input = canvas(
+            move |bounds, window, cx| {
+                let size = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+                // Only a real change goes back to the view, so this cannot loop.
+                if size != last {
+                    let measure = measure.clone();
+                    window.defer(cx, move |_, cx| {
+                        let _ = measure.update(cx, |view, cx| {
+                            view.with_viewer(cx, |v| {
+                                v.set_viewport(size.0, size.1);
+                            })
+                        });
+                    });
+                }
+                window.insert_hitbox(bounds, HitboxBehavior::Normal)
+            },
+            move |bounds, hitbox, window, _| {
+                let origin = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+                let wheel = owner.clone();
+                let wheel_hitbox = hitbox.clone();
+                window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Capture || !wheel_hitbox.should_handle_scroll(window) {
+                        return;
+                    }
+                    let dy = f32::from(event.delta.pixel_delta(px(image_viewer::WHEEL_LINE_PX)).y);
+                    if dy == 0. {
+                        return;
+                    }
+                    let cursor = (f32::from(event.position.x) - origin.0, f32::from(event.position.y) - origin.1);
+                    let _ = wheel.update(cx, |view, cx| {
+                        view.with_viewer(cx, |v| v.zoom_at(cursor, image_viewer::wheel_factor(dy)));
+                    });
+                    cx.stop_propagation();
+                });
+
+                let down = owner.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Capture
+                        || event.button != MouseButton::Left
+                        || !hitbox.is_hovered_at(event.position, window)
+                    {
+                        return;
+                    }
+                    let position = (f32::from(event.position.x), f32::from(event.position.y));
+                    let cursor = (position.0 - origin.0, position.1 - origin.1);
+                    let _ = down.update(cx, |view, cx| {
+                        view.focus.focus(window, cx);
+                        if event.click_count >= 2 {
+                            view.drag = None;
+                            view.with_viewer(cx, |v| v.toggle_at(cursor));
+                        } else {
+                            view.drag = Some(position);
+                        }
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                });
+
+                let moved = owner.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    let position = (f32::from(event.position.x), f32::from(event.position.y));
+                    let _ = moved.update(cx, |view, cx| {
+                        let Some(last) = view.drag else { return };
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            view.drag = None;
+                            cx.notify();
+                            return;
+                        }
+                        view.drag = Some(position);
+                        view.with_viewer(cx, |v| v.pan((position.0 - last.0, position.1 - last.1)));
+                    });
+                });
+
+                let up = owner.clone();
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture || event.button != MouseButton::Left {
+                        return;
+                    }
+                    let _ = up.update(cx, |view, cx| {
+                        if view.drag.take().is_some() {
+                            cx.notify();
+                        }
+                    });
+                });
+            },
+        )
+        .absolute()
+        .size_full();
+        let (width, height) = viewer.display_size();
+        let (left, top) = viewer.offset();
+        let image = viewer.has_viewport().then(|| {
+            img(self.path.clone())
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(width))
+                .h(px(height))
+                .object_fit(ObjectFit::Contain)
+        });
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
+            .bg(theme.background)
+            .cursor(if self.drag.is_some() { CursorStyle::ClosedHand } else { CursorStyle::OpenHand })
+            .child(input)
+            .children(image)
+            .into_any_element()
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -303,6 +454,52 @@ impl FileView {
             .children(read_only.then(|| {
                 div().flex_shrink_0().text_size(px(11.)).text_color(theme.muted_foreground).child(tr(lang, Tr::FileReadOnly))
             }))
+            .children(self.viewer.map(|viewer| {
+                h_flex()
+                    .flex_shrink_0()
+                    .gap_0p5()
+                    .items_center()
+                    .child(
+                        Button::new("img-zoom-out")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(Ic::Minus))
+                            .tooltip(tr(lang, Tr::ImgZoomOut))
+                            .on_click(cx.listener(|view, _, _, cx| view.apply_key_action(KeyAction::ZoomOut, cx))),
+                    )
+                    .child(
+                        div()
+                            .w(px(40.))
+                            .text_center()
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{}%", viewer.percent())),
+                    )
+                    .child(
+                        Button::new("img-zoom-in")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(Ic::Plus))
+                            .tooltip(tr(lang, Tr::ImgZoomIn))
+                            .on_click(cx.listener(|view, _, _, cx| view.apply_key_action(KeyAction::ZoomIn, cx))),
+                    )
+                    .child(
+                        Button::new("img-fit")
+                            .ghost()
+                            .xsmall()
+                            .label(tr(lang, Tr::ImgFit))
+                            .selected(viewer.is_fit())
+                            .on_click(cx.listener(|view, _, _, cx| view.apply_key_action(KeyAction::Fit, cx))),
+                    )
+                    .child(
+                        Button::new("img-actual")
+                            .ghost()
+                            .xsmall()
+                            .label("100%")
+                            .tooltip(tr(lang, Tr::ImgActualSize))
+                            .on_click(cx.listener(|view, _, _, cx| view.apply_key_action(KeyAction::Actual, cx))),
+                    )
+            }))
             .children((!read_only).then(|| {
                 Button::new("file-save")
                     .ghost()
@@ -344,18 +541,10 @@ impl Render for FileView {
                 .w_full()
                 .child(Editor::new(&self.editor).size_full().bordered(false))
                 .into_any_element(),
-            Phase::Image { width, height } => {
-                // Natural size, shrunk (never enlarged) to fit; `Contain` keeps the aspect ratio
-                // when the box is clamped on one axis only.
-                let natural = div()
-                    .w(px(*width as f32))
-                    .h(px(*height as f32))
-                    .max_w_full()
-                    .max_h_full()
-                    .flex_shrink(1.)
-                    .child(img(self.path.clone()).size_full().object_fit(ObjectFit::Contain));
-                h_flex().flex_1().min_h_0().w_full().p_3().items_center().justify_center().child(natural).into_any_element()
-            }
+            Phase::Image => match self.viewer {
+                Some(viewer) => self.image_viewport(viewer, cx),
+                None => div().into_any_element(),
+            },
             Phase::Failed(error) => {
                 let key = match error {
                     LoadError::TooLarge => Tr::FileTooLarge,
@@ -390,6 +579,15 @@ impl Render for FileView {
                     view.save(cx);
                     cx.stop_propagation();
                     window.prevent_default();
+                    return;
+                }
+                if view.viewer.is_some() {
+                    let held = m.control || m.alt || m.platform;
+                    if let Some(action) = image_viewer::key_action(&ev.keystroke.key, held) {
+                        view.apply_key_action(action, cx);
+                        cx.stop_propagation();
+                        window.prevent_default();
+                    }
                 }
             }))
             .child(self.header(lang, cx))
@@ -416,6 +614,10 @@ mod tests {
             Tr::FileReload,
             Tr::FileReadOnly,
             Tr::FileSaveFailed,
+            Tr::ImgFit,
+            Tr::ImgActualSize,
+            Tr::ImgZoomIn,
+            Tr::ImgZoomOut,
             Tr::CtxOpenInTab,
             Tr::CtxOpenDefault,
             Tr::CtxShowInFolder,

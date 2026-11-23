@@ -10,6 +10,7 @@ mod cli;
 mod codex_hooks;
 mod colors;
 mod context_panel;
+mod image_viewer;
 mod images_panel;
 mod ctx_files;
 mod daemon_client;

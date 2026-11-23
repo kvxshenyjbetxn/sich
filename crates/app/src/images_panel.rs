@@ -25,8 +25,15 @@ use crate::ctx_files::Resolved;
 use crate::i18n::{self, Language, Tr, tr};
 
 const POLL: Duration = Duration::from_secs(2);
-const ROW_HEIGHT: f32 = 52.;
-const THUMB: f32 = 40.;
+/// Narrowest a tile may get; tiles stretch to fill the row.
+const MIN_TILE: f32 = 150.;
+const GAP: f32 = 8.;
+const IMAGE_H: f32 = 140.;
+/// Tile = padding 4 + picture + 4 + name 16 + 4 + subtitle 14 + padding 4 (constant: `uniform_list`).
+const TILE_H: f32 = 4. + IMAGE_H + 4. + 16. + 4. + 14. + 4.;
+const ROW_H: f32 = TILE_H + GAP;
+/// Horizontal space of the right panel that is not tile area: its left border and the `px_2` padding.
+const PANEL_CHROME_W: f32 = 1. + 16.;
 
 // ---------------------------------------------------------------------------------------------
 // Pure logic
@@ -84,6 +91,31 @@ pub(crate) fn row_file(row: &ImageRow) -> Option<Resolved> {
         ImageState::Ready(path) => Some(Resolved { path: path.clone(), read_only: true }),
         _ => None,
     }
+}
+
+/// Width available for tiles inside a right panel of `panel_width`.
+pub(crate) fn content_width(panel_width: f32) -> f32 {
+    (panel_width - PANEL_CHROME_W).max(0.)
+}
+
+/// Tiles per row for `available` px: as many `MIN_TILE`s (with gaps) as fit, at least one.
+pub(crate) fn columns(available: f32) -> usize {
+    if !available.is_finite() || available <= 0. {
+        return 1;
+    }
+    (((available + GAP) / (MIN_TILE + GAP)).floor() as usize).max(1)
+}
+
+/// Number of grid rows for `count` images.
+pub(crate) fn grid_row_count(count: usize, cols: usize) -> usize {
+    count.div_ceil(cols.max(1))
+}
+
+/// Indices of the images in grid row `row` (the last row may be short).
+pub(crate) fn grid_row_range(row: usize, cols: usize, count: usize) -> std::ops::Range<usize> {
+    let cols = cols.max(1);
+    let start = (row * cols).min(count);
+    start..(start + cols).min(count)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -201,17 +233,26 @@ fn placeholder(icon: Ic, color: Hsla) -> AnyElement {
         .into_any_element()
 }
 
-fn thumbnail(row: &ImageRow, theme: &Theme) -> impl IntoElement + use<> {
+/// One tile: the picture, then the name and "source · age". Constant height (`TILE_H`).
+fn render_tile(
+    row: &ImageRow,
+    lang: Language,
+    now_ms: u64,
+    theme: &Theme,
+    app: gpui_kit::WeakEntity<AppView>,
+) -> AnyElement {
+    let ready = is_ready(row);
     let muted = theme.muted_foreground;
     let frame = div()
+        .w_full()
         .flex_shrink_0()
-        .size(px(THUMB))
-        .rounded(px(4.))
+        .h(px(IMAGE_H))
+        .rounded(px(6.))
         .border_1()
         .border_color(theme.border)
         .bg(muted.opacity(0.08))
         .overflow_hidden();
-    match &row.state {
+    let picture = match &row.state {
         ImageState::Ready(path) => frame.child(
             img(path.clone())
                 .size_full()
@@ -220,42 +261,35 @@ fn thumbnail(row: &ImageRow, theme: &Theme) -> impl IntoElement + use<> {
                 .with_fallback(move || placeholder(Ic::ImageOff, muted.opacity(0.6))),
         ),
         _ => frame.child(placeholder(Ic::ImageOff, muted.opacity(0.6))),
-    }
-}
-
-fn render_row(
-    row: &ImageRow,
-    lang: Language,
-    now_ms: u64,
-    theme: &Theme,
-    app: gpui_kit::WeakEntity<AppView>,
-) -> AnyElement {
-    let ready = is_ready(row);
-    let text = v_flex()
-        .flex_1()
-        .min_w_0()
-        .gap_0p5()
+    };
+    let content = v_flex()
+        .w_full()
+        .h_full()
+        .gap(px(4.))
+        .items_start()
+        .child(picture)
         .child(
             div()
                 .w_full()
+                .h(px(16.))
                 .truncate()
+                .text_left()
                 .text_size(px(12.))
-                .text_color(if ready { theme.foreground } else { theme.muted_foreground })
+                .text_color(if ready { theme.foreground } else { muted })
                 .child(row.name.clone()),
         )
-        .child(div().w_full().truncate().text_size(px(11.)).text_color(theme.muted_foreground).child(row_subtitle(lang, row, now_ms)));
-    let content = h_flex().w_full().h(px(ROW_HEIGHT - 4.)).gap_2().items_center().child(thumbnail(row, theme)).child(text);
+        .child(div().w_full().h(px(14.)).truncate().text_left().text_size(px(11.)).text_color(muted).child(row_subtitle(lang, row, now_ms)));
     let Some(file) = row_file(row) else {
-        return h_flex().w_full().h(px(ROW_HEIGHT)).items_center().px_1().child(content).into_any_element();
+        return div().w_full().h(px(TILE_H)).p_1().child(content).into_any_element();
     };
     let actions = row_actions(row);
     Button::new(gpui_kit::SharedString::from(format!("img-{}", row.id)))
         .ghost()
         .xsmall()
         .w_full()
-        .h_auto()
-        .py_0p5()
-        .justify_start()
+        .h(px(TILE_H))
+        .p_1()
+        .cursor_pointer()
         .tooltip(file.path.display().to_string())
         .child(content)
         .dropdown_menu(move |menu, _, _| {
@@ -273,11 +307,27 @@ fn render_row(
         .into_any_element()
 }
 
+/// One list item: `cols` equal-width tiles; a short last row is padded so its tiles keep their width.
+fn render_grid_row(
+    rows: &[ImageRow],
+    cols: usize,
+    lang: Language,
+    now_ms: u64,
+    theme: &Theme,
+    app: &gpui_kit::WeakEntity<AppView>,
+) -> AnyElement {
+    let slot = || div().flex_1().min_w_0().h(px(TILE_H));
+    let tiles = rows.iter().map(|row| slot().child(render_tile(row, lang, now_ms, theme, app.clone())));
+    let fillers = (rows.len()..cols).map(|_| slot());
+    h_flex().w_full().h(px(ROW_H)).pb(px(GAP)).gap(px(GAP)).items_start().children(tiles).children(fillers).into_any_element()
+}
+
 pub(crate) fn render_panel(
     ui: &ContextUi,
     images: &ImagesUi,
     input: PanelInput,
     lang: Language,
+    panel_width: f32,
     cx: &Context<AppView>,
 ) -> AnyElement {
     let theme = cx.theme().clone();
@@ -290,9 +340,12 @@ pub(crate) fn render_panel(
     let body = if rows.is_empty() {
         context_panel::centered(tr(lang, Tr::ImgEmpty), &theme)
     } else {
+        let cols = columns(content_width(panel_width));
         let (app, now_ms, count, row_theme) = (cx.weak_entity(), input.now_ms, rows.len(), theme.clone());
-        uniform_list("img-list", count, move |range, _, _| {
-            range.map(|index| render_row(&rows[index], lang, now_ms, &row_theme, app.clone())).collect::<Vec<_>>()
+        uniform_list("img-list", grid_row_count(count, cols), move |range, _, _| {
+            range
+                .map(|row| render_grid_row(&rows[grid_row_range(row, cols, count)], cols, lang, now_ms, &row_theme, &app))
+                .collect::<Vec<_>>()
         })
         .flex_1()
         .min_h_0()
@@ -395,6 +448,49 @@ mod tests {
         let rx = ui.receiver();
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn columns_follow_the_width() {
+        assert_eq!(columns(0.), 1);
+        assert_eq!(columns(-5.), 1);
+        assert_eq!(columns(f32::NAN), 1);
+        assert_eq!(columns(100.), 1);
+        assert_eq!(columns(150.), 1);
+        // Two tiles need 2 * 150 + 8.
+        assert_eq!(columns(307.9), 1);
+        assert_eq!(columns(308.), 2);
+        assert_eq!(columns(465.9), 2);
+        assert_eq!(columns(466.), 3);
+        assert_eq!(columns(10_000.), 63);
+    }
+
+    #[test]
+    fn content_width_removes_the_panel_chrome() {
+        assert_eq!(content_width(340.), 323.);
+        assert_eq!(content_width(10.), 0.);
+    }
+
+    #[test]
+    fn rows_are_chunked_with_a_short_last_row() {
+        assert_eq!(grid_row_count(0, 3), 0);
+        assert_eq!(grid_row_count(6, 3), 2);
+        assert_eq!(grid_row_count(7, 3), 3);
+        assert_eq!(grid_row_count(5, 1), 5);
+        assert_eq!(grid_row_count(5, 0), 5);
+        assert_eq!(grid_row_range(0, 3, 7), 0..3);
+        assert_eq!(grid_row_range(1, 3, 7), 3..6);
+        assert_eq!(grid_row_range(2, 3, 7), 6..7);
+        assert_eq!(grid_row_range(5, 3, 7), 7..7);
+        // Every index is covered exactly once.
+        let all: Vec<usize> = (0..grid_row_count(7, 3)).flat_map(|r| grid_row_range(r, 3, 7)).collect();
+        assert_eq!(all, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn tile_height_is_constant() {
+        assert_eq!(TILE_H, 186.);
+        assert_eq!(ROW_H, 194.);
     }
 
     #[test]

@@ -2022,8 +2022,8 @@ impl AppView {
         context_panel::render_panel(&self.ctx_ui, self.ctx_panel_input(), lang, cx)
     }
 
-    fn render_images_panel(&self, lang: i18n::Language, cx: &Context<Self>) -> gpui_kit::AnyElement {
-        images_panel::render_panel(&self.ctx_ui, &self.images_ui, self.ctx_panel_input(), lang, cx)
+    fn render_images_panel(&self, width: f32, lang: i18n::Language, cx: &Context<Self>) -> gpui_kit::AnyElement {
+        images_panel::render_panel(&self.ctx_ui, &self.images_ui, self.ctx_panel_input(), lang, width, cx)
     }
 
     /// What the Images poller should do now (it only reads while its tab is on screen).
@@ -2047,7 +2047,7 @@ impl AppView {
         // Both tabs are views of the same panel entity (it needs the status for either).
         let pane = match active_tab {
             RightTab::Context => self.render_context_panel(lang, cx),
-            RightTab::Images => self.render_images_panel(lang, cx),
+            RightTab::Images => self.render_images_panel(width, lang, cx),
             _ => self.git_panel.clone().into_any_element(),
         };
         let tabs = RightTab::ALL.iter().copied().filter(|&tab| tab != RightTab::Pr || pr_visible).map(|tab| {
