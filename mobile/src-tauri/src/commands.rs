@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde_json::Value;
 use sich_remote_proto::{PairUrl, TermRef};
-use tauri::ipc::{Channel, InvokeBody, InvokeResponseBody, Request};
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::conn::ConnectionManager;
@@ -135,20 +135,15 @@ pub fn send_text(state: State<'_, AppState>, term: TermRef, text: String, image_
     state.mgr.send_text(term, text, image_ids, submit);
 }
 
-/// Raw request body = image bytes; the file name travels percent-encoded in `x-file-name`.
+/// Image upload: JSON args (Android's IPC does not deliver raw binary bodies). Resolves to the upload id.
 #[tauri::command]
-pub async fn upload_image(request: Request<'_>, state: State<'_, AppState>) -> Result<String, String> {
-    let InvokeBody::Raw(data) = request.body() else {
-        return Err("expected a binary body".into());
-    };
-    let name = request
-        .headers()
-        .get("x-file-name")
-        .and_then(|v| v.to_str().ok())
-        .map(percent_decode)
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "image.jpg".to_string());
-    state.mgr.upload(name, data.clone()).await
+pub async fn upload_image(
+    state: State<'_, AppState>,
+    file_name: String,
+    data_b64: String,
+) -> Result<String, String> {
+    let (name, data) = decode_upload(&file_name, &data_b64)?;
+    state.mgr.upload(name, data).await
 }
 
 #[tauri::command]
@@ -177,44 +172,72 @@ pub fn workspace_snapshot(state: State<'_, AppState>) -> Option<Value> {
     state.mgr.workspace().map(|w| workspace_to_json(&w))
 }
 
-/// Lenient percent-decoding for header values; invalid escapes are kept literally.
-pub fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && let Some(h) = s.get(i + 1..i + 3)
-            && let Ok(v) = u8::from_str_radix(h, 16)
-        {
-            out.push(v);
-            i += 3;
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
+/// Max decoded image size (same as the gateway).
+const MAX_DECODED_BYTES: usize = 15 * 1024 * 1024;
+
+/// Validate and decode an upload request: non-empty valid base64, at most 15 MiB decoded.
+/// An empty file name falls back to `image.jpg`.
+pub fn decode_upload(file_name: &str, data_b64: &str) -> Result<(String, Vec<u8>), String> {
+    use base64::Engine;
+    let b64 = data_b64.trim();
+    if b64.is_empty() {
+        return Err("empty image data".into());
     }
-    String::from_utf8_lossy(&out).into_owned()
+    if b64.len() > MAX_DECODED_BYTES / 3 * 4 + 4 {
+        return Err("image too large".into());
+    }
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    if data.is_empty() {
+        return Err("empty image data".into());
+    }
+    if data.len() > MAX_DECODED_BYTES {
+        return Err("image too large".into());
+    }
+    let name = file_name.trim();
+    let name = if name.is_empty() { "image.jpg" } else { name };
+    Ok((name.to_string(), data))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::percent_decode;
+    use super::{MAX_DECODED_BYTES, decode_upload};
+    use base64::Engine;
 
-    #[test]
-    fn decodes_utf8_and_spaces() {
-        assert_eq!(percent_decode("photo%20%D1%84%D0%BE%D1%82%D0%BE.jpg"), "photo фото.jpg");
+    fn enc(b: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(b)
     }
 
     #[test]
-    fn keeps_invalid_escapes() {
-        assert_eq!(percent_decode("a%zzb%"), "a%zzb%");
-        assert_eq!(percent_decode("100%"), "100%");
+    fn decodes_valid() {
+        let (n, d) = decode_upload("a.png", &enc(&[1, 2, 3, 4])).unwrap();
+        assert_eq!(n, "a.png");
+        assert_eq!(d, vec![1, 2, 3, 4]);
     }
 
     #[test]
-    fn plain_passes_through() {
-        assert_eq!(percent_decode("a.png"), "a.png");
-        assert_eq!(percent_decode(""), "");
+    fn empty_name_falls_back() {
+        assert_eq!(decode_upload("  ", &enc(&[1])).unwrap().0, "image.jpg");
+    }
+
+    #[test]
+    fn rejects_invalid_base64() {
+        let e = decode_upload("a.png", "not*base64!").unwrap_err();
+        assert!(e.contains("invalid base64"), "{e}");
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(decode_upload("a.png", "").is_err());
+        assert!(decode_upload("a.png", "   ").is_err());
+    }
+
+    #[test]
+    fn rejects_too_large() {
+        let big = vec![0u8; MAX_DECODED_BYTES + 1];
+        assert_eq!(decode_upload("a.png", &enc(&big)).unwrap_err(), "image too large");
+        let ok = vec![0u8; MAX_DECODED_BYTES];
+        assert!(decode_upload("a.png", &enc(&ok)).is_ok());
     }
 }

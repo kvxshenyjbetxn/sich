@@ -10,6 +10,7 @@ interface Attachment {
   preview: string | null;
   status: "uploading" | "done" | "error";
   uploadId?: string;
+  error?: string;
 }
 
 interface Props {
@@ -18,6 +19,16 @@ interface Props {
 }
 
 const MAX_ROWS_PX = 140;
+
+function errorText(e: unknown): string {
+  if (typeof e === "string") return e;
+  if (e instanceof Error) return e.message;
+  try {
+    return JSON.stringify(e);
+  } catch {
+    return String(e);
+  }
+}
 
 export function Composer({ disabled, onSend }: Props) {
   const { t } = useI18n();
@@ -56,8 +67,9 @@ export function Composer({ disabled, onSend }: Props) {
         const bytes = new Uint8Array(await prepared.blob.arrayBuffer());
         const id = await api.uploadImage(prepared.name, bytes);
         patch(key, { status: "done", uploadId: id });
-      } catch {
-        patch(key, { status: "error" });
+      } catch (e) {
+        console.error("image upload failed", e);
+        patch(key, { status: "error", error: errorText(e) });
       }
     }
     if (fileInput.current) fileInput.current.value = "";
@@ -73,6 +85,7 @@ export function Composer({ disabled, onSend }: Props) {
       return cur.filter((a) => a.key !== key);
     });
 
+  const failed = items.find((a) => a.status === "error");
   const uploading = items.some((a) => a.status === "uploading");
   const ready = items.filter((a) => a.status === "done" && a.uploadId).map((a) => a.uploadId!);
   const canSend = !disabled && !uploading && (text.trim().length > 0 || ready.length > 0);
@@ -90,7 +103,7 @@ export function Composer({ disabled, onSend }: Props) {
       {items.length > 0 && (
         <div className="thumbs">
           {items.map((a) => (
-            <div key={a.key} className={`thumb ${a.status}`} title={a.status === "error" ? t("upload_failed") : a.name}>
+            <div key={a.key} className={`thumb ${a.status}`} title={a.status === "error" ? `${t("upload_failed")}: ${a.error ?? ""}` : a.name}>
               {a.preview && <img src={a.preview} alt={a.name} />}
               {a.status === "uploading" && (
                 <span className="thumb-overlay">
@@ -107,6 +120,11 @@ export function Composer({ disabled, onSend }: Props) {
               </button>
             </div>
           ))}
+        </div>
+      )}
+      {failed && (
+        <div className="upload-error">
+          {t("upload_failed")}: {failed.error}
         </div>
       )}
       <div className="composer-row">
