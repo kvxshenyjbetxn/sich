@@ -7,10 +7,9 @@ use std::rc::Rc;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::DialogFooter;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, WindowExt as _, v_flex};
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Entity, Focusable as _, IntoElement, ParentElement as _,
+    AnyElement, App, AppContext as _, Entity, IntoElement, ParentElement as _,
     Styled as _, Window, div, px,
 };
 use sich_proto::ProjectId;
@@ -18,6 +17,7 @@ use sich_proto::ProjectId;
 use crate::app_view::AppView;
 use crate::i18n::{self, Tr, tr};
 use crate::settings;
+use crate::worktree_from_pr::NewWorktreeForm;
 
 /// Builds an extra element for the body of a confirmation dialog.
 type Extra = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
@@ -196,80 +196,15 @@ pub fn open_new_worktree(
     if window.has_active_dialog(cx) {
         return;
     }
-    let name_in = cx.new(|cx| InputState::new(window, cx).placeholder("feature-x"));
-    let base_in = cx.new(|cx| InputState::new(window, cx).placeholder("HEAD"));
-    let done = Rc::new(Cell::new(false));
-
-    // Returns true when the dialog may close (submitted or already submitted).
-    let submit: Rc<dyn Fn(&mut App) -> bool> = {
-        let (name_in, base_in, done) = (name_in.clone(), base_in.clone(), done.clone());
-        Rc::new(move |cx: &mut App| {
-            if done.get() {
-                return true;
-            }
-            let name = name_in.read(cx).value().trim().to_string();
-            if name.is_empty() {
-                return false;
-            }
-            let base = base_in.read(cx).value().trim().to_string();
-            let base = (!base.is_empty()).then_some(base);
-            done.set(true);
-            app.update(cx, |this, cx| this.create_worktree(project_id, name, base, cx));
-            true
-        })
+    let Some(root) = app.read(cx).projects.iter().find(|p| p.id == project_id).map(|p| p.path.clone()) else {
+        return;
     };
-
-    for input in [&name_in, &base_in] {
-        let submit = submit.clone();
-        window
-            .subscribe(input, cx, move |_, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. }) && submit(cx) {
-                    window.close_dialog(cx);
-                }
-            })
-            .detach();
-    }
-
-    let focus_first = Cell::new(true);
-    window.open_dialog(cx, move |dialog, window, cx| {
+    let form = cx.new(|cx| NewWorktreeForm::new(app, project_id, root, window, cx));
+    window.open_dialog(cx, move |dialog, _window, cx| {
         let lang = settings::language(cx);
-        if focus_first.replace(false) {
-            name_in.focus_handle(cx).focus(window, cx);
-        }
-        let field = |label: &'static str, input: &Entity<InputState>| {
-            v_flex()
-                .gap_1()
-                .child(div().text_sm().text_color(cx.theme().muted_foreground).child(label))
-                .child(Input::new(input))
-        };
-        let body = v_flex()
-            .gap_3()
-            .child(field(tr(lang, Tr::NameLabel), &name_in))
-            .child(field(tr(lang, Tr::BaseLabel), &base_in));
-        let create = {
-            let submit = submit.clone();
-            Button::new("worktree-create")
-                .primary()
-                .label(tr(lang, Tr::Create))
-                .on_click(move |_, window, cx| {
-                    if submit(cx) {
-                        window.close_dialog(cx);
-                    }
-                })
-        };
-        let footer = DialogFooter::new()
-            .child(
-                Button::new("worktree-cancel")
-                    .label(tr(lang, Tr::Cancel))
-                    .on_click(|_, window, cx| window.close_dialog(cx)),
-            )
-            .child(create);
-        let submit = submit.clone();
         dialog
             .title(i18n::new_worktree_title(lang, &project_name))
-            .w(px(440.))
-            .on_ok(move |_, _, cx| submit(cx))
-            .child(body)
-            .footer(footer)
+            .w(px(480.))
+            .child(form.clone())
     });
 }

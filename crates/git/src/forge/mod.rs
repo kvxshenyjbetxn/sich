@@ -11,6 +11,7 @@ mod gh;
 mod github;
 mod merge;
 mod model;
+mod pr_list;
 mod prefill;
 mod remote;
 mod repo_ext;
@@ -41,6 +42,7 @@ pub use model::{
     AutoMerge, Check, CheckState, ChecksSummary, FailedJob, MergeState, Mergeable, PrState, PullRequest, ReviewDecision,
     parse_pr_json,
 };
+pub use pr_list::{LIST_LIMIT, PrListItem, PrRef, parse_pr_input, parse_pr_item, parse_pr_list};
 pub use prefill::{PrDraft, pr_prefill};
 pub use remote::RemoteRepo;
 pub use repo_ext::CommitMessage;

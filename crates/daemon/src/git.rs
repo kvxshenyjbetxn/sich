@@ -87,10 +87,26 @@ pub fn list_worktrees(repo: &Path) -> GitResult<Vec<WorktreeInfo>> {
     Ok(list)
 }
 
+/// Pure part of the name check: no leading `-`, no backslash, `..`, or edge slashes.
+/// `/` is allowed inside (branches like `feat/x`); the folder name is sanitized separately.
+pub fn name_shape_error(name: &str) -> Option<&'static str> {
+    if name.is_empty()
+        || name.starts_with(['-', '/'])
+        || name.ends_with('/')
+        || name.contains(['\\', '\0'])
+        || name.contains("..")
+        || name.contains("//")
+    {
+        Some("Invalid name: must not be empty, start with '-', or contain '\\', '..' or '//'")
+    } else {
+        None
+    }
+}
+
 /// Rejects names that are invalid branches or unsafe as a folder name.
 pub fn validate_name(repo: &Path, name: &str) -> GitResult<()> {
-    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") {
-        return Err("Invalid name: must not be empty or contain '/', '\\' or '..'".into());
+    if let Some(error) = name_shape_error(name) {
+        return Err(error.into());
     }
     run(repo, &["check-ref-format", "--branch", name])
         .map(|_| ())
@@ -134,4 +150,19 @@ pub fn remove_worktree(repo: &Path, path: &Path, force: bool) -> GitResult<()> {
 
 pub fn delete_branch(repo: &Path, branch: &str, force: bool) -> GitResult<()> {
     run(repo, &["branch", if force { "-D" } else { "-d" }, branch]).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_shape_allows_slashes_but_not_unsafe_names() {
+        for ok in ["feat", "feat/x", "a/b/c", "pr-12-feat/x", "fix_1.2"] {
+            assert_eq!(name_shape_error(ok), None, "{ok}");
+        }
+        for bad in ["", "-x", "/x", "x/", "a//b", "a..b", "a\\b", "a/../b", "-"] {
+            assert!(name_shape_error(bad).is_some(), "{bad}");
+        }
+    }
 }

@@ -9,6 +9,7 @@ mod diff;
 pub mod graph;
 mod history;
 mod mutation;
+pub mod pr_checkout;
 mod runner;
 pub mod scheduler;
 mod sequencer;
