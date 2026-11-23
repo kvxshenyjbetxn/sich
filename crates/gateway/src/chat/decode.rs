@@ -34,6 +34,19 @@ pub struct Decoded {
     pub messages: Vec<ChatMessage>,
     /// In the order of the `i<offset>.<n>` refs.
     pub images: Vec<ImageSrc>,
+    /// Claude only: how the line relates to its neighbours (used to drop duplicate image companions).
+    pub link: Option<Link>,
+}
+
+/// Identity of a Claude user line, enough for `ChatState` to dedupe image companions.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Link {
+    pub uuid: Option<String>,
+    pub parent_uuid: Option<String>,
+    /// `isMeta` line: its messages are only images (Claude's `[Image: source: ..]` companions).
+    pub meta: bool,
+    /// The line carries at least one inline (base64) image.
+    pub inline_image: bool,
 }
 
 pub fn decode_line(format: Format, offset: u64, line: &str) -> Decoded {
@@ -140,7 +153,7 @@ impl Builder {
                 blocks,
             })
             .collect();
-        Decoded { messages, images: self.images }
+        Decoded { messages, images: self.images, link: None }
     }
 }
 
@@ -281,7 +294,20 @@ fn claude(offset: u64, line: &str) -> Decoded {
         }
         _ => {}
     }
-    b.finish()
+    let mut decoded = b.finish();
+    if kind == "user" {
+        let inline_image = match content {
+            Value::Array(blocks) => blocks.iter().any(|x| str_of(x, "type") == Some("image") && claude_image_src(x).is_some()),
+            _ => false,
+        };
+        decoded.link = Some(Link {
+            uuid: str_of(&v, "uuid").filter(|s| !s.is_empty()).map(String::from),
+            parent_uuid: str_of(&v, "parentUuid").filter(|s| !s.is_empty()).map(String::from),
+            meta,
+            inline_image,
+        });
+    }
+    decoded
 }
 
 fn claude_tool_result(b: &mut Builder, blk: &Value) {

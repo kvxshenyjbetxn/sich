@@ -1,12 +1,13 @@
 //! The decoded messages of one transcript file: initial load, incremental updates, paging.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use sich_remote_proto::{ChatBlock, ChatMessage};
 
 use super::Format;
-use super::decode::decode_line;
+use super::decode::{Link, decode_line};
 use super::tail::Tailer;
 
 /// Phones may ask for at most this many messages at once.
@@ -28,6 +29,19 @@ pub struct ChatState {
     tailer: Tailer,
     /// Sorted by `order`; ids are unique.
     messages: Vec<ChatMessage>,
+    /// Uuids of user lines that carry an inline image.
+    inline_image_uuids: HashSet<String>,
+    /// Whether the latest real (non-meta) user line carried an inline image.
+    last_user_inline: bool,
+}
+
+/// True when an `isMeta` image companion repeats an image its user message already shows: its
+/// `parentUuid` names a user line with an inline image, or (no parent) the preceding user line has one.
+fn is_duplicate_companion(link: &Link, inline_uuids: &HashSet<String>, last_user_inline: bool) -> bool {
+    match &link.parent_uuid {
+        Some(p) => inline_uuids.contains(p),
+        None => last_user_inline,
+    }
 }
 
 fn approx_size(m: &ChatMessage) -> usize {
@@ -65,7 +79,7 @@ pub fn page_bounds(messages: &[ChatMessage], end: usize, limit: usize) -> usize 
 impl ChatState {
     /// Reads the whole file.
     pub fn open(path: PathBuf, format: Format) -> io::Result<Self> {
-        let mut state = Self { format, tailer: Tailer::new(path), messages: Vec::new() };
+        let mut state = Self { format, tailer: Tailer::new(path), messages: Vec::new(), inline_image_uuids: HashSet::new(), last_user_inline: false };
         state.poll()?;
         Ok(state)
     }
@@ -90,10 +104,25 @@ impl ChatState {
         let poll = self.tailer.poll()?;
         if poll.reset {
             self.messages.clear();
+            self.inline_image_uuids.clear();
+            self.last_user_inline = false;
         }
         let mut fresh = Vec::new();
         for line in &poll.lines {
-            fresh.extend(decode_line(self.format, line.offset, &line.text).messages);
+            let d = decode_line(self.format, line.offset, &line.text);
+            if let Some(link) = &d.link {
+                if link.meta {
+                    if !d.messages.is_empty() && is_duplicate_companion(link, &self.inline_image_uuids, self.last_user_inline) {
+                        continue;
+                    }
+                } else if !d.messages.is_empty() {
+                    self.last_user_inline = link.inline_image;
+                    if let (true, Some(u)) = (link.inline_image, &link.uuid) {
+                        self.inline_image_uuids.insert(u.clone());
+                    }
+                }
+            }
+            fresh.extend(d.messages);
         }
         if poll.reset {
             self.messages = fresh;
@@ -264,5 +293,56 @@ mod tests {
     fn a_missing_file_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         assert!(ChatState::open(dir.path().join("none.jsonl"), Format::Codex).is_err());
+    }
+
+    fn image_count(ms: &[ChatMessage]) -> usize {
+        ms.iter().flat_map(|m| &m.blocks).filter(|b| matches!(b, ChatBlock::Image { .. })).count()
+    }
+
+    const USER_WITH_IMAGE: &str = r#"{"type":"user","uuid":"u1","parentUuid":"p0","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"QUJD"}},{"type":"text","text":"[Image #1] тест"}]}}"#;
+    const USER_NO_IMAGE: &str = r#"{"type":"user","uuid":"u1","parentUuid":"p0","message":{"role":"user","content":[{"type":"text","text":"[Image #1] тест"}]}}"#;
+    const COMPANION: &str = r#"{"type":"user","uuid":"c1","parentUuid":"u1","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"[Image: source: C:\\tmp\\a.jpg]"}]}}"#;
+    const COMPANION_NO_PARENT: &str = r#"{"type":"user","uuid":"c1","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"[Image: source: C:\\tmp\\a.jpg]"}]}}"#;
+
+    fn open_with(lines: &[&str]) -> ChatState {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        append(&path, &lines.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let s = ChatState::open(path, Format::Claude).unwrap();
+        std::mem::forget(dir);
+        s
+    }
+
+    #[test]
+    fn image_companion_is_dropped_when_the_user_message_has_the_inline_image() {
+        let s = open_with(&[USER_WITH_IMAGE, COMPANION]);
+        assert_eq!(image_count(&s.latest(10).0), 1);
+        let s = open_with(&[USER_WITH_IMAGE, COMPANION_NO_PARENT]);
+        assert_eq!(image_count(&s.latest(10).0), 1, "falls back to the preceding user message");
+    }
+
+    #[test]
+    fn image_companion_is_kept_without_an_inline_image() {
+        let s = open_with(&[USER_NO_IMAGE, COMPANION]);
+        assert_eq!(image_count(&s.latest(10).0), 1);
+        let s = open_with(&[USER_NO_IMAGE, COMPANION_NO_PARENT]);
+        assert_eq!(image_count(&s.latest(10).0), 1);
+    }
+
+    #[test]
+    fn image_companion_dedupe_works_across_polls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        append(&path, &[USER_WITH_IMAGE.to_string()]);
+        let mut s = ChatState::open(path.clone(), Format::Claude).unwrap();
+        append(&path, &[COMPANION.to_string()]);
+        assert_eq!(s.poll().unwrap(), Change::None);
+        assert_eq!(image_count(&s.latest(10).0), 1);
+    }
+
+    #[test]
+    fn plain_path_text_next_to_an_inline_image_does_not_duplicate() {
+        let l = r#"{"type":"user","uuid":"u9","message":{"content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA"}},{"type":"text","text":"[Image: source: /tmp/a.png]"}]}}"#;
+        assert_eq!(image_count(&open_with(&[l]).latest(10).0), 1);
     }
 }
