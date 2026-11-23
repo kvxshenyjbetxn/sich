@@ -774,14 +774,10 @@ pub fn section(lang: Language, cx: &App) -> impl IntoElement {
         };
         v_flex()
             .gap_1()
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(div().text_xs().text_color(if fw_error { theme.danger } else { theme.muted_foreground }).child(text))
-                    .children(button),
-            )
+            .child(div().text_xs().text_color(if fw_error { theme.danger } else { theme.muted_foreground }).child(text))
             .child(div().text_xs().text_color(theme.muted_foreground).child(tr(lang, Tr::PhoneFwHint)))
+            // Own row: next to the status text the button overflowed the settings dialog.
+            .child(h_flex().children(button))
     };
     #[cfg(not(windows))]
     let firewall = div();
