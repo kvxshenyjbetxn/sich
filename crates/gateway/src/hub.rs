@@ -14,6 +14,7 @@ use sich_remote_proto::{GatewayMsg, PairUrl, TermRef, Workspace};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::chat::{ChatHandle, Resolver, locate};
 use crate::compose;
 use crate::control::{PairRequest, Status};
 use crate::convert;
@@ -56,6 +57,8 @@ pub struct Session {
     pub outbox: Arc<Outbox>,
     /// Watched terminals with the phone's viewport size.
     subs: HashMap<TermRef, (u16, u16)>,
+    /// Open chat views (dropping a handle stops its watcher).
+    chats: HashMap<TermRef, ChatHandle>,
 }
 
 pub struct HubConfig {
@@ -219,10 +222,11 @@ impl Hub {
             id,
             PhoneEntry { endpoint_id: endpoint_id.to_string(), outbox: outbox.clone(), cancel: cancel.clone() },
         );
-        (Session { id, endpoint_id: endpoint_id.to_string(), outbox, subs: HashMap::new() }, cancel)
+        (Session { id, endpoint_id: endpoint_id.to_string(), outbox, subs: HashMap::new(), chats: HashMap::new() }, cancel)
     }
 
     pub fn unregister_phone(&self, session: &mut Session) {
+        session.chats.clear();
         let terms: Vec<TermRef> = session.subs.keys().cloned().collect();
         for term in terms {
             self.unsubscribe(session, &term);
@@ -402,6 +406,52 @@ impl Hub {
         let id = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         self.uploads.lock().insert(id.clone(), path);
         Ok(id)
+    }
+
+    // ----- chat view -----
+
+    /// Where the transcript of `term`'s agent is, asked again whenever the watcher rechecks.
+    fn chat_resolver(&self, term: &TermRef) -> Resolver {
+        let pool = self.pool.clone();
+        let term = term.clone();
+        Arc::new(move || {
+            let Some(info) = pool.terminal(&term) else {
+                return crate::chat::Target::Unavailable("no such terminal".into());
+            };
+            let (kind, session) = match &info.agent {
+                Some(a) => (Some(a.kind), a.session_id.as_deref()),
+                None => (None, None),
+            };
+            locate::resolve(&locate::Dirs::from_env(), kind, session, Some(info.cwd.as_path()))
+        })
+    }
+
+    pub fn chat_subscribe(&self, s: &mut Session, term: TermRef, limit: u32) {
+        if self.pool.terminal(&term).is_none() {
+            s.outbox.push(GatewayMsg::Error { message: "no such terminal".into() });
+            return;
+        }
+        let handle = ChatHandle::spawn(term.clone(), limit, self.chat_resolver(&term), s.outbox.clone());
+        // Replacing an old handle stops its watcher.
+        s.chats.insert(term, handle);
+    }
+
+    pub fn chat_unsubscribe(&self, s: &mut Session, term: &TermRef) {
+        s.chats.remove(term);
+    }
+
+    pub fn chat_load_earlier(&self, s: &Session, term: &TermRef, before_order: u64, limit: u32) {
+        match s.chats.get(term) {
+            Some(chat) => chat.load_earlier(before_order, limit),
+            None => s.outbox.push(GatewayMsg::ChatEarlier { term: term.clone(), messages: Vec::new(), has_more: false }),
+        }
+    }
+
+    pub fn chat_image(&self, s: &Session, req_id: u64, term: &TermRef, image_ref: String) {
+        match s.chats.get(term) {
+            Some(chat) => chat.image(req_id, image_ref),
+            None => s.outbox.push(GatewayMsg::ChatImageData { req_id, result: Err("the chat is not open".into()) }),
+        }
     }
 
     // ----- pairing -----

@@ -1,6 +1,7 @@
 //! Sich phone gateway: a daemon client (like the GUI) that serves paired phones over iroh.
 //! See `docs/phone-mvp.md`.
 
+pub mod chat;
 pub mod compose;
 pub mod control;
 pub mod convert;
