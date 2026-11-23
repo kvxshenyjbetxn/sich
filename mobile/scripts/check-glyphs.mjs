@@ -31,6 +31,18 @@ for (const css of cssFiles) {
     faces.push({ name: path.basename(url), range, font });
   }
 }
+// The Kitty placeholder must be covered by the bundled empty-glyph font (no tofu box).
+{
+  const ph = fontkit.openSync(path.join(root, "src/assets/sich-placeholder.ttf"));
+  const g = ph.hasGlyphForCodePoint(0x10eeee) ? ph.glyphForCodePoint(0x10eeee) : null;
+  const css = fs.readFileSync(path.join(root, "src/styles.css"), "utf8");
+  const ok = g && g.path.commands.length === 0 && g.advanceWidth === 600 && ph.unitsPerEm === 1000 && /Sich Placeholder[^}]*U[+]10EEEE/.test(css);
+  console.log(`U+10EEEE sich-placeholder.ttf ${ok ? "empty glyph" : "BAD"}`);
+  if (!ok) {
+    console.log("Placeholder font must cover U+10EEEE with an empty glyph (advance 600/1000)");
+    process.exit(1);
+  }
+}
 const missing = [];
 for (const g of glyphs) {
   const cp = g.codePointAt(0);

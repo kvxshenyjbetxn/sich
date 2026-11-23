@@ -5,7 +5,7 @@ import { chooseOutput, fitWithin, hasAlpha, outputName } from "./image";
 import { canRetry, connDot, connLabel, rejectKey } from "./connLabels";
 import { agentLine, badgeFor, rollup } from "./agent";
 import { imageAddonOptions } from "./imageOptions";
-import { FONT_FAMILY, BUNDLED_FAMILIES } from "./fonts";
+import { FONT_FAMILY, BUNDLED_FAMILIES, PLACEHOLDER_FAMILY } from "./fonts";
 import termGlyphs from "./termGlyphs.json";
 import { bytesToBase64 } from "./base64";
 import { allTerminals, buildTree, filterTree, normPath, samePath, sortTerminals, worktreeLabel } from "./workspaceTree";
@@ -456,6 +456,10 @@ describe("terminal font stack", () => {
     expect(FONT_FAMILY.indexOf('"JetBrains Mono"')).toBeLessThan(FONT_FAMILY.indexOf('"Noto Sans Symbols 2"'));
     for (const f of BUNDLED_FAMILIES) expect(FONT_FAMILY).toContain(f);
     expect(FONT_FAMILY.endsWith("monospace")).toBe(true);
+  });
+  it("puts the empty placeholder font first so U+10EEEE never falls back to tofu", () => {
+    expect(FONT_FAMILY.startsWith(`"${PLACEHOLDER_FAMILY}", `)).toBe(true);
+    expect(BUNDLED_FAMILIES[0]).toBe(PLACEHOLDER_FAMILY);
   });
   it("glyph list covers what agent CLIs print", () => {
     for (const g of ["⏵", "⏺", "⎿", "✻", "█", "⚠", "…"]) expect(termGlyphs).toContain(g);

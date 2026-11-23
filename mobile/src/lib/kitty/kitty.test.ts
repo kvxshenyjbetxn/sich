@@ -274,6 +274,9 @@ describe("cover runs", () => {
   });
   it("box spans all cells of the run", () => {
     expect(coverBox({ y: 2, x: 4, len: 3 }, 10, 20)).toEqual({ left: 40, top: 40, width: 30, height: 20 });
+    // spans exactly start..end column inclusive: right edge is the left edge of the cell after the run
+    const b = coverBox({ y: 0, x: 4, len: 3 }, 10, 20);
+    expect(b.left + b.width).toBe((4 + 3 - 1 + 1) * 10);
   });
   it("handles missing lines", () => {
     const out: CoverRun[] = [];
