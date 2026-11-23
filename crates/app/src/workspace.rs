@@ -198,13 +198,21 @@ pub fn match_pending_worktree<'a>(
     // Branch names like `feat/x` live in a flat folder (`feat-x`).
     let flat_suffix = format!("{sep}{}", want.replace(['/', '\\'], "-"));
     let project = projects.iter().find(|p| p.id == pending.project_id)?;
+    // The default location puts the worktree next to the project: `<repo>-<flat name>`.
+    let sibling_suffix = project
+        .path
+        .file_name()
+        .map(|repo| format!("{sep}{}-{}", normalize_str(&repo.to_string_lossy()), want.replace(['/', '\\'], "-")));
     project
         .worktrees
         .iter()
         .filter(|w| !w.is_main && w.branch.as_deref() == Some(&pending.name))
         .find(|w| {
             let have = normalize_path(&w.path);
-            have == want || have.ends_with(&suffix) || have.ends_with(&flat_suffix)
+            have == want
+                || have.ends_with(&suffix)
+                || have.ends_with(&flat_suffix)
+                || sibling_suffix.as_ref().is_some_and(|s| have.ends_with(s))
         })
         .map(|w| (project.path.as_path(), w.path.as_path()))
 }
@@ -347,6 +355,23 @@ mod tests {
         // A different branch in that folder is not the new worktree.
         let other = vec![project(7, vec![WorktreeInfo { branch: Some("feat-x".into()), ..wt("/w/app-wt/feat-x", false) }])];
         assert_eq!(match_pending_worktree(&pending, &other), None);
+    }
+
+    #[test]
+    fn pending_worktree_matches_the_sibling_folder_next_to_the_project() {
+        let pending = PendingWorktree { project_id: 7, name: "feat/x".into() };
+        let named = |path| WorktreeInfo { branch: Some(pending.name.clone()), ..wt(path, false) };
+        let mut app = project(7, vec![wt("/w/app", true), named("/w/app-feat-x")]);
+        app.path = PathBuf::from("/w/app");
+        let projects = vec![app];
+        assert_eq!(
+            match_pending_worktree(&pending, &projects),
+            Some((projects[0].path.as_path(), Path::new("/w/app-feat-x")))
+        );
+        // Another repo's sibling folder with the same suffix is not this worktree.
+        let mut other = project(7, vec![named("/w/old-feat-x")]);
+        other.path = PathBuf::from("/w/app");
+        assert_eq!(match_pending_worktree(&pending, &[other]), None);
     }
 
     #[test]
