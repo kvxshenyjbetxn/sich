@@ -180,12 +180,24 @@ fn relay(path: Option<&Path>, bytes: &[u8], original: Option<Command>) -> i32 {
     }
 }
 
+/// Publishes the per-session context status for the GUI. Never fails the status line.
+fn record_context(input: &[u8]) {
+    let Some(term_id) = std::env::var("SICH_TERM_ID").ok().filter(|id| !id.is_empty()) else { return };
+    let Some(dir) = crate::claude_ctx::ctx_dir() else { return };
+    let socket = std::env::var("SICH_SOCKET").ok().filter(|s| !s.is_empty());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64);
+    let _ = crate::claude_ctx::record_status(&dir, input, Some(term_id), socket, now_ms);
+}
+
 pub fn run(args: &[String]) -> i32 {
     let mut input = Vec::new();
     let _ = io::stdin().lock().read_to_end(&mut input);
     let original = original_command(args).as_deref().map(platform_shell);
     let managed_session = std::env::var("SICH_TERM_ID").ok().and_then(|id| id.parse::<u64>().ok()).is_some();
     let path = managed_session.then(|| config_file(SNAPSHOT_FILE)).flatten();
+    record_context(&input);
     relay(path.as_deref(), &input, original)
 }
 
@@ -320,6 +332,12 @@ mod tests {
             assert_eq!(output.stderr, b"relay-stderr-token");
             let snapshot = config.path().join("sich").join(SNAPSHOT_FILE);
             assert_eq!(snapshot.is_file(), input == VALID && !blocked && in_sich);
+            let ctx = config.path().join("sich").join("claude-ctx").join("the-session.status.json");
+            assert_eq!(ctx.is_file(), input == VALID && !blocked && in_sich);
+            if ctx.is_file() {
+                let status: Value = serde_json::from_slice(&fs::read(&ctx).unwrap()).unwrap();
+                assert_eq!((status["term_id"].as_str(), status["session_id"].as_str()), (Some("77"), Some("the-session")));
+            }
         }
     }
 

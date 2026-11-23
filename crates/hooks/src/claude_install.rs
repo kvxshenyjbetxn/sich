@@ -24,9 +24,9 @@ const HOOK_TIMEOUT_SECS: u64 = 5;
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // Hook installation can run in the background while the app applies the skill setting.
-static SETTINGS_EDIT: Mutex<()> = Mutex::new(());
+pub(crate) static SETTINGS_EDIT: Mutex<()> = Mutex::new(());
 
-type Version = (u32, u32, u32);
+type Version =(u32, u32, u32);
 
 /// A Claude hook event we register.
 #[derive(Debug, Clone, Copy)]
@@ -100,7 +100,7 @@ pub fn hook_command(exe: &Path) -> String {
 // ---------------------------------------------------------------------------------------------
 // Version handling
 
-fn parse_version_triple(s: &str) -> Option<Version> {
+pub(crate) fn parse_version_triple(s: &str) -> Option<Version> {
     let core = s.split(['-', '+']).next()?;
     let mut it = core.split('.');
     let a = it.next()?.parse().ok()?;
@@ -392,12 +392,12 @@ fn merge_install(
 // ---------------------------------------------------------------------------------------------
 // File handling
 
-fn settings_path(dir: &Path) -> PathBuf {
+pub(crate) fn settings_path(dir: &Path) -> PathBuf {
     dir.join(SETTINGS_FILE)
 }
 
 /// Reads settings.json: `Ok(None)` when missing, an empty file counts as `{}`.
-fn read_settings(path: &Path) -> anyhow::Result<Option<Value>> {
+pub(crate) fn read_settings(path: &Path) -> anyhow::Result<Option<Value>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -412,7 +412,7 @@ fn read_settings(path: &Path) -> anyhow::Result<Option<Value>> {
 }
 
 /// Writes atomically (temp file + rename), making the one-time backup first.
-fn write_settings(dir: &Path, root: &Value, existed: bool) -> anyhow::Result<bool> {
+pub(crate) fn write_settings(dir: &Path, root: &Value, existed: bool) -> anyhow::Result<bool> {
     std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let path = settings_path(dir);
     let mut backup_created = false;
