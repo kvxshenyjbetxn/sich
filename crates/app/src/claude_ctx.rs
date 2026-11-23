@@ -451,6 +451,34 @@ pub(crate) fn match_session(
         .map(|c| c.session.clone())
 }
 
+/// Maps terminals to sessions: the terminal's own session id when `has_file` knows it, else the
+/// newest candidate (built lazily, only when needed) whose terminal id and socket match.
+/// Shared by every kind of per-session file (`*.mod.json`, `*.img.json`).
+pub(crate) fn pick_sessions<'a>(
+    targets: &'a [Target],
+    has_file: impl Fn(&str) -> bool,
+    candidates: impl FnOnce() -> Vec<Candidate>,
+) -> Vec<(&'a Target, String)> {
+    let mut resolved = Vec::new();
+    let mut need_scan = Vec::new();
+    for target in targets {
+        let own = target.session_id.as_deref().map(sanitize_id).filter(|id| has_file(id));
+        match own {
+            Some(id) => resolved.push((target, id)),
+            None => need_scan.push(target),
+        }
+    }
+    if !need_scan.is_empty() {
+        let candidates = candidates();
+        for target in need_scan {
+            if let Some(id) = match_session(None, &target.raw_id, &target.socket, &candidates) {
+                resolved.push((target, id));
+            }
+        }
+    }
+    resolved
+}
+
 /// The terminal to show for "Auto": the focused one when it is a Claude terminal of the
 /// workspace, else the workspace's active one, else the first.
 pub(crate) fn auto_target(ids: &[u64], focused: Option<u64>, active: Option<u64>) -> Option<u64> {
@@ -475,7 +503,10 @@ pub(crate) fn prune_dir(dir: &Path, now: SystemTime, max_age: Duration) -> usize
     let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
     let files: Vec<(PathBuf, SystemTime)> = entries
         .flatten()
-        .filter(|e| split_name(&e.file_name().to_string_lossy()).is_some())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            split_name(&name).is_some() || crate::claude_images::is_manifest_name(&name)
+        })
         .filter_map(|e| Some((e.path(), e.metadata().ok()?.modified().ok()?)))
         .collect();
     select_prune(&files, now, max_age).into_iter().filter(|p| std::fs::remove_file(p).is_ok()).count()
@@ -539,41 +570,31 @@ impl Loader {
                 .is_some_and(|(stem, part)| listing.get(stem).is_some_and(|files| files[part as usize].is_some()))
         });
 
-        let mut resolved: Vec<(&Target, String)> = Vec::new();
-        let mut need_scan = Vec::new();
-        for target in targets {
-            let own = target.session_id.as_deref().map(sanitize_id).filter(|id| listing.contains_key(id));
-            match own {
-                Some(id) => resolved.push((target, id)),
-                None => need_scan.push(target),
-            }
-        }
-        if !need_scan.is_empty() {
-            let stems: Vec<String> = listing.keys().cloned().collect();
-            let candidates: Vec<Candidate> = stems
-                .iter()
-                .map(|stem| {
-                    let (status, modf) = self.read_session(&listing, stem);
-                    Candidate {
-                        session: stem.clone(),
-                        term_id: status.as_ref().and_then(|s| s.term_id.clone()).or(modf.as_ref().and_then(|m| m.term_id.clone())),
-                        socket: status.as_ref().and_then(|s| s.socket.clone()).or(modf.as_ref().and_then(|m| m.socket.clone())),
-                        updated_ms: status
-                            .as_ref()
-                            .and_then(|s| s.updated_ms)
-                            .into_iter()
-                            .chain(modf.as_ref().and_then(|m| m.updated_at))
-                            .max()
-                            .unwrap_or(0),
-                    }
-                })
-                .collect();
-            for target in need_scan {
-                if let Some(id) = match_session(None, &target.raw_id, &target.socket, &candidates) {
-                    resolved.push((target, id));
-                }
-            }
-        }
+        let resolved = pick_sessions(
+            targets,
+            |id| listing.contains_key(id),
+            || {
+                let stems: Vec<String> = listing.keys().cloned().collect();
+                stems
+                    .iter()
+                    .map(|stem| {
+                        let (status, modf) = self.read_session(&listing, stem);
+                        Candidate {
+                            session: stem.clone(),
+                            term_id: status.as_ref().and_then(|s| s.term_id.clone()).or(modf.as_ref().and_then(|m| m.term_id.clone())),
+                            socket: status.as_ref().and_then(|s| s.socket.clone()).or(modf.as_ref().and_then(|m| m.socket.clone())),
+                            updated_ms: status
+                                .as_ref()
+                                .and_then(|s| s.updated_ms)
+                                .into_iter()
+                                .chain(modf.as_ref().and_then(|m| m.updated_at))
+                                .max()
+                                .unwrap_or(0),
+                        }
+                    })
+                    .collect()
+            },
+        );
 
         let mut views: HashMap<String, Option<CtxView>> = HashMap::new();
         let mut out = HashMap::new();
@@ -852,6 +873,33 @@ mod tests {
         assert!(dir.path().join("keep.txt").exists());
         assert!(!dir.path().join("a.status.json").exists());
         assert_eq!(prune_dir(&dir.path().join("missing"), later, PRUNE_AGE), 0);
+    }
+
+    #[test]
+    fn prune_dir_also_removes_stale_image_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.img.json"), "{}").unwrap();
+        std::fs::write(dir.path().join(".img.json"), "{}").unwrap();
+        let later = SystemTime::now() + Duration::from_secs(8 * 86_400);
+        assert_eq!(prune_dir(dir.path(), SystemTime::now(), PRUNE_AGE), 0);
+        assert_eq!(prune_dir(dir.path(), later, PRUNE_AGE), 1);
+        assert!(!dir.path().join("a.img.json").exists());
+        assert!(dir.path().join(".img.json").exists());
+    }
+
+    #[test]
+    fn pick_sessions_prefers_own_file_and_scans_lazily() {
+        let targets = [target(1, Some("abc"), "9", "x"), target(2, None, "3", "s1"), target(3, None, "7", "s1")];
+        let called = std::cell::Cell::new(0);
+        let picked = pick_sessions(&targets, |id| id == "abc", || {
+            called.set(called.get() + 1);
+            vec![cand("new", "3", "s1", 20), cand("old", "3", "s1", 10)]
+        });
+        let ids: Vec<_> = picked.iter().map(|(t, id)| (t.key, id.as_str())).collect();
+        assert_eq!(ids, [(1, "abc"), (2, "new")]);
+        assert_eq!(called.get(), 1);
+        let only_own = pick_sessions(&targets[..1], |_| true, || panic!("no scan needed"));
+        assert_eq!(only_own.len(), 1);
     }
 
     fn target(key: u64, session: Option<&str>, raw: &str, socket: &str) -> Target {

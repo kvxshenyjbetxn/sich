@@ -146,9 +146,22 @@ pub(crate) fn is_dirty(current: &str, saved: &str) -> bool {
     current != saved
 }
 
-/// Transcripts (`.jsonl`) and files flagged by the caller are never edited here.
+/// Image formats the file tab shows (all decoded by the UI toolkit's image loader).
+pub(crate) const IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "gif", "webp", "bmp"];
+
+/// Whether the file tab shows `path` as an image instead of loading it as text.
+pub(crate) fn is_image(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
+}
+
+/// Pixel size of an image file (reads only its header).
+pub(crate) fn image_size(path: &Path) -> Result<(u32, u32), LoadError> {
+    image::image_dimensions(path).map_err(|e| LoadError::Io(e.to_string()))
+}
+
+/// Transcripts (`.jsonl`), images and files flagged by the caller are never edited here.
 pub(crate) fn is_read_only(path: &Path, forced: bool) -> bool {
-    forced || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+    forced || is_image(path) || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
 }
 
 /// Highlighting language of the editor for a file name.
@@ -311,6 +324,32 @@ mod tests {
         assert!(is_read_only(Path::new("X.JSONL"), false));
         assert!(!is_read_only(Path::new("CLAUDE.md"), false));
         assert!(is_read_only(Path::new("CLAUDE.md"), true));
+    }
+
+    #[test]
+    fn image_files_are_detected_by_extension_and_never_edited() {
+        for name in ["a.png", "b.JPG", "c.jpeg", "d.gif", "e.WebP", "f.bmp", "dir/g.PNG"] {
+            assert!(is_image(Path::new(name)), "{name}");
+            assert!(is_read_only(Path::new(name), false), "{name}");
+        }
+        for name in ["a.md", "png", "a.png.txt", "a.svg", "a.tiff", "Makefile", "a.", ".png"] {
+            assert!(!is_image(Path::new(name)), "{name}");
+        }
+        assert!(!is_read_only(Path::new("a.md"), false));
+    }
+
+    #[test]
+    fn image_size_reads_the_header_without_the_text_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        image::RgbaImage::new(3, 2).save(&png).unwrap();
+        assert_eq!(image_size(&png), Ok((3, 2)));
+        // The text loader would refuse this binary file; the image path never calls it.
+        assert_eq!(load(&png), Err(LoadError::NotUtf8));
+        let junk = dir.path().join("junk.png");
+        std::fs::write(&junk, b"not an image").unwrap();
+        assert!(matches!(image_size(&junk), Err(LoadError::Io(_))));
+        assert!(matches!(image_size(&dir.path().join("none.png")), Err(LoadError::Io(_))));
     }
 
     #[test]
