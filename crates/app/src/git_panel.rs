@@ -392,6 +392,8 @@ pub(crate) struct GitPanel {
     pane: RightTab,
     /// State of the PR tab's details and files sections.
     pr_extras: pr_details::PrExtras,
+    /// The Notes shelf (diff review notes of this worktree).
+    notes: notes::NotesUi,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -404,7 +406,9 @@ impl GitPanel {
         history_height: Option<f32>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let notes = notes::NotesUi::new(cx);
         let subscriptions = vec![
+            cx.observe(&notes.store, |_, _, cx| cx.notify()),
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&store, |panel, _, event, cx| panel.on_store_event(event, cx)),
         ];
@@ -440,6 +444,7 @@ impl GitPanel {
             comments,
             pane: RightTab::Git,
             pr_extras: pr_details::PrExtras::default(),
+            notes,
             _subscriptions: subscriptions,
         }
     }

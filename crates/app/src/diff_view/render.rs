@@ -7,7 +7,8 @@ use gpui_kit::{
     AnyElement, App, Bounds, Context, DispatchPhase, HighlightStyle, HitboxBehavior, Hsla,
     InteractiveElement as _, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Render, ScrollEvent,
-    StatefulInteractiveElement as _, Styled as _, StyledText, WeakEntity, Window, canvas, div,
+    SharedString, StatefulInteractiveElement as _, Styled as _, StyledText, WeakEntity, Window,
+    canvas, div,
     fill, list, point, px, relative, size, uniform_list,
 };
 use sich_git::compare::{Comparison, LineKind, Row, VisibleRow};
@@ -17,7 +18,7 @@ use super::*;
 use crate::i18n::{diff_eol_text, diff_unchanged_lines};
 
 pub(super) const ROW_H: f32 = 19.;
-const GUTTER_W: f32 = 60.;
+pub(super) const GUTTER_W: f32 = 60.;
 const MARKER_W: f32 = 18.;
 const CODE_PAD: f32 = 4.;
 const BAR_H: f32 = 10.;
@@ -27,6 +28,7 @@ pub(super) const FONT_SIZE: f32 = 12.5;
 impl Render for DiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.measure_advance(window);
+        self.sync_notes(cx);
         let lang = settings::language(cx);
         let theme = cx.theme().clone();
         let content = match self.comparison.as_deref() {
@@ -172,6 +174,7 @@ impl DiffView {
                         view.choose_mode(mode, cx);
                     }))
             }))
+            .child(self.note_buttons(lang, cx))
             .child(
                 Button::new("diff-wrap")
                     .ghost()
@@ -217,6 +220,10 @@ impl DiffView {
             mode: self.mode,
             selected: self.change,
             lang,
+            layout: self.layout.clone(),
+            composer: self.layout.composer.flatten().zip(self.composer_parts()).map(
+                |(row, (state, start, end))| (row, state, start, end),
+            ),
             owner: owner.clone(),
             window: (!wrapped).then(|| {
                 geometry.code_window(
@@ -236,7 +243,7 @@ impl DiffView {
                 .px_2()
                 .child(format!("{} → {}", tr(lang, left), tr(lang, right)))
         };
-        let items = if let Some(state) = &self.wrapped_scroll {
+        let items = if let Some(state) = self.active_list() {
             list(state.clone(), move |index, _, cx| rows.render(index, cx))
                 .flex_1()
                 .min_h_0()
@@ -283,6 +290,7 @@ impl DiffView {
                     .border_b_1()
                     .border_color(theme.border),
             )
+            .children(self.top_notes(lang, &owner, cx))
             .child(items)
             .children(bars)
             .child(viewport_input(owner, self.body_width, wrapped))
@@ -296,6 +304,9 @@ struct DiffRows {
     mode: DiffMode,
     selected: Option<usize>,
     lang: Language,
+    layout: Arc<notes::NoteLayout>,
+    /// Row, text box and line range of the open composer.
+    composer: Option<(usize, Entity<gpui_kit::component::input::TextareaState>, u32, u32)>,
     owner: WeakEntity<DiffView>,
     window: Option<CodeWindow>,
 }
@@ -307,7 +318,23 @@ impl DiffRows {
         else {
             return div().h(px(ROW_H)).into_any_element();
         };
-        self.row(item, index, comparison, cx.theme())
+        let row = self.row(item, index, comparison, cx.theme());
+        let cards = self.layout.by_row.get(&index);
+        let composer = self.composer.as_ref().filter(|composer| composer.0 == index);
+        if cards.is_none() && composer.is_none() {
+            return row;
+        }
+        let theme = cx.theme();
+        v_flex()
+            .w_full()
+            .child(row)
+            .children(cards.into_iter().flatten().map(|card| {
+                notes::card_element(card, GUTTER_W, self.lang, self.owner.clone(), theme)
+            }))
+            .children(composer.map(|(_, state, start, end)| {
+                notes::composer_box(state, *start, *end, self.lang, self.owner.clone(), theme)
+            }))
+            .into_any_element()
     }
 }
 
@@ -567,10 +594,21 @@ impl DiffRows {
         let Some(Row { left, right }) = comparison.row(aligned) else {
             return wrapper.into_any_element();
         };
+        let group = SharedString::from(format!("diff-row-{index}"));
+        let wrapper = wrapper.id(("diff-row", index)).group(group.clone());
+        let add = |line: Option<DiffLineView<'_>>, deleted: bool, slot: usize| {
+            line.map(|line| notes::GutterAdd {
+                owner: self.owner.clone(),
+                group: group.clone(),
+                key: (line.number as u32, deleted),
+                id: index * 2 + slot,
+            })
+        };
         if self.mode == DiffMode::SideBySide {
+            let left_add = if right.is_none() { add(left, true, 0) } else { None };
             wrapper
-                .child(side_cell(left, false, theme, self.window.as_ref()))
-                .child(side_cell(right, true, theme, self.window.as_ref()))
+                .child(side_cell(left, false, theme, self.window.as_ref(), left_add))
+                .child(side_cell(right, true, theme, self.window.as_ref(), add(right, false, 1)))
                 .into_any_element()
         } else {
             let shown = if side == Some(false) { left } else { right };
@@ -582,10 +620,15 @@ impl DiffRows {
             };
             wrapper
                 .bg(tint.map_or(theme.background, |color| color.opacity(0.15)))
-                .child(gutter(if side != Some(true) { left } else { None }, theme))
+                .child(gutter(
+                    if side != Some(true) { left } else { None },
+                    theme,
+                    if side == Some(false) { add(left, true, 0) } else { None },
+                ))
                 .child(gutter(
                     if side != Some(false) { right } else { None },
                     theme,
+                    if side != Some(false) { add(right, false, 1) } else { None },
                 ))
                 .child(
                     div()
@@ -606,6 +649,7 @@ fn side_cell(
     right: bool,
     theme: &Theme,
     window: Option<&CodeWindow>,
+    add: Option<notes::GutterAdd>,
 ) -> impl IntoElement + use<> {
     let tint = line
         .filter(|line| line.kind != LineKind::Same)
@@ -628,12 +672,17 @@ fn side_cell(
         } else {
             theme.border.opacity(0.)
         })
-        .child(gutter(line, theme))
+        .child(gutter(line, theme, add))
         .child(code_cell(line, tint, window))
 }
 
-fn gutter(line: Option<DiffLineView<'_>>, theme: &Theme) -> impl IntoElement + use<> {
+fn gutter(
+    line: Option<DiffLineView<'_>>,
+    theme: &Theme,
+    add: Option<notes::GutterAdd>,
+) -> impl IntoElement + use<> {
     div()
+        .relative()
         .w(px(GUTTER_W))
         .pr_2()
         .text_right()
@@ -641,6 +690,7 @@ fn gutter(line: Option<DiffLineView<'_>>, theme: &Theme) -> impl IntoElement + u
         .text_size(px(11.))
         .text_color(theme.muted_foreground)
         .children(line.map(|line| line.number.to_string()))
+        .children(add.map(|add| notes::gutter_add(add, theme)))
 }
 
 fn code_cell(
