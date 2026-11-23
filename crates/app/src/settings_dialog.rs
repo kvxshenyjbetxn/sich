@@ -18,6 +18,7 @@ use crate::codex_hooks;
 use crate::i18n::{Language, Tr, tr};
 use crate::omp_hooks;
 use crate::orch_skill;
+use crate::phone_settings;
 use crate::settings::{self, WorktreeLocation};
 use crate::theme::{self, ThemeKind};
 
@@ -25,6 +26,7 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
     if window.has_active_dialog(cx) {
         return;
     }
+    phone_settings::on_settings_open(window, cx);
     // The builder runs on every render, so the dialog follows language and theme changes.
     window.open_dialog(cx, move |dialog, _window, cx| {
         let lang = settings::language(cx);
@@ -47,6 +49,7 @@ pub fn open(app: Entity<AppView>, window: &mut Window, cx: &mut App) {
                     )
                     .child(section(tr(lang, Tr::WorktreeLocation), worktree_location_picker(lang, cx), cx))
                     .child(section(tr(lang, Tr::AgentsSection), agents_section(lang, cx), cx))
+                    .child(section(tr(lang, Tr::Phone), phone_settings::section(lang, cx), cx))
                     .children(cfg!(windows).then(|| {
                         section(tr(lang, Tr::Notifications), notification_controls(lang, app.clone(), &prefs), cx)
                     }))

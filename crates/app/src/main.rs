@@ -25,6 +25,7 @@ mod file_doc;
 mod file_view;
 mod paste_image;
 mod phone_cli;
+mod phone_settings;
 mod quick_command_dialogs;
 mod quick_commands;
 mod handoff;
@@ -169,6 +170,7 @@ fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
         codex_hooks::startup(cx);
         omp_hooks::startup(cx);
         orch_skill::startup(cx);
+        phone_settings::startup(handle.clone(), socket.clone(), cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();

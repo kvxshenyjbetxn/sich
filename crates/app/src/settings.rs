@@ -105,6 +105,8 @@ pub struct AppSettings {
     pub github_prs: bool,
     pub(crate) pr_merge_method: PrMergeMethod,
     pub(crate) worktree_location: WorktreeLocation,
+    /// Run the phone gateway so the Sich phone app can reach this computer.
+    pub phone_sync: bool,
 }
 
 impl Default for AppSettings {
@@ -137,6 +139,7 @@ impl Default for AppSettings {
             github_prs: true,
             pr_merge_method: PrMergeMethod::default(),
             worktree_location: WorktreeLocation::default(),
+            phone_sync: false,
         }
     }
 }
@@ -333,6 +336,14 @@ pub fn set_notify_sound(enabled: bool, cx: &mut App) {
     let mut s = get(cx);
     if s.notify_sound != enabled {
         s.notify_sound = enabled;
+        store(s, cx);
+    }
+}
+
+pub fn set_phone_sync(enabled: bool, cx: &mut App) {
+    let mut s = get(cx);
+    if s.phone_sync != enabled {
+        s.phone_sync = enabled;
         store(s, cx);
     }
 }
@@ -598,6 +609,16 @@ mod tests {
         assert!(!back.notify_agent_needs_input);
         assert!(!back.notify_agent_done);
         assert!(!back.notify_sound);
+    }
+
+    #[test]
+    fn phone_sync_defaults_to_false_and_round_trips() {
+        let old: AppSettings = serde_json::from_str(r#"{"close_to_tray":false}"#).unwrap();
+        assert!(!old.phone_sync);
+        assert!(!AppSettings::default().phone_sync);
+        let on = AppSettings { phone_sync: true, ..Default::default() };
+        let back: AppSettings = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(back.phone_sync);
     }
 
     #[test]
