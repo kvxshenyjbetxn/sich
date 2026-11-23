@@ -467,6 +467,24 @@ impl DaemonPool {
         self.send_restore(worktree, cwd, size, data)
     }
 
+    /// A regular terminal that types `command` (and Enter) once the shell is up. Unlike a quick
+    /// command it stays open after the command ends.
+    pub(crate) fn open_command_tab(
+        &self,
+        worktree: Option<PathBuf>,
+        cwd: Option<PathBuf>,
+        size: (u16, u16),
+        token: u64,
+        command: &str,
+    ) -> bool {
+        let data = RestoreData {
+            resume: Some(command.to_owned()),
+            protect_resume: true,
+            ..RestoreData::fresh_terminal(token)
+        };
+        self.send_restore(worktree, cwd, size, data)
+    }
+
     fn send_restore(&self, worktree: Option<PathBuf>, cwd: Option<PathBuf>, size: (u16, u16), data: RestoreData) -> bool {
         let state = self.0.primary.state.lock();
         matches!(state.status, ConnStatus::Connected { .. })

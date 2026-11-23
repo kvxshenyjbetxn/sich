@@ -24,6 +24,8 @@ mod file_view;
 mod paste_image;
 mod quick_command_dialogs;
 mod quick_commands;
+mod handoff;
+mod handoff_dialog;
 mod git_panel;
 mod group_dialogs;
 mod groups;

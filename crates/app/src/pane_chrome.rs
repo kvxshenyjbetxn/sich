@@ -20,6 +20,7 @@ pub(crate) fn terminal_menu(
     app: &Entity<AppView>,
     drag: &TerminalDrag,
     split: bool,
+    handoff: bool,
     lang: Language,
 ) -> PopupMenu {
     let (right_app, right_drag) = (app.clone(), drag.clone());
@@ -35,6 +36,12 @@ pub(crate) fn terminal_menu(
         let (detach_app, detach_drag) = (app.clone(), drag.clone());
         menu = menu.item(PopupMenuItem::new(tr(lang, Tr::DetachPane)).on_click(move |_, window, cx| {
             detach_app.update(cx, |this, cx| this.detach_terminal(&detach_drag, window, cx));
+        }));
+    }
+    if handoff {
+        let (handoff_app, handoff_id) = (app.clone(), drag.id);
+        menu = menu.separator().item(PopupMenuItem::new(tr(lang, Tr::HandoffMenu)).on_click(move |_, window, cx| {
+            crate::handoff_dialog::open(handoff_app.clone(), handoff_id, window, cx);
         }));
     }
     let (close_app, id) = (app.clone(), drag.id);
@@ -89,7 +96,8 @@ impl AppView {
             .child(div().flex_shrink_0().child(close))
             .context_menu(move |menu, _, cx| {
                 let split = app.read(cx).terminal_is_split(id);
-                terminal_menu(menu, &app, &menu_drag, split, lang)
+                let handoff = crate::handoff_dialog::can_handoff(app.read(cx), id);
+                terminal_menu(menu, &app, &menu_drag, split, handoff, lang)
             })
     }
 }

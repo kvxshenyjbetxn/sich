@@ -296,6 +296,13 @@ struct TerminalInfo { id: TermId, title: String, cwd: PathBuf, cols: u16, rows: 
 - Фолбек: якщо файлів немає чи копіювання не вдалось - лише попередження в лог, використовується системний ConPTY (APC тоді губляться, решта працює).
 - Тест `crates/daemon/tests/conpty_apc.rs` перевіряє, що APC доходить до читача.
 
+## Передача контексту іншому агенту (`app/handoff.rs`, `app/handoff_dialog.rs`)
+
+Пункт меню терміналa (лише коли в ньому є агент і він не завершений) відкриває діалог: цільовий агент (Claude Code / Codex / Gemini / omp; за замовчуванням Claude → Codex, решта → Claude), тека (поточна, worktree усіх проєктів, Home або довільна через «Обрати теку…») і необов'язкова нотатка. Протокол не змінюється (жодних нових `ClientMsg`/`ServerMsg`, без bump `PROTO_VERSION`).
+- Бриф (markdown, англійською) пишеться в `<data>/sich/agent-prompts/handoff-<unix_ms>.md` у фоні; ліміт 20 файлів спільний із «Send to agent». У брифі лише **шлях** до транскрипту (вміст не читається): Claude — `transcript_path` зі statusLine або `<CLAUDE_CONFIG_DIR|~/.claude>/projects/*/<session_id>.jsonl`; Codex — `<CODEX_HOME|~/.codex>/sessions/**` (глибина ≤ 4) з файлом `…<session_id>.jsonl`. `session_id` перевіряється тим самим правилом, що й `session::resume_command`. Без транскрипту береться текст термінала (≤ 200 рядків, ≤ 16 КіБ).
+- Новий термінал відкривається через `Cmd::Restore` (`DaemonPool::open_command_tab`, власний токен) у цільовому workspace/cwd: відомий worktree → його workspace, Home → домашня тека, інша тека → Home з cwd. Команда запуску — `claude`/`codex`/`gemini`/`omp`; вкладка активується.
+- Готовність (`handoff_ready`): статус агента того ж виду, стан Idle або Done. Перевіряється в `sync` (`advance_handoffs`); після готовності пауза 500 мс, далі один рядок «Read the Sich handoff brief at <path>…» вставляється bracketed-paste **без Enter**. Термінал завершився/зник — запис тихо скасовується. За 60 с без готовності рядок копіюється в буфер обміну й показується тост.
+
 ## Що свідомо відкладено
 - Snapshot стану екрана через `vt100` на демоні. Поки що replay сирого ring buffer: при обрізаному буфері можливі артефакти на початку.
 - Синхронізація з телефоном (`phone-sync-plan.md`).

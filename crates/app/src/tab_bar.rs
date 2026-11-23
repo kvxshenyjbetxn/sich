@@ -169,7 +169,8 @@ impl AppView {
                     .child(close_wrap)
                     .context_menu(move |menu, _, cx| {
                         let split = menu_app.read(cx).terminal_is_split(id);
-                        terminal_menu(menu, &menu_app, &menu_drag, split, lang)
+                        let handoff = crate::handoff_dialog::can_handoff(menu_app.read(cx), id);
+                        terminal_menu(menu, &menu_app, &menu_drag, split, handoff, lang)
                     }),
             )
         });

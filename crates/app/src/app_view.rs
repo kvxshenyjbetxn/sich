@@ -89,6 +89,17 @@ struct RestoreTarget {
 enum TerminalOpenKind {
     Split { target: TermId, edge: Edge },
     QuickTab,
+    Handoff,
+}
+
+/// A handoff line waiting for the new agent terminal to become ready.
+struct PendingHandoff {
+    token: u64,
+    term: Option<TermId>,
+    kind: sich_proto::AgentKind,
+    line: String,
+    deadline: Instant,
+    scheduled: bool,
 }
 
 struct PendingTerminalOpen {
@@ -136,6 +147,7 @@ pub struct AppView {
     /// Workspaces this window asked a terminal for; the matching new terminal gets activated.
     pending_creates: VecDeque<WorkspaceKey>,
     pending_terminal_opens: Vec<PendingTerminalOpen>,
+    pending_handoffs: Vec<PendingHandoff>,
     pending_terminal_restarts: HashMap<TermId, u64>,
     pub(crate) quick_terminals: HashMap<TermId, TemporaryCommand>,
     quick_return: HashMap<WorkspaceKey, TermId>,
@@ -338,6 +350,7 @@ impl AppView {
             collapsed: HashSet::new(),
             pending_creates: VecDeque::new(),
             pending_terminal_opens: Vec::new(),
+            pending_handoffs: Vec::new(),
             pending_terminal_restarts: HashMap::new(),
             quick_terminals: HashMap::new(),
             quick_return: HashMap::new(),
@@ -1609,6 +1622,7 @@ impl AppView {
             self.terminal_layouts.get(key).is_some_and(|layout| layout.contains(*id))
         });
         self.finish_pending_terminal_opens(snap, window, cx);
+        self.advance_handoffs(snap, window, cx);
         let key = self.ws.selected.clone();
         let ids = self.workspace_ids(infos);
         if let Some(active) = self.ws.active_in(&key, &ids)
@@ -1713,6 +1727,136 @@ impl AppView {
         self.track_terminal_open(token, workspace, TerminalOpenKind::QuickTab, cx);
     }
 
+    /// Writes the brief for `request.term`, opens the target agent in a new terminal and queues
+    /// the one-line prompt for when that agent reports ready. Never presses Enter.
+    pub(crate) fn start_handoff(&mut self, request: crate::handoff::HandoffRequest, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::handoff::{self, HandoffSource, HandoffTarget};
+        let snap = self.client.snapshot();
+        let Some(entry) = snap.terminals.iter().find(|e| e.info.id == request.term && e.info.exited.is_none()) else { return };
+        let Some(status) = entry.info.agent.clone() else { return };
+        let lang = settings::language(cx);
+        let Some(command) = handoff::launch_command(request.target) else { return };
+        let resolved = handoff::resolve_target(&request.folder, &self.projects, dirs::home_dir().as_deref());
+        let terminal_text = handoff::bound_terminal_text(
+            &entry.session.recent_text(handoff::TERMINAL_READ_ROWS),
+            handoff::TERMINAL_MAX_LINES,
+            handoff::TERMINAL_MAX_BYTES,
+        );
+        let hint = self.ctx_ui.view(request.term).and_then(|view| view.transcript_path.clone());
+        let size = entry.session.size();
+        let source = HandoffSource {
+            kind: status.kind,
+            model: status.model.clone(),
+            title: status.title.clone(),
+            session_id: status.session_id.clone(),
+            cwd: entry.info.cwd.clone(),
+            prompt: status.prompt.clone(),
+            message: status.message.clone(),
+            transcript: None,
+            terminal_text: Some(terminal_text),
+        };
+        let target = HandoffTarget { dir: resolved.cwd.clone().unwrap_or_default() };
+        let note = request.note.clone();
+        let target_kind = request.target;
+        let job = cx.background_spawn(async move {
+            let mut source = source;
+            source.transcript = handoff::find_transcript(
+                source.kind,
+                source.session_id.as_deref(),
+                hint.as_deref(),
+                &handoff::TranscriptDirs::from_system(),
+            );
+            let brief = handoff::build_brief(&source, &target, Some(&note));
+            let dir = handoff::agent_prompts_dir().ok_or_else(|| "no data directory".to_owned())?;
+            handoff::write_brief(&dir, sich_orch::paths::now_ms() as u128, &brief)
+                .map_err(|err| format!("{}: {err}", dir.display()))
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = job.await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Err(err) => notifications::show_error(i18n::handoff_write_failed(lang, &err), window, cx),
+                Ok(path) => {
+                    this.next_restore_token += 1;
+                    let token = this.next_restore_token;
+                    let opened = this.client.open_command_tab(
+                        resolved.workspace.path().map(PathBuf::from), resolved.cwd.clone(), size, token, command,
+                    );
+                    if !opened {
+                        notifications::show_error(tr(lang, Tr::HandoffOpenFailed).to_owned(), window, cx);
+                        return;
+                    }
+                    this.track_terminal_open(token, resolved.workspace.clone(), TerminalOpenKind::Handoff, cx);
+                    this.pending_handoffs.push(PendingHandoff {
+                        token,
+                        term: None,
+                        kind: target_kind,
+                        line: handoff::handoff_line(&path),
+                        deadline: Instant::now() + handoff::READY_TIMEOUT,
+                        scheduled: false,
+                    });
+                    cx.spawn_in(window, async move |this, cx| {
+                        cx.background_executor().timer(handoff::READY_TIMEOUT + Duration::from_millis(1)).await;
+                        let _ = this.update_in(cx, |this, window, cx| {
+                            let snap = this.client.snapshot();
+                            this.advance_handoffs(&snap, window, cx);
+                        });
+                    }).detach();
+                }
+            });
+        }).detach();
+    }
+
+    /// Decides for every pending handoff whether to wait, schedule the paste, give up or drop it.
+    fn advance_handoffs(&mut self, snap: &Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::handoff::{Step, Tracked, handoff_step};
+        if self.pending_handoffs.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let (mut scheduled, mut expired) = (Vec::new(), Vec::new());
+        let mut index = 0;
+        while let Some(pending) = self.pending_handoffs.get_mut(index) {
+            if pending.term.is_none() {
+                pending.term = snap.terminals.iter().find(|e| e.restore_token == Some(pending.token)).map(|e| e.info.id);
+            }
+            let entry = pending.term.and_then(|id| snap.terminals.iter().find(|e| e.info.id == id));
+            let tracked = match (pending.term, entry) {
+                (None, _) => Tracked::NotYet,
+                (Some(_), None) => Tracked::Gone,
+                (Some(_), Some(e)) => Tracked::Live { exited: e.info.exited.is_some(), status: e.info.agent.as_ref() },
+            };
+            match handoff_step(tracked, pending.kind, now >= pending.deadline, pending.scheduled) {
+                Step::Wait => index += 1,
+                Step::Drop => { self.pending_handoffs.remove(index); }
+                Step::Expire => expired.push(self.pending_handoffs.remove(index).line),
+                Step::Schedule => {
+                    pending.scheduled = true;
+                    scheduled.push(pending.token);
+                    index += 1;
+                }
+            }
+        }
+        for line in expired {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(line));
+            let message = tr(settings::language(cx), Tr::HandoffTimeout).to_owned();
+            cx.defer_in(window, move |_, window, cx| notifications::show_info(message, window, cx));
+        }
+        for token in scheduled {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(crate::handoff::PASTE_DELAY).await;
+                let _ = this.update(cx, |this, cx| this.paste_handoff(token, cx));
+            }).detach();
+        }
+    }
+
+    fn paste_handoff(&mut self, token: u64, cx: &mut Context<Self>) {
+        let Some(pos) = self.pending_handoffs.iter().position(|h| h.token == token) else { return };
+        let pending = self.pending_handoffs.remove(pos);
+        if let Some(view) = pending.term.and_then(|id| self.views.get(&id)) {
+            view.update(cx, |view, cx| view.paste_text(&pending.line, cx));
+        }
+    }
+
     pub(crate) fn request_terminal_split(&mut self, target: &TerminalDrag, edge: Edge, window: &mut Window, cx: &mut Context<Self>) {
         if target.workspace != self.ws.selected { return; }
         let snap = self.client.snapshot();
@@ -1746,22 +1890,26 @@ impl AppView {
 
     fn finish_pending_terminal_opens(&mut self, snap: &Snapshot, window: &mut Window, cx: &mut Context<Self>) {
         let failures = self.client.take_failed_terminal_opens();
-        let (mut failed_split, mut failed_quick) = (false, false);
+        let (mut failed_split, mut failed_quick, mut failed_handoff) = (false, false, false);
         self.pending_terminal_opens.retain(|request| {
             if failures.contains(&request.token) {
                 match request.kind {
                     TerminalOpenKind::Split { .. } => failed_split = true,
                     TerminalOpenKind::QuickTab => failed_quick = true,
+                    TerminalOpenKind::Handoff => {
+                        failed_handoff = true;
+                        self.pending_handoffs.retain(|handoff| handoff.token != request.token);
+                    }
                 }
                 return false;
             }
             request.started.elapsed() <= RESTORE_TIMEOUT && match request.kind {
                 TerminalOpenKind::Split { target, .. } => self.terminal_layouts
                     .get(&request.workspace).is_some_and(|layout| layout.contains(target)),
-                TerminalOpenKind::QuickTab => true,
+                TerminalOpenKind::QuickTab | TerminalOpenKind::Handoff => true,
             }
         });
-        for (failed, key) in [(failed_split, Tr::TerminalSplitFailed), (failed_quick, Tr::QuickCommandOpenFailed)] {
+        for (failed, key) in [(failed_split, Tr::TerminalSplitFailed), (failed_quick, Tr::QuickCommandOpenFailed), (failed_handoff, Tr::HandoffOpenFailed)] {
             if failed {
                 let message = tr(settings::language(cx), key);
                 cx.defer_in(window, move |_, window, cx| {
@@ -1789,6 +1937,9 @@ impl AppView {
                     let mut command = TemporaryCommand::default();
                     command.observe(entry.info.exited.is_some(), sich_orch::paths::now_ms());
                     self.quick_terminals.insert(entry.info.id, command);
+                }
+                TerminalOpenKind::Handoff => {
+                    self.activate_terminal_in(key.clone(), entry.info.id, window, cx);
                 }
             }
             if self.ws.selected == *key && self.active_tab().is_none() {

@@ -30,6 +30,10 @@ pub fn show_error(message: String, window: &mut Window, cx: &mut App) {
     window.push_notification(Notification::error(message), cx);
 }
 
+pub fn show_info(message: String, window: &mut Window, cx: &mut App) {
+    window.push_notification(Notification::info(message), cx);
+}
+
 pub(crate) fn show_update(
     app: WeakEntity<AppView>,
     version: &semver::Version,

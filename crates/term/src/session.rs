@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Point, Side};
+use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
@@ -406,6 +406,18 @@ impl TermSession {
     /// True if there is a selection that covers nothing (e.g. a plain click).
     pub fn selection_is_empty(&self) -> bool {
         self.term.lock().selection.as_ref().is_some_and(|s| s.is_empty())
+    }
+
+    /// Text of the last `max_rows` grid rows (scrollback plus screen), lines joined with `\n`.
+    pub fn recent_text(&self, max_rows: usize) -> String {
+        let term = self.term.lock();
+        let bottom = term.screen_lines() as i32 - 1;
+        let top = (bottom - max_rows.max(1) as i32 + 1).max(term.topmost_line().0);
+        let text = term.bounds_to_string(
+            Point::new(Line(top), Column(0)),
+            Point::new(Line(bottom), term.last_column()),
+        );
+        strip_placeholders(&text)
     }
 
     pub fn selection_text(&self) -> Option<String> {

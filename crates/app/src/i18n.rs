@@ -601,6 +601,18 @@ pub enum Tr {
     FileReload,
     FileReadOnly,
     FileSaveFailed,
+    HandoffMenu,
+    HandoffTitle,
+    HandoffFrom,
+    HandoffAgent,
+    HandoffFolder,
+    HandoffCurrent,
+    HandoffHome,
+    HandoffChooseFolder,
+    HandoffNote,
+    HandoffSubmit,
+    HandoffOpenFailed,
+    HandoffTimeout,
 }
 
 impl Tr {
@@ -1164,6 +1176,18 @@ impl Tr {
         Tr::FileReload,
         Tr::FileReadOnly,
         Tr::FileSaveFailed,
+        Tr::HandoffMenu,
+        Tr::HandoffTitle,
+        Tr::HandoffFrom,
+        Tr::HandoffAgent,
+        Tr::HandoffFolder,
+        Tr::HandoffCurrent,
+        Tr::HandoffHome,
+        Tr::HandoffChooseFolder,
+        Tr::HandoffNote,
+        Tr::HandoffSubmit,
+        Tr::HandoffOpenFailed,
+        Tr::HandoffTimeout,
     ];
 }
 
@@ -2814,6 +2838,66 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             Ru => "Не удалось сохранить файл",
             En => "Could not save the file",
         },
+        Tr::HandoffMenu => match lang {
+            Uk => "Передати контекст іншому агенту…",
+            Ru => "Передать контекст другому агенту…",
+            En => "Hand off to another agent…",
+        },
+        Tr::HandoffTitle => match lang {
+            Uk => "Передати контекст іншому агенту",
+            Ru => "Передать контекст другому агенту",
+            En => "Hand off to another agent",
+        },
+        Tr::HandoffFrom => match lang {
+            Uk => "Від",
+            Ru => "От",
+            En => "From",
+        },
+        Tr::HandoffAgent => match lang {
+            Uk => "Агент",
+            Ru => "Агент",
+            En => "Agent",
+        },
+        Tr::HandoffFolder => match lang {
+            Uk => "Тека",
+            Ru => "Папка",
+            En => "Folder",
+        },
+        Tr::HandoffCurrent => match lang {
+            Uk => "поточна",
+            Ru => "текущая",
+            En => "current",
+        },
+        Tr::HandoffHome => match lang {
+            Uk => "Домашня тека",
+            Ru => "Домашняя папка",
+            En => "Home",
+        },
+        Tr::HandoffChooseFolder => match lang {
+            Uk => "Обрати теку…",
+            Ru => "Выбрать папку…",
+            En => "Choose folder…",
+        },
+        Tr::HandoffNote => match lang {
+            Uk => "Нотатка (необов'язково)",
+            Ru => "Заметка (необязательно)",
+            En => "Note (optional)",
+        },
+        Tr::HandoffSubmit => match lang {
+            Uk => "Передати",
+            Ru => "Передать",
+            En => "Hand off",
+        },
+        Tr::HandoffOpenFailed => match lang {
+            Uk => "Не вдалося відкрити термінал для передачі контексту.",
+            Ru => "Не удалось открыть терминал для передачи контекста.",
+            En => "Could not open a terminal for the handoff.",
+        },
+        Tr::HandoffTimeout => match lang {
+            Uk => "Агент не повідомив про готовність. Підказку для передачі скопійовано в буфер обміну.",
+            Ru => "Агент не сообщил о готовности. Подсказка для передачи скопирована в буфер обмена.",
+            En => "The agent did not report ready. The handoff prompt is in the clipboard.",
+        },
         Tr::ToastAgent => match lang {
             Uk => "Агент",
             Ru => "Агент",
@@ -4045,6 +4129,14 @@ pub fn download_progress(lang: Language, done: u64, total: u64) -> String {
         Language::En => "MB",
     };
     format!("{:.1} / {:.1} {unit} ({}%)", mb(done), mb(total), crate::updater::percent(done, total))
+}
+
+pub fn handoff_write_failed(lang: Language, err: &str) -> String {
+    match lang {
+        Language::Uk => format!("Не вдалося записати файл передачі контексту: {err}"),
+        Language::Ru => format!("Не удалось записать файл передачи контекста: {err}"),
+        Language::En => format!("Could not write the handoff brief: {err}"),
+    }
 }
 
 pub fn new_worktree_title(lang: Language, project: &str) -> String {
