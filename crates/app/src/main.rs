@@ -23,6 +23,7 @@ mod diff_view;
 mod element;
 mod file_doc;
 mod file_view;
+mod gateway_host;
 mod paste_image;
 mod phone_cli;
 #[cfg(windows)]

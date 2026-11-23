@@ -1,7 +1,8 @@
 //! Windows Firewall rule for the phone gateway's fixed UDP port.
 //!
-//! The gateway runs from a relocated copy whose path changes every build, so the rule is
-//! port-based. Status is read without elevation (`netsh`); adding/removing runs one elevated,
+//! Two rules: one by port, and one by program path for the gateway's stable copy
+//! (`gateway-host/sich.exe`); Windows asks "allow sich.exe" once per program path and only a
+//! program rule silences that. Status is read without elevation (`netsh`); adding/removing runs one elevated,
 //! hidden PowerShell (a single UAC prompt). Command building and result parsing are pure and
 //! unit-tested; nothing here is run by tests.
 
@@ -39,13 +40,26 @@ pub fn rule_name(port: u16) -> String {
     format!("Sich phone sync (UDP {port})")
 }
 
-/// Arguments of the unelevated status query.
-pub fn show_rule_args(port: u16) -> Vec<String> {
+/// Display name of the program rule for the stable gateway executable.
+pub const PROGRAM_RULE_NAME: &str = "Sich phone gateway";
+
+/// Arguments of the unelevated status query for the rule called `name`.
+pub fn show_named_rule_args(name: &str) -> Vec<String> {
     ["advfirewall", "firewall", "show", "rule"]
         .iter()
         .map(|s| s.to_string())
-        .chain(std::iter::once(format!("name={}", rule_name(port))))
+        .chain(std::iter::once(format!("name={name}")))
         .collect()
+}
+
+/// Allowed only when both the port rule and the program rule exist.
+pub fn all_present(port_rule: bool, program_rule: bool) -> bool {
+    port_rule && program_rule
+}
+
+/// Body of a PowerShell single-quoted string: quotes doubled.
+fn ps_quote(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 /// `netsh ... show rule` exits 0 when a rule matches and 1 ("No rules match") otherwise; the
@@ -54,16 +68,25 @@ pub fn rule_present(exit_code: Option<i32>) -> bool {
     exit_code == Some(0)
 }
 
-/// The script the elevated PowerShell runs. Idempotent: `Add` replaces an existing rule.
-pub fn inner_script(action: Action, port: u16) -> String {
+/// The script the elevated PowerShell runs. Idempotent: `Add` replaces existing rules. Both
+/// rules are handled in one script (one UAC prompt); `program` is the stable gateway exe.
+pub fn inner_script(action: Action, port: u16, program: &str) -> String {
     let name = rule_name(port);
+    let prog_name = PROGRAM_RULE_NAME;
+    let program = ps_quote(program);
+    let remove = format!(
+        "Remove-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue; \
+         Remove-NetFirewallRule -DisplayName '{prog_name}' -ErrorAction SilentlyContinue"
+    );
     let body = match action {
         Action::Add => format!(
-            "Remove-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue; \
+            "{remove}; \
              New-NetFirewallRule -DisplayName '{name}' -Direction Inbound -Protocol UDP -LocalPort {port} \
-             -Action Allow -Profile Any -ErrorAction Stop | Out-Null"
+             -Action Allow -Profile Any -ErrorAction Stop | Out-Null; \
+             New-NetFirewallRule -DisplayName '{prog_name}' -Direction Inbound -Protocol UDP \
+             -Program '{program}' -Action Allow -Profile Any -ErrorAction Stop | Out-Null"
         ),
-        Action::Remove => format!("Remove-NetFirewallRule -DisplayName '{name}' -ErrorAction SilentlyContinue"),
+        Action::Remove => remove,
     };
     format!("try {{ {body} }} catch {{ exit 1 }}")
 }
@@ -76,8 +99,8 @@ pub fn encode_command(script: &str) -> String {
 
 /// The unelevated wrapper: starts the inner script elevated and hidden, waits, and passes its
 /// exit code on. A dismissed UAC prompt (Win32 error 1223) becomes exit code 1223.
-pub fn outer_script(action: Action, port: u16) -> String {
-    let inner = encode_command(&inner_script(action, port));
+pub fn outer_script(action: Action, port: u16, program: &str) -> String {
+    let inner = encode_command(&inner_script(action, port, program));
     format!(
         "try {{ $p = Start-Process -FilePath powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru \
          -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{inner}'; exit $p.ExitCode }} \
@@ -87,14 +110,14 @@ pub fn outer_script(action: Action, port: u16) -> String {
     )
 }
 
-pub fn powershell_args(action: Action, port: u16) -> Vec<String> {
+pub fn powershell_args(action: Action, port: u16, program: &str) -> Vec<String> {
     vec![
         "-NoProfile".into(),
         "-NonInteractive".into(),
         "-WindowStyle".into(),
         "Hidden".into(),
         "-EncodedCommand".into(),
-        encode_command(&outer_script(action, port)),
+        encode_command(&outer_script(action, port, program)),
     ]
 }
 
@@ -107,10 +130,15 @@ pub fn outcome_from_exit(code: Option<i32>) -> Outcome {
     }
 }
 
-/// Is the rule for `port` present? Blocking (spawns `netsh`); any failure counts as absent.
+/// Are both rules present? Blocking (spawns `netsh`); any failure counts as absent.
 pub fn is_present(port: u16) -> bool {
+    let port_rule = named_rule_present(&rule_name(port));
+    all_present(port_rule, port_rule && named_rule_present(PROGRAM_RULE_NAME))
+}
+
+fn named_rule_present(name: &str) -> bool {
     let status = Command::new("netsh")
-        .args(show_rule_args(port))
+        .args(show_named_rule_args(name))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -121,8 +149,11 @@ pub fn is_present(port: u16) -> bool {
 
 /// Adds or removes the rule through one UAC prompt. Blocking until the prompt is answered.
 pub fn run_elevated(action: Action, port: u16) -> Outcome {
+    let Some(program) = crate::gateway_host::stable_exe_path() else {
+        return Outcome::Failed("no local data dir".into());
+    };
     let status = Command::new("powershell.exe")
-        .args(powershell_args(action, port))
+        .args(powershell_args(action, port, &program.to_string_lossy()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -138,6 +169,35 @@ pub fn run_elevated(action: Action, port: u16) -> Outcome {
 mod tests {
     use super::*;
 
+    const PROG: &str = r"C:\Data\sich\gateway-host\sich.exe";
+
+    #[test]
+    fn program_rule_uses_the_stable_path_and_both_rules_are_removed() {
+        let add = inner_script(Action::Add, 6769, PROG);
+        assert!(add.contains(r"-Program 'C:\Data\sich\gateway-host\sich.exe'"));
+        let create = add.find("New-NetFirewallRule -DisplayName 'Sich phone gateway'").unwrap();
+        let remove = add.find("Remove-NetFirewallRule -DisplayName 'Sich phone gateway'").unwrap();
+        assert!(remove < create);
+        assert!(add.contains("-Protocol UDP") && add.contains("-Direction Inbound"));
+        let rm = inner_script(Action::Remove, 6769, PROG);
+        assert!(rm.contains("Remove-NetFirewallRule -DisplayName 'Sich phone gateway'"));
+        assert!(rm.contains("Remove-NetFirewallRule -DisplayName 'Sich phone sync (UDP 6769)'"));
+        assert!(!rm.contains("New-NetFirewallRule"));
+        // A quote in the path cannot break out of the string.
+        assert!(inner_script(Action::Add, 1, r"C:\o'x\sich.exe").contains(r"-Program 'C:\o''x\sich.exe'"));
+    }
+
+    #[test]
+    fn allowed_needs_both_rules() {
+        assert!(all_present(true, true));
+        assert!(!all_present(true, false));
+        assert!(!all_present(false, true));
+        assert_eq!(
+            show_named_rule_args(PROGRAM_RULE_NAME),
+            ["advfirewall", "firewall", "show", "rule", "name=Sich phone gateway"]
+        );
+    }
+
     #[test]
     fn rule_name_matches_the_spec() {
         assert_eq!(rule_name(6769), "Sich phone sync (UDP 6769)");
@@ -146,7 +206,7 @@ mod tests {
     #[test]
     fn show_command_is_netsh_by_name() {
         assert_eq!(
-            show_rule_args(6769),
+            show_named_rule_args(&rule_name(6769)),
             ["advfirewall", "firewall", "show", "rule", "name=Sich phone sync (UDP 6769)"]
         );
     }
@@ -160,7 +220,7 @@ mod tests {
 
     #[test]
     fn add_script_replaces_then_creates_an_inbound_udp_allow_rule() {
-        let s = inner_script(Action::Add, 6769);
+        let s = inner_script(Action::Add, 6769, PROG);
         let remove = s.find("Remove-NetFirewallRule -DisplayName 'Sich phone sync (UDP 6769)'").unwrap();
         let create = s.find("New-NetFirewallRule -DisplayName 'Sich phone sync (UDP 6769)'").unwrap();
         assert!(remove < create);
@@ -171,7 +231,7 @@ mod tests {
 
     #[test]
     fn remove_script_only_removes() {
-        let s = inner_script(Action::Remove, 7000);
+        let s = inner_script(Action::Remove, 7000, PROG);
         assert!(s.contains("Remove-NetFirewallRule -DisplayName 'Sich phone sync (UDP 7000)'"));
         assert!(!s.contains("New-NetFirewallRule"));
     }
@@ -187,13 +247,13 @@ mod tests {
 
     #[test]
     fn outer_script_elevates_hidden_and_reports_cancel() {
-        let s = outer_script(Action::Add, 6769);
+        let s = outer_script(Action::Add, 6769, PROG);
         assert!(s.contains("-Verb RunAs") && s.contains("-WindowStyle Hidden") && s.contains("-Wait"));
-        assert!(s.contains(&encode_command(&inner_script(Action::Add, 6769))));
+        assert!(s.contains(&encode_command(&inner_script(Action::Add, 6769, PROG))));
         assert!(s.contains("1223"));
-        let args = powershell_args(Action::Remove, 6769);
+        let args = powershell_args(Action::Remove, 6769, PROG);
         assert_eq!(args[4], "-EncodedCommand");
-        assert_eq!(args[5], encode_command(&outer_script(Action::Remove, 6769)));
+        assert_eq!(args[5], encode_command(&outer_script(Action::Remove, 6769, PROG)));
         // Encoded, so no quoting problems on the command line.
         assert!(args[5].chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c)));
     }

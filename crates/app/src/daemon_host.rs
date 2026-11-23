@@ -154,7 +154,7 @@ fn select_path(source: &Path, copy: impl FnOnce() -> anyhow::Result<PathBuf>) ->
     })
 }
 
-fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
+pub(crate) fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
     let (a, b) = (File::open(a)?, File::open(b)?);
     if a.metadata()?.len() != b.metadata()?.len() {
         return Ok(false);

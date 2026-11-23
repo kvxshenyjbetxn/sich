@@ -8,6 +8,8 @@ use futures::SinkExt as _;
 use sich_proto::{ClientMsg, encode, frame_codec};
 use tokio_util::codec::Framed;
 
+use crate::gateway_host;
+
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `sich daemon`: runs the daemon in this process until `Shutdown`.
@@ -100,12 +102,27 @@ pub fn run_gateway(base: &str, takeover: bool) -> anyhow::Result<()> {
 /// The GUI calls this too.
 pub async fn ensure_gateway(base: &str) -> anyhow::Result<()> {
     let own = sich_app::build_id();
-    let takeover = match sich_gateway::ControlClient::connect_as(base, own).await {
+    let data_dir = sich_daemon::data_local_dir();
+    let stable = gateway_host::plan(gateway_host::no_relocate(), data_dir.as_deref());
+    let mut takeover = false;
+    match sich_gateway::ControlClient::connect_as(base, own).await {
         Ok(running) if running.gateway_build_id() == own => return Ok(()),
-        Ok(_) => true,
-        Err(_) => false,
-    };
-    spawn_detached_gateway(base, takeover)?;
+        Ok(mut running) => {
+            if stable.is_some() {
+                // The stable copy is locked while a gateway runs from it: stop the old one first.
+                running.shutdown().await?;
+                drop(running);
+                wait_gateway_gone(base, own).await?;
+            } else {
+                takeover = true;
+            }
+        }
+        Err(_) => {}
+    }
+    match stable {
+        Some(target) => spawn_stable_gateway(base, &target).await?,
+        None => spawn_detached_gateway(base, takeover)?,
+    }
     let limit = if takeover { START_TIMEOUT * 2 } else { START_TIMEOUT };
     let deadline = Instant::now() + limit;
     loop {
@@ -118,6 +135,39 @@ pub async fn ensure_gateway(base: &str) -> anyhow::Result<()> {
             anyhow::bail!("gateway did not start within {} s", limit.as_secs());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Waits (up to 5 s) until nothing answers on the gateway control pipe any more.
+async fn wait_gateway_gone(base: &str, own: &str) -> anyhow::Result<()> {
+    let deadline = Instant::now() + START_TIMEOUT;
+    while sich_gateway::ControlClient::connect_as(base, own).await.is_ok() {
+        if Instant::now() >= deadline {
+            anyhow::bail!("the previous gateway did not stop within {} s", START_TIMEOUT.as_secs());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
+/// Copies this build to the stable gateway path and runs it from there. If the copy fails the
+/// gateway still starts from the per-build copy (the firewall just asks again).
+async fn spawn_stable_gateway(base: &str, target: &std::path::Path) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("locate current executable")?;
+    let (src, dst) = (exe.clone(), target.to_path_buf());
+    let installed = tokio::task::spawn_blocking(move || gateway_host::install(&src, &dst)).await?;
+    match installed {
+        Ok(()) => match spawn_detached_args(target, &["gateway"], Some(base)) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                tracing::warn!("could not launch the stable gateway: {err:#}");
+                spawn_detached_gateway(base, false)
+            }
+        },
+        Err(err) => {
+            tracing::warn!("could not install the stable gateway executable: {err}");
+            spawn_detached_gateway(base, false)
+        }
     }
 }
 
