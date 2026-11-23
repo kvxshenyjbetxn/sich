@@ -24,6 +24,7 @@ use sich_orch::auto_close::{AutoClose, countdown_seconds, due_for_close};
 use sich_proto::{GroupId, GroupInfo, PROTO_VERSION, ProjectId, ProjectInfo, SubagentActivityKey, TermId, TerminalInfo};
 
 use crate::agent_badge::{BadgeKind, kind_of, should_flash, should_mark_seen};
+use crate::context_panel::{self, ContextUi};
 use crate::daemon_client::{ConnStatus, DEFAULT_COLS, DEFAULT_ROWS, DaemonPool, RestartResult, RestoreData, Snapshot};
 use crate::diff_view::DiffView;
 use crate::git_panel::{DEFAULT_RIGHT_W, GitPanel, GitPanelEvent, MIN_RIGHT_W, clamp_right_w};
@@ -139,6 +140,7 @@ pub struct AppView {
     /// Terminal that last received keyboard focus.
     focused: Option<TermId>,
     pub(crate) usage_bar: crate::usage_bar::UsageBar,
+    pub(crate) ctx_ui: ContextUi,
     /// Whether the window has focus (kept by the activation observer and `sync`).
     window_active: bool,
     /// Native window handle for the taskbar flash (Windows).
@@ -336,6 +338,7 @@ impl AppView {
             shown_error: None,
             focused: None,
             usage_bar: crate::usage_bar::UsageBar::default(),
+            ctx_ui: ContextUi::default(),
             window_active: false,
             hwnd: None,
             attention: HashMap::new(),
@@ -493,6 +496,7 @@ impl AppView {
     /// window-bounds tracking for the session.
     pub fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.usage_bar.watch(window, cx);
+        ContextUi::watch(window, cx);
         Self::start_update_checks(window, cx);
         cx.observe(&self.git_panel, |this, panel, cx| {
             let panel = panel.read(cx);
@@ -1957,17 +1961,51 @@ impl AppView {
         v_flex().flex_1().min_w_0().h_full().child(tab_bar).child(content)
     }
 
+    /// Live Claude terminals (for the context polling and panel).
+    pub(crate) fn ctx_targets(&self) -> Vec<crate::claude_ctx::Target> {
+        let infos: Vec<TerminalInfo> = self.client.snapshot().terminals.into_iter().map(|t| t.info).collect();
+        context_panel::claude_targets(&infos, |id| self.client.owner(id))
+    }
+
+    /// Status-bar click: open the right panel on the Context tab.
+    pub(crate) fn show_context_tab(&mut self, cx: &mut Context<Self>) {
+        self.right_panel.open = true;
+        self.right_panel.tab = RightTab::Context;
+        self.sync_right_worktree(cx);
+        self.sidebar_changed(cx);
+    }
+
+    fn render_context_panel(&self, lang: i18n::Language, cx: &Context<Self>) -> gpui_kit::AnyElement {
+        let key = self.ws.selected.clone();
+        let targets: Vec<_> = self.ctx_targets().into_iter().filter(|t| key.contains(t.worktree.as_deref())).collect();
+        let ids: Vec<TermId> = targets.iter().map(|t| t.key).collect();
+        let active = self.ws.active_in(&key, &ids);
+        let input = context_panel::PanelInput {
+            targets,
+            key,
+            focused: self.focused,
+            active,
+            now_ms: crate::claude_ctx::now_ms(),
+        };
+        context_panel::render_panel(&self.ctx_ui, input, lang, cx)
+    }
+
     fn render_right_panel(&self, width: f32, lang: i18n::Language, cx: &Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
         let pr_visible = self.pr_tab_visible(cx);
         let active_tab = self.right_panel.tab.effective(pr_visible);
         let glyph = self.ws.selected.path().and_then(|path| self.pr_store.read(cx).glyph_for(path));
         // Both tabs are views of the same panel entity (it needs the status for either).
-        let pane = self.git_panel.clone().into_any_element();
-        let tabs = RightTab::ALL.iter().copied().filter(|&tab| tab == RightTab::Git || pr_visible).map(|tab| {
+        let pane = if active_tab == RightTab::Context {
+            self.render_context_panel(lang, cx)
+        } else {
+            self.git_panel.clone().into_any_element()
+        };
+        let tabs = RightTab::ALL.iter().copied().filter(|&tab| tab != RightTab::Pr || pr_visible).map(|tab| {
             let (id, icon, label) = match tab {
                 RightTab::Git => ("right-tab-git", Ic::GitBranch, Tr::Git),
                 RightTab::Pr => ("right-tab-pr", Ic::GitPullRequest, Tr::PrTabLabel),
+                RightTab::Context => ("right-tab-context", Ic::Layers, Tr::CtxTab),
             };
             let active = active_tab == tab;
             let dot = glyph
@@ -2047,7 +2085,13 @@ impl AppView {
             .border_color(theme.status_bar_border)
             .text_size(px(12.))
             .text_color(theme.muted_foreground)
-            .child(div().flex_1().min_w_0().truncate().child(indicator))
+            .child(
+                h_flex().flex_1().min_w_0().gap_2().items_center()
+                    .child(div().min_w_0().truncate().child(indicator))
+                    .children(self.focused.and_then(|id| self.ctx_ui.view(id)).map(|view| {
+                        context_panel::status_item(view, lang, crate::claude_ctx::now_ms(), &theme, cx)
+                    })),
+            )
             .children(self.usage_bar.render(lang, cx))
             .child(
                 Button::new("open-settings")

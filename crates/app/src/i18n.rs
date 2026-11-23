@@ -549,6 +549,31 @@ pub enum Tr {
     NotesLine,
     NotesLines,
     // ---- end notes ----
+    // ---- Claude context panel ----
+    CtxTab,
+    CtxAuto,
+    CtxUsed,
+    CtxTokens,
+    CtxUpdatedAgo,
+    CtxNoClaude,
+    CtxWaiting,
+    CtxNoMod,
+    CtxSubagents,
+    CtxMcp,
+    CtxMemory,
+    CtxSkills,
+    CtxSession,
+    CtxCost,
+    CtxDuration,
+    CtxApiDuration,
+    CtxLines,
+    CtxCache,
+    CtxCacheWarm,
+    CtxCacheCold,
+    CtxSessionId,
+    CtxRunning,
+    CtxDone,
+    CtxFailed,
 }
 
 impl Tr {
@@ -1061,6 +1086,30 @@ impl Tr {
         Tr::NotesLine,
         Tr::NotesLines,
         // ---- end notes ----
+        Tr::CtxTab,
+        Tr::CtxAuto,
+        Tr::CtxUsed,
+        Tr::CtxTokens,
+        Tr::CtxUpdatedAgo,
+        Tr::CtxNoClaude,
+        Tr::CtxWaiting,
+        Tr::CtxNoMod,
+        Tr::CtxSubagents,
+        Tr::CtxMcp,
+        Tr::CtxMemory,
+        Tr::CtxSkills,
+        Tr::CtxSession,
+        Tr::CtxCost,
+        Tr::CtxDuration,
+        Tr::CtxApiDuration,
+        Tr::CtxLines,
+        Tr::CtxCache,
+        Tr::CtxCacheWarm,
+        Tr::CtxCacheCold,
+        Tr::CtxSessionId,
+        Tr::CtxRunning,
+        Tr::CtxDone,
+        Tr::CtxFailed,
     ];
 }
 
@@ -3516,6 +3565,126 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
             En => "lines",
         },
         // ---- end notes ----
+        Tr::CtxTab => match lang {
+            Uk => "Контекст",
+            Ru => "Контекст",
+            En => "Context",
+        },
+        Tr::CtxAuto => match lang {
+            Uk => "Авто",
+            Ru => "Авто",
+            En => "Auto",
+        },
+        Tr::CtxUsed => match lang {
+            Uk => "використано",
+            Ru => "использовано",
+            En => "used",
+        },
+        Tr::CtxTokens => match lang {
+            Uk => "токенів",
+            Ru => "токенов",
+            En => "tokens",
+        },
+        Tr::CtxUpdatedAgo => match lang {
+            Uk => "оновлено {t} тому",
+            Ru => "обновлено {t} назад",
+            En => "updated {t} ago",
+        },
+        Tr::CtxNoClaude => match lang {
+            Uk => "У цьому терміналі немає сесії Claude",
+            Ru => "В этом терминале нет сессии Claude",
+            En => "No Claude session in this terminal",
+        },
+        Tr::CtxWaiting => match lang {
+            Uk => "Очікування даних від Claude…",
+            Ru => "Ожидание данных от Claude…",
+            En => "Waiting for data from Claude…",
+        },
+        Tr::CtxNoMod => match lang {
+            Uk => "Детальна розбивка потребує мод контексту Sich (Налаштування)",
+            Ru => "Подробная разбивка требует мод контекста Sich (Настройки)",
+            En => "Detailed breakdown needs the Sich context mod (Settings)",
+        },
+        Tr::CtxSubagents => match lang {
+            Uk => "Субагенти",
+            Ru => "Субагенты",
+            En => "Subagents",
+        },
+        Tr::CtxMcp => match lang {
+            Uk => "Інструменти MCP",
+            Ru => "Инструменты MCP",
+            En => "MCP tools",
+        },
+        Tr::CtxMemory => match lang {
+            Uk => "Файли пам'яті",
+            Ru => "Файлы памяти",
+            En => "Memory files",
+        },
+        Tr::CtxSkills => match lang {
+            Uk => "Навички",
+            Ru => "Навыки",
+            En => "Skills",
+        },
+        Tr::CtxSession => match lang {
+            Uk => "Сесія",
+            Ru => "Сессия",
+            En => "Session",
+        },
+        Tr::CtxCost => match lang {
+            Uk => "Вартість",
+            Ru => "Стоимость",
+            En => "Cost",
+        },
+        Tr::CtxDuration => match lang {
+            Uk => "Тривалість",
+            Ru => "Длительность",
+            En => "Duration",
+        },
+        Tr::CtxApiDuration => match lang {
+            Uk => "Час API",
+            Ru => "Время API",
+            En => "API time",
+        },
+        Tr::CtxLines => match lang {
+            Uk => "Рядки",
+            Ru => "Строки",
+            En => "Lines",
+        },
+        Tr::CtxCache => match lang {
+            Uk => "Кеш промптів",
+            Ru => "Кеш промптов",
+            En => "Prompt cache",
+        },
+        Tr::CtxCacheWarm => match lang {
+            Uk => "теплий",
+            Ru => "тёплый",
+            En => "warm",
+        },
+        Tr::CtxCacheCold => match lang {
+            Uk => "холодний",
+            Ru => "холодный",
+            En => "cold",
+        },
+        Tr::CtxSessionId => match lang {
+            Uk => "ID сесії",
+            Ru => "ID сессии",
+            En => "Session ID",
+        },
+        Tr::CtxRunning => match lang {
+            Uk => "виконується",
+            Ru => "выполняется",
+            En => "running",
+        },
+        Tr::CtxDone => match lang {
+            Uk => "готово",
+            Ru => "готово",
+            En => "done",
+        },
+        Tr::CtxFailed => match lang {
+            Uk => "помилка",
+            Ru => "ошибка",
+            En => "failed",
+        },
     }
 }
 
