@@ -58,17 +58,18 @@ pub fn worktree_target(
     home: &Path,
 ) -> PathBuf {
     let repo: PathBuf = project.file_name().map(PathBuf::from).unwrap_or_else(|| "repo".into());
-    let shared = |root: &Path| root.join(&repo).join(name);
+    // Branch names may contain separators (`feat/x`): the folder never nests.
+    let folder = name.replace(['/', '\\'], "-");
+    let shared = |root: &Path| root.join(&repo).join(&folder);
     if let Some(root) = env_root {
         return shared(root);
     }
     let shared_default = || shared(&home.join("sich").join("worktrees"));
     match location {
         WorktreeLocation::Shared => shared_default(),
-        WorktreeLocation::Inside => project.join(".worktrees").join(name),
+        WorktreeLocation::Inside => project.join(".worktrees").join(&folder),
         WorktreeLocation::Sibling => match project.parent().filter(|p| !p.as_os_str().is_empty()) {
             Some(parent) if project.file_name().is_some() => {
-                let folder = name.replace(['/', '\\'], "-");
                 parent.join(format!("{}-{folder}", repo.to_string_lossy()))
             }
             _ => shared_default(),
@@ -128,9 +129,15 @@ mod tests {
     }
 
     #[test]
-    fn inside_target_is_nested() {
+    fn inside_target_sanitizes_separators() {
         let t = worktree_target(Path::new("/dev/game"), "a/b", WorktreeLocation::Inside, None, Path::new("/h"));
-        assert_eq!(t, Path::new("/dev/game").join(".worktrees").join("a/b"));
+        assert_eq!(t, Path::new("/dev/game").join(".worktrees").join("a-b"));
+    }
+
+    #[test]
+    fn shared_target_sanitizes_separators() {
+        let t = worktree_target(Path::new("/dev/game"), "feat/x\\y", WorktreeLocation::Shared, None, Path::new("/h"));
+        assert_eq!(t, Path::new("/h").join("sich").join("worktrees").join("game").join("feat-x-y"));
     }
 
     #[test]
@@ -143,7 +150,7 @@ mod tests {
     fn env_root_overrides_every_location() {
         for loc in [WorktreeLocation::Sibling, WorktreeLocation::Inside, WorktreeLocation::Shared] {
             let t = worktree_target(Path::new("/dev/game"), "f/x", loc, Some(Path::new("/r")), Path::new("/h"));
-            assert_eq!(t, Path::new("/r").join("game").join("f/x"));
+            assert_eq!(t, Path::new("/r").join("game").join("f-x"));
         }
     }
 

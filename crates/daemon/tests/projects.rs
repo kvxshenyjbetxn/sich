@@ -151,7 +151,7 @@ async fn git_project_and_worktree_lifecycle() {
     send(c, ClientMsg::CreateWorktree { project_id: pid, name: "feat-a".into(), base: None }).await;
     let msg = expect_failed(c).await;
     assert!(!msg.is_empty());
-    send(c, ClientMsg::CreateWorktree { project_id: pid, name: "a/b".into(), base: None }).await;
+    send(c, ClientMsg::CreateWorktree { project_id: pid, name: "a/../b".into(), base: None }).await;
     expect_failed(c).await;
 
     send(
@@ -508,5 +508,56 @@ async fn worktree_location_inside_uses_dot_worktrees_and_excludes_it() {
     // The main worktree does not see .worktrees as untracked.
     let out = Command::new("git").arg("-C").arg(&repo).args(["status", "--porcelain"]).output().unwrap();
     assert!(String::from_utf8_lossy(&out.stdout).trim().is_empty());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_with_slash_in_branch_name_gets_a_flat_folder() {
+    let _guard = SERIAL.lock().await;
+    for (tag, setting, parent_is_repo) in [("wt-sl-sib", None, false), ("wt-sl-in", Some("inside"), true)] {
+        let (repo, wt, tmp) = create_with_location(tag, setting, "feat/x").await;
+        assert!(wt.is_dir());
+        let expected = if parent_is_repo {
+            repo.join(".worktrees").join("feat-x")
+        } else {
+            repo.parent().unwrap().join("myrepo-feat-x")
+        };
+        assert!(sich_path_eq(&wt, &expected), "{wt:?}");
+        let out = Command::new("git").arg("-C").arg(&wt).args(["branch", "--show-current"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "feat/x");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn worktree_at_a_given_base_commit_with_slash_name() {
+    let _guard = SERIAL.lock().await;
+    let tmp = temp_dir("wt-sl-base");
+    let (cfg, wt_root) = (tmp.join("cfg"), tmp.join("wt"));
+    // SAFETY: serialized by SERIAL; no other thread in this process reads these concurrently.
+    unsafe {
+        std::env::set_var("SICH_CONFIG_DIR", &cfg);
+        std::env::set_var("SICH_WORKTREE_ROOT", &wt_root);
+    }
+    let repo = init_repo(&tmp);
+    git(&repo, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "second"]);
+    let first = Command::new("git").arg("-C").arg(&repo).args(["rev-parse", "HEAD~1"]).output().unwrap();
+    let first = String::from_utf8_lossy(&first.stdout).trim().to_string();
+    let mut h = start("wt-sl-base").await;
+    let c = &mut h.conn;
+    send(c, ClientMsg::AddProject { path: repo.clone(), group: None }).await;
+    let pid = expect_projects(c).await[0].id;
+    send(c, ClientMsg::CreateWorktree { project_id: pid, name: "feat/y".into(), base: Some(first.clone()) }).await;
+    let projects = expect_projects(c).await;
+    let wt = projects[0].worktrees.iter().find(|w| w.branch.as_deref() == Some("feat/y")).expect("listed");
+    assert!(sich_path_eq(&wt.path, &wt_root.join("myrepo").join("feat-y")), "{:?}", wt.path);
+    assert!(first.starts_with(&wt.head));
+    // Unsafe names are still rejected.
+    for bad in ["a/../b", "-x", "a//b", r"a\b", "/x", "x/"] {
+        send(c, ClientMsg::CreateWorktree { project_id: pid, name: bad.into(), base: None }).await;
+        let message = expect_failed(c).await;
+        assert!(message.contains("Invalid"), "{bad}: {message}");
+    }
+    h.stop().await;
     let _ = std::fs::remove_dir_all(&tmp);
 }

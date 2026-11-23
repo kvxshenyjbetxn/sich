@@ -58,6 +58,7 @@ mod win_toast;
 mod workspace;
 mod workspace_tabs;
 mod worktree_dialogs;
+mod worktree_from_pr;
 pub mod worktree_visibility;
 
 use gpui_kit::{

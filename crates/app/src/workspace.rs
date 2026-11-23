@@ -195,6 +195,8 @@ pub fn match_pending_worktree<'a>(
     }
     let sep = if cfg!(windows) { '\\' } else { '/' };
     let suffix = format!("{sep}{want}");
+    // Branch names like `feat/x` live in a flat folder (`feat-x`).
+    let flat_suffix = format!("{sep}{}", want.replace(['/', '\\'], "-"));
     let project = projects.iter().find(|p| p.id == pending.project_id)?;
     project
         .worktrees
@@ -202,7 +204,7 @@ pub fn match_pending_worktree<'a>(
         .filter(|w| !w.is_main && w.branch.as_deref() == Some(&pending.name))
         .find(|w| {
             let have = normalize_path(&w.path);
-            have == want || have.ends_with(&suffix)
+            have == want || have.ends_with(&suffix) || have.ends_with(&flat_suffix)
         })
         .map(|w| (project.path.as_path(), w.path.as_path()))
 }
@@ -331,6 +333,20 @@ mod tests {
         assert_eq!(cycle_id(&[1, 2, 3], Some(1), -1), Some(3));
         assert_eq!(cycle_id(&[1, 2, 3], None, 1), Some(2));
         assert_eq!(cycle_id(&[], Some(1), 1), None);
+    }
+
+    #[test]
+    fn pending_worktree_with_slash_name_matches_the_flat_folder() {
+        let pending = PendingWorktree { project_id: 7, name: "feat/x".into() };
+        let named = |path| WorktreeInfo { branch: Some(pending.name.clone()), ..wt(path, false) };
+        let projects = vec![project(7, vec![wt("/w/app", true), named("/w/app-wt/feat-x")])];
+        assert_eq!(
+            match_pending_worktree(&pending, &projects),
+            Some((projects[0].path.as_path(), Path::new("/w/app-wt/feat-x")))
+        );
+        // A different branch in that folder is not the new worktree.
+        let other = vec![project(7, vec![WorktreeInfo { branch: Some("feat-x".into()), ..wt("/w/app-wt/feat-x", false) }])];
+        assert_eq!(match_pending_worktree(&pending, &other), None);
     }
 
     #[test]

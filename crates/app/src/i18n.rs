@@ -475,6 +475,19 @@ pub enum Tr {
     // ---- end compare ----
 
     // ---- prwt keys: append below ----
+    PrwtModeBranch,
+    PrwtModePr,
+    PrwtFilter,
+    PrwtNumberLabel,
+    PrwtNumberHint,
+    PrwtLoading,
+    PrwtEmpty,
+    PrwtNoMatches,
+    PrwtNoGithub,
+    PrwtDraft,
+    PrwtFetching,
+    PrwtInvalidInput,
+    PrwtWrongRepo,
     // ---- end prwt ----
 
     // ---- notes keys: append below ----
@@ -917,6 +930,19 @@ impl Tr {
         // ---- end compare ----
 
         // ---- prwt keys: append below ----
+        Tr::PrwtModeBranch,
+        Tr::PrwtModePr,
+        Tr::PrwtFilter,
+        Tr::PrwtNumberLabel,
+        Tr::PrwtNumberHint,
+        Tr::PrwtLoading,
+        Tr::PrwtEmpty,
+        Tr::PrwtNoMatches,
+        Tr::PrwtNoGithub,
+        Tr::PrwtDraft,
+        Tr::PrwtFetching,
+        Tr::PrwtInvalidInput,
+        Tr::PrwtWrongRepo,
         // ---- end prwt ----
 
         // ---- notes keys: append below ----
@@ -3022,6 +3048,71 @@ pub fn tr(lang: Language, key: Tr) -> &'static str {
         // ---- end compare ----
 
         // ---- prwt keys: append below ----
+        Tr::PrwtModeBranch => match lang {
+            Uk => "Нова гілка",
+            Ru => "Новая ветка",
+            En => "New branch",
+        },
+        Tr::PrwtModePr => match lang {
+            Uk => "З pull request",
+            Ru => "Из pull request",
+            En => "From pull request",
+        },
+        Tr::PrwtFilter => match lang {
+            Uk => "Фільтр pull request…",
+            Ru => "Фильтр pull request…",
+            En => "Filter pull requests…",
+        },
+        Tr::PrwtNumberLabel => match lang {
+            Uk => "Номер PR або посилання",
+            Ru => "Номер PR или ссылка",
+            En => "PR number or URL",
+        },
+        Tr::PrwtNumberHint => match lang {
+            Uk => "123 або https://github.com/…/pull/123",
+            Ru => "123 или https://github.com/…/pull/123",
+            En => "123 or https://github.com/…/pull/123",
+        },
+        Tr::PrwtLoading => match lang {
+            Uk => "Завантаження pull request…",
+            Ru => "Загрузка pull request…",
+            En => "Loading pull requests…",
+        },
+        Tr::PrwtEmpty => match lang {
+            Uk => "Немає відкритих pull request.",
+            Ru => "Нет открытых pull request.",
+            En => "No open pull requests.",
+        },
+        Tr::PrwtNoMatches => match lang {
+            Uk => "Нічого не знайдено.",
+            Ru => "Ничего не найдено.",
+            En => "No matches.",
+        },
+        Tr::PrwtNoGithub => match lang {
+            Uk => "Проєкт не має GitHub-репозиторію (remote).",
+            Ru => "У проекта нет GitHub-репозитория (remote).",
+            En => "This project has no GitHub remote.",
+        },
+        Tr::PrwtDraft => match lang {
+            Uk => "Чернетка",
+            Ru => "Черновик",
+            En => "Draft",
+        },
+        Tr::PrwtFetching => match lang {
+            Uk => "Отримання pull request…",
+            Ru => "Получение pull request…",
+            En => "Fetching pull request…",
+        },
+        Tr::PrwtInvalidInput => match lang {
+            Uk => "Введіть номер PR (123) або посилання на pull request.",
+            Ru => "Введите номер PR (123) или ссылку на pull request.",
+            En => "Enter a PR number (123) or a pull request URL.",
+        },
+        Tr::PrwtWrongRepo => match lang {
+            Uk => "Цей pull request належить іншому репозиторію.",
+            Ru => "Этот pull request принадлежит другому репозиторию.",
+            En => "This pull request belongs to another repository.",
+        },
         // ---- end prwt ----
 
         // ---- notes keys: append below ----

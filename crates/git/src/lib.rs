@@ -5,6 +5,7 @@ pub mod forge;
 mod diff;
 mod history;
 mod mutation;
+pub mod pr_checkout;
 mod runner;
 pub mod scheduler;
 mod sequencer;
