@@ -40,13 +40,20 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     }
 }
 
-/// Image paths first, then the text, separated by single spaces.
+/// Image paths first, then the text. Bracketed agents get one paste per part (a paste that is
+/// just a path becomes an attachment); others get the parts joined by single spaces.
 pub fn plan(text: &str, image_paths: &[String], agent: Option<AgentKind>, submit: bool) -> Plan {
     let mut parts: Vec<String> = image_paths.iter().map(|p| path_text(p)).collect();
     if !text.is_empty() {
         parts.push(text.to_string());
     }
-    let payload = if parts.is_empty() { Vec::new() } else { paste_bytes(&parts.join(" "), force_bracketed(agent)) };
+    let payload = if parts.is_empty() {
+        Vec::new()
+    } else if force_bracketed(agent) {
+        parts.iter().flat_map(|p| paste_bytes(p, true)).collect()
+    } else {
+        paste_bytes(&parts.join(" "), false)
+    };
     Plan { payload, submit }
 }
 
@@ -81,6 +88,18 @@ mod tests {
         let imgs = vec!["C:\\Temp\\a.png".to_string(), "C:\\My Temp\\b.png".to_string()];
         assert_eq!(plan("look", &imgs, None, false).payload, b"C:\\Temp\\a.png \"C:\\My Temp\\b.png\" look");
         assert_eq!(plan("", &imgs, None, false).payload, b"C:\\Temp\\a.png \"C:\\My Temp\\b.png\"");
+    }
+
+    /// Claude Code turns a paste into an `[Image #N]` attachment only when the paste is just the
+    /// path, so each image gets its own bracketed paste and the text a separate one.
+    #[test]
+    fn bracketed_agents_get_one_paste_per_image_then_the_text() {
+        let imgs = vec!["C:\\Temp\\a.png".to_string(), "C:\\My Temp\\b.png".to_string()];
+        assert_eq!(
+            plan("look", &imgs, Some(AgentKind::Claude), false).payload,
+            b"\x1b[200~C:\\Temp\\a.png\x1b[201~\x1b[200~\"C:\\My Temp\\b.png\"\x1b[201~\x1b[200~look\x1b[201~"
+        );
+        assert_eq!(plan("", &imgs[..1], Some(AgentKind::Codex), false).payload, b"\x1b[200~C:\\Temp\\a.png\x1b[201~");
     }
 
     #[test]
