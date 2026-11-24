@@ -2282,12 +2282,12 @@ impl AppView {
                 .as_ref()
                 .filter(|_| tab == RightTab::Pr)
                 .map(|glyph| div().flex_shrink_0().size(px(6.)).rounded_full().bg(tone_color(glyph.tone, theme)));
+            let tip = tr(lang, label);
             h_flex().id(id).h_full().px_3().gap_1().items_center().cursor_pointer().border_b_2()
                 .border_color(if active { theme.primary } else { theme.primary.opacity(0.) })
                 .bg(if active { theme.sidebar } else { theme.tab_bar })
-                .text_size(px(12.5))
+                .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
                 .child(Icon::new(icon).size(px(14.)))
-                .child(tr(lang, label))
                 .children(dot)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.right_panel.tab != tab {
