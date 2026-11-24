@@ -356,11 +356,16 @@ textarea:focus {
   background: var(--agent-waiting);
 }
 .term-row {
-  padding-left: 40px;
+  width: calc(100% - 40px);
+  margin: 3px 8px 3px 32px;
+  padding-left: 8px;
   min-height: 48px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
 }
 .term-row.active {
   background: var(--active);
+  border-color: color-mix(in srgb, var(--muted) 45%, transparent);
 }
 .term-row.dim {
   opacity: 0.5;
