@@ -1,5 +1,6 @@
 //! Link detection in the terminal grid: OSC 8 hyperlinks and plain-text URLs.
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use alacritty_terminal::grid::Dimensions as _;
@@ -7,6 +8,8 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::Term;
 use alacritty_terminal::term::cell::Flags;
 use regex::Regex;
+
+use crate::path_links::{PathCandidate, PathKind, extract_paths};
 
 /// Cells `c0..c1` of one viewport row.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -16,11 +19,22 @@ pub struct Span {
     pub c1: usize,
 }
 
+/// What a link points at.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum LinkTarget {
+    Url(String),
+    /// An existing file or folder (absolute path); `line` is kept for future use.
+    Path { path: PathBuf, kind: PathKind, line: Option<u32> },
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Link {
-    pub url: String,
+    pub target: LinkTarget,
     pub spans: Vec<Span>,
 }
+
+/// Resolves a path candidate to an existing file/folder (`None` = not a link).
+pub type PathResolver<'a> = &'a mut dyn FnMut(&PathCandidate) -> Option<(PathBuf, PathKind)>;
 
 /// Max number of wrapped rows joined above/below the hovered row.
 const MAX_WRAP: usize = 8;
@@ -78,8 +92,15 @@ pub fn extract_urls(text: &str) -> Vec<(std::ops::Range<usize>, String)> {
     out
 }
 
-/// Link under viewport cell (`col`, `row`), if any.
-pub fn link_at<T>(term: &Term<T>, display_offset: usize, col: usize, row: usize) -> Option<Link> {
+/// Link under viewport cell (`col`, `row`), if any. URLs win over paths; `paths` decides
+/// whether a path-looking text really exists.
+pub fn link_at<T>(
+    term: &Term<T>,
+    display_offset: usize,
+    col: usize,
+    row: usize,
+    paths: PathResolver<'_>,
+) -> Option<Link> {
     let grid = term.grid();
     let top = -(grid.history_size() as i32);
     let bottom = grid.screen_lines() as i32;
@@ -104,7 +125,7 @@ pub fn link_at<T>(term: &Term<T>, display_offset: usize, col: usize, row: usize)
         while c1 < width && same(c1) {
             c1 += 1;
         }
-        return Some(Link { url: uri, spans: vec![Span { row, c0, c1 }] });
+        return Some(Link { target: LinkTarget::Url(uri), spans: vec![Span { row, c0, c1 }] });
     }
 
     // Plain text: join wrapped rows around the hovered one.
@@ -140,9 +161,19 @@ pub fn link_at<T>(term: &Term<T>, display_offset: usize, col: usize, row: usize)
     // Index of the hovered char (a wide char's spacer maps to the char before it).
     let k = cells.iter().rposition(|&(l, c)| l == hover_line && c <= col)?;
     let k_byte = byte_starts[k];
-    let (range, url) = extract_urls(&text).into_iter().find(|(r, _)| r.contains(&k_byte))?;
-    if !is_allowed(&url) {
-        return None;
+    let target;
+    let range;
+    if let Some((r, url)) = extract_urls(&text).into_iter().find(|(r, _)| r.contains(&k_byte)) {
+        if !is_allowed(&url) {
+            return None;
+        }
+        range = r;
+        target = LinkTarget::Url(url);
+    } else {
+        let cand = extract_paths(&text).into_iter().find(|c| c.range.contains(&k_byte))?;
+        let (path, kind) = paths(&cand)?;
+        range = cand.range.clone();
+        target = LinkTarget::Path { path, kind, line: cand.line };
     }
     let from = byte_starts.partition_point(|&b| b < range.start);
     let to = byte_starts.partition_point(|&b| b < range.end);
@@ -156,7 +187,7 @@ pub fn link_at<T>(term: &Term<T>, display_offset: usize, col: usize, row: usize)
             _ => spans.push(Span { row: vrow, c0: c, c1: end }),
         }
     }
-    Some(Link { url, spans })
+    Some(Link { target, spans })
 }
 
 #[cfg(test)]
@@ -200,5 +231,62 @@ mod tests {
         assert!(is_allowed("mailto:a@b.c"));
         assert!(!is_allowed("javascript:alert(1)"));
         assert!(!is_allowed("calc.exe"));
+    }
+
+    // ---- link_at over a real grid ----
+
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::Config;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    struct Dims(usize, usize);
+    impl alacritty_terminal::grid::Dimensions for Dims {
+        fn total_lines(&self) -> usize {
+            self.1
+        }
+        fn screen_lines(&self) -> usize {
+            self.1
+        }
+        fn columns(&self) -> usize {
+            self.0
+        }
+    }
+
+    fn term_with(cols: usize, rows: usize, text: &str) -> Term<VoidListener> {
+        let mut term = Term::new(Config::default(), &Dims(cols, rows), VoidListener);
+        let mut proc: Processor<StdSyncHandler> = Processor::new();
+        proc.advance(&mut term, text.as_bytes());
+        term
+    }
+
+    fn fake_exists(c: &PathCandidate) -> Option<(PathBuf, PathKind)> {
+        c.raw.ends_with(".jar").then(|| (PathBuf::from(&c.raw), PathKind::File))
+    }
+
+    #[test]
+    fn path_link_is_found_and_spans_cover_it() {
+        let term = term_with(80, 5, r"Built: E:\dev\x\a+b.jar done");
+        let link = link_at(&term, 0, 12, 0, &mut fake_exists).unwrap();
+        assert!(matches!(&link.target, LinkTarget::Path { kind: PathKind::File, .. }));
+        assert_eq!(link.spans, vec![Span { row: 0, c0: 7, c1: 7 + r"E:\dev\x\a+b.jar".len() }]);
+        // Outside the path, and for a missing file: nothing.
+        assert!(link_at(&term, 0, 2, 0, &mut fake_exists).is_none());
+        assert!(link_at(&term, 0, 12, 0, &mut |_| None).is_none());
+    }
+
+    #[test]
+    fn wrapped_path_link_spans_two_rows() {
+        // 20 columns: the 26-char path wraps onto the next row.
+        let term = term_with(20, 5, "/very/long/dir/name/file.jar");
+        let link = link_at(&term, 0, 3, 1, &mut fake_exists).unwrap();
+        assert_eq!(link.spans.len(), 2);
+        assert_eq!((link.spans[0].row, link.spans[1].row), (0, 1));
+    }
+
+    #[test]
+    fn url_wins_over_path_and_skips_the_resolver() {
+        let term = term_with(80, 3, "go https://example.com/a/b.jar now");
+        let link = link_at(&term, 0, 10, 0, &mut |_| panic!("resolver must not run")).unwrap();
+        assert_eq!(link.target, LinkTarget::Url("https://example.com/a/b.jar".into()));
     }
 }

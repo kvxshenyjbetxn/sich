@@ -46,7 +46,7 @@ use crate::tray::{self, Tray, UiEvent};
 use crate::update_dialog::{self, UpdateFlow};
 use crate::update_status::{self, CheckStatus};
 use crate::updater;
-use crate::view::TerminalView;
+use crate::view::{TerminalEvent, TerminalView};
 use crate::terminal_layout::{self, Axis, Edge, Layout, Rect};
 use crate::split_drag::{DragGhost, SeparatorDrag, TerminalDrag};
 use crate::workspace::{
@@ -1605,11 +1605,19 @@ impl AppView {
             let id = entry.info.id;
             if let Some(view) = self.views.get(&id) {
                 let agent = entry.info.agent.as_ref().map(|a| a.kind);
-                view.update(cx, |v, _| v.set_agent(agent));
+                let cwd = Some(entry.info.cwd.clone());
+                view.update(cx, |v, _| {
+                    v.set_agent(agent);
+                    v.set_cwd(cwd);
+                });
                 continue;
             }
             let session = entry.session.clone();
             let view = cx.new(|cx| TerminalView::new(session, id, window, cx));
+            cx.subscribe_in(&view, window, |this, _, ev: &TerminalEvent, window, cx| match ev {
+                TerminalEvent::OpenFile(path) => this.open_file_tab(path.clone(), false, window, cx),
+            })
+            .detach();
             self.views.insert(id, view);
             // A terminal this window asked for: show its workspace and activate it.
             let key = WorkspaceKey::of(entry.info.worktree.as_deref());

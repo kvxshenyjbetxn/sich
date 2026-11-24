@@ -39,6 +39,7 @@ mod groups;
 mod i18n;
 mod input;
 mod links;
+mod path_links;
 mod notes_store;
 mod notifications;
 mod notify;

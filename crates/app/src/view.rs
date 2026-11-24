@@ -9,8 +9,9 @@ use gpui_kit::{
     App, Bounds, ClipboardItem, Context, Div, EntityInputHandler, FocusHandle, Focusable, InteractiveElement, IntoElement,
     KeyDownEvent, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
     Pixels, Point as PxPoint, Render, ScrollDelta, ScrollEvent, Styled, Subscription, UTF16Selection, Window,
-    div, px, Hsla,
+    DismissEvent, Entity, EventEmitter, anchored, deferred, div, px, Hsla,
 };
+use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::ActiveTheme as _;
 use sich_term::alacritty_terminal::index::{Column, Line, Point, Side};
 use sich_term::alacritty_terminal::selection::SelectionType;
@@ -24,10 +25,26 @@ use sich_term::{
 use crate::colors;
 use crate::element::{SharedCaret, SharedGeometry, TerminalElement};
 use crate::input::{Route, route_keystroke};
-use crate::links::Link;
+use crate::links::{Link, LinkTarget};
+use crate::path_links::{self, PathKind, ResolveCache};
 use crate::paste_image;
 use crate::term_settings;
 use crate::win_caret::Caret;
+
+/// Requests from a terminal view to the app.
+pub enum TerminalEvent {
+    /// Open a file in an in-app editor tab.
+    OpenFile(PathBuf),
+}
+
+impl EventEmitter<TerminalEvent> for TerminalView {}
+
+/// The popup menu of a Ctrl+clicked path.
+struct LinkMenu {
+    menu: Entity<PopupMenu>,
+    position: PxPoint<Pixels>,
+    _dismiss: Subscription,
+}
 
 pub struct TerminalView {
     session: TermSession,
@@ -47,6 +64,10 @@ pub struct TerminalView {
     caret: SharedCaret,
     /// Agent running in this terminal (decides how a pasted image path is delivered).
     agent: Option<AgentKind>,
+    /// Folder the terminal started in: base for relative paths in its output.
+    cwd: Option<PathBuf>,
+    path_cache: RefCell<ResolveCache>,
+    link_menu: Option<LinkMenu>,
     _subs: Vec<Subscription>,
 }
 
@@ -70,12 +91,19 @@ impl TerminalView {
             marked: None,
             caret: Rc::new(RefCell::new(Caret::new())),
             agent: None,
+            cwd: None,
+            path_cache: RefCell::new(ResolveCache::default()),
+            link_menu: None,
             _subs: subs,
         }
     }
 
     pub fn set_agent(&mut self, agent: Option<AgentKind>) {
         self.agent = agent;
+    }
+
+    pub fn set_cwd(&mut self, cwd: Option<PathBuf>) {
+        self.cwd = cwd.filter(|c| !c.as_os_str().is_empty());
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut App) {
@@ -286,7 +314,71 @@ impl TerminalView {
         }
         let term = session.lock_term();
         let offset = term.grid().display_offset();
-        crate::links::link_at(&term, offset, fx as usize, fy as usize)
+        let base = self.cwd.as_deref();
+        let home = dirs::home_dir();
+        let mut resolver = |cand: &path_links::PathCandidate| {
+            self.path_cache.borrow_mut().get(&cand.raw, base, std::time::Instant::now(), || {
+                path_links::resolve_existing(&cand.raw, base, home.as_deref())
+            })
+        };
+        crate::links::link_at(&term, offset, fx as usize, fy as usize, &mut resolver)
+    }
+
+    /// Opens the actions menu of a Ctrl+clicked path at `position`.
+    fn open_link_menu(
+        &mut self,
+        path: PathBuf,
+        kind: PathKind,
+        position: PxPoint<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::i18n::Tr;
+        let lang = crate::settings::language(cx);
+        let can_edit = kind == PathKind::File && path_links::editor_can_open(&path);
+        let this = cx.entity().downgrade();
+        let menu = PopupMenu::build(window, cx, move |mut menu, _, _| {
+            let tr = |key| crate::i18n::tr(lang, key);
+            match kind {
+                PathKind::File => {
+                    if can_edit {
+                        let (this, p) = (this.clone(), path.clone());
+                        menu = menu.item(PopupMenuItem::new(tr(Tr::OpenInSich)).on_click(move |_, _, cx| {
+                            let _ = this.update(cx, |_, cx| cx.emit(TerminalEvent::OpenFile(p.clone())));
+                        }));
+                    }
+                    let p = path.clone();
+                    menu = menu.item(PopupMenuItem::new(tr(Tr::OpenWithDefaultApp)).on_click(move |_, _, _| {
+                        crate::os::open_default(&p);
+                    }));
+                    let p = path.clone();
+                    menu = menu.item(PopupMenuItem::new(tr(Tr::ShowInExplorer)).on_click(move |_, _, _| {
+                        crate::os::reveal_in_file_manager(&p);
+                    }));
+                }
+                PathKind::Dir => {
+                    let p = path.clone();
+                    menu = menu.item(PopupMenuItem::new(tr(Tr::OpenInExplorer)).on_click(move |_, _, _| {
+                        crate::os::open_in_explorer(&p);
+                    }));
+                }
+            }
+            let text = path.display().to_string();
+            menu.separator().item(PopupMenuItem::new(tr(Tr::CopyPath)).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            }))
+        });
+        window.focus(&menu.focus_handle(cx), cx);
+        let dismiss = cx.subscribe_in(&menu, window, |this, menu, _: &DismissEvent, window, cx| {
+            this.link_menu = None;
+            // Give focus back unless an action already moved it elsewhere.
+            if menu.focus_handle(cx).contains_focused(window, cx) || window.focused(cx).is_none() {
+                window.focus(&this.focus, cx);
+            }
+            cx.notify();
+        });
+        self.link_menu = Some(LinkMenu { menu, position, _dismiss: dismiss });
+        cx.notify();
     }
 
     fn set_hover_link(&mut self, link: Option<Link>, cx: &mut Context<Self>) {
@@ -406,7 +498,10 @@ impl TerminalView {
         let session = self.session.clone();
         if ev.modifiers.control {
             if let Some(link) = self.link_at_pos(&session, ev.position) {
-                cx.open_url(&link.url);
+                match link.target {
+                    LinkTarget::Url(url) => cx.open_url(&url),
+                    LinkTarget::Path { path, kind, .. } => self.open_link_menu(path, kind, ev.position, window, cx),
+                }
                 return;
             }
         }
@@ -699,6 +794,26 @@ impl Render for TerminalView {
                 self.marked.clone(),
                 self.caret.clone(),
             ));
+
+        if let Some(m) = &self.link_menu {
+            root = root.child(
+                deferred(
+                    anchored().child(
+                        div()
+                            .w(window.bounds().size.width)
+                            .h(window.bounds().size.height)
+                            .on_scroll(|_, _, cx| cx.stop_propagation())
+                            .child(
+                                anchored()
+                                    .position(m.position)
+                                    .snap_to_window_with_margin(px(8.))
+                                    .child(m.menu.clone()),
+                            ),
+                    ),
+                )
+                .with_priority(gpui_kit::base::POPUP_PRIORITY),
+            );
+        }
 
         if let Some(code) = session.exited() {
             let text = crate::i18n::process_exited(crate::settings::language(cx), code);
