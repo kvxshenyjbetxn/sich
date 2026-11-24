@@ -306,7 +306,9 @@ impl ContextUi {
         changed
     }
 
-    /// Background polling of the data directory while the window is active.
+    /// Background polling of the data directory. While the window is inactive nothing is read
+    /// and the last data stays (the activation wake reloads it); with no targets or no data
+    /// dir the store is cleared.
     pub(crate) fn watch(window: &mut Window, cx: &Context<AppView>) {
         let (wake, rx) = async_channel::bounded::<()>(1);
         cx.observe_window_activation(window, move |_, window, _| {
@@ -340,7 +342,12 @@ impl ContextUi {
                 }) else {
                     break;
                 };
-                let Some(dir) = claude_ctx::data_dir().filter(|_| active && !targets.is_empty()) else {
+                let data_dir = claude_ctx::data_dir();
+                let step = poll_step(active, !targets.is_empty(), data_dir.is_some());
+                if step == PollStep::Keep {
+                    continue;
+                }
+                let Some(dir) = data_dir.filter(|_| step == PollStep::Load) else {
                     // Nothing to read: drop stale data of terminals that are gone.
                     if view.update(cx, |view, cx| {
                         if view.ctx_ui.replace(HashMap::new()) {
@@ -377,6 +384,27 @@ impl ContextUi {
             }
         })
         .detach();
+    }
+}
+
+/// What a poll tick does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollStep {
+    /// Window inactive: keep the last data, read nothing.
+    Keep,
+    /// Nothing to show: clear the store.
+    Clear,
+    /// Read the data directory.
+    Load,
+}
+
+fn poll_step(active: bool, has_targets: bool, has_dir: bool) -> PollStep {
+    if !has_targets || !has_dir {
+        PollStep::Clear
+    } else if !active {
+        PollStep::Keep
+    } else {
+        PollStep::Load
     }
 }
 
@@ -917,6 +945,19 @@ pub(crate) fn render_panel(ui: &ContextUi, input: PanelInput, lang: Language, cx
 mod tests {
     use super::*;
     use sich_proto::{AgentState, AgentStatus};
+
+    #[test]
+    fn poll_step_decisions() {
+        use PollStep::*;
+        // Regression: an inactive window with targets must keep its data.
+        assert_eq!(poll_step(false, true, true), Keep);
+        assert_eq!(poll_step(true, true, true), Load);
+        for active in [false, true] {
+            assert_eq!(poll_step(active, false, true), Clear);
+            assert_eq!(poll_step(active, true, false), Clear);
+            assert_eq!(poll_step(active, false, false), Clear);
+        }
+    }
 
     fn cat(name: &str, tokens: u64, color: Option<&str>, kind: CatKind) -> Category {
         Category { name: name.into(), tokens, color: color.map(Into::into), kind }

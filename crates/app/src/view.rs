@@ -125,30 +125,22 @@ impl TerminalView {
             }
         }
 
-        if m.control && m.shift {
-            match ks.key.as_str() {
-                "v" => {
-                    Self::paste_clipboard(&session, self.agent, cx);
-                    cx.notify();
-                    return;
-                }
-                "c" => {
-                    Self::copy_selection(&session, cx);
-                    return;
-                }
-                _ => {}
-            }
-        }
-        if ks.key == "insert" && !m.alt {
-            if m.control && !m.shift {
-                Self::copy_selection(&session, cx);
-                return;
-            }
-            if m.shift && !m.control {
+        let has_selection = session.selection_text().is_some();
+        match clipboard_key(&ks.key, m.control, m.shift, m.alt, has_selection) {
+            Some(ClipKey::Paste) => {
                 Self::paste_clipboard(&session, self.agent, cx);
                 cx.notify();
                 return;
             }
+            Some(ClipKey::Copy) => {
+                Self::copy_selection(&session, cx);
+                // Plain Ctrl+C consumed a selection: deselect like Windows Terminal.
+                if !m.shift && ks.key == "c" && session.clear_selection() {
+                    cx.notify();
+                }
+                return;
+            }
+            None => {}
         }
 
         let mods = KeyMods { ctrl: m.control, alt: m.alt, shift: m.shift };
@@ -791,9 +783,51 @@ fn prompt_paste_text(text: &str, bracketed: bool) -> String {
     }
 }
 
+/// Clipboard action a terminal key maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipKey {
+    Copy,
+    Paste,
+}
+
+/// Maps a keystroke to a clipboard action (None: goes to the PTY). Alt combos (AltGr is
+/// ctrl+alt on Windows) are never caught. Plain Ctrl+C copies only with a selection, so
+/// without one it stays the interrupt (0x03).
+fn clipboard_key(key: &str, ctrl: bool, shift: bool, alt: bool, has_selection: bool) -> Option<ClipKey> {
+    if alt {
+        return None;
+    }
+    match (key, ctrl, shift) {
+        ("v", true, _) => Some(ClipKey::Paste),
+        ("c", true, true) => Some(ClipKey::Copy),
+        ("c", true, false) if has_selection => Some(ClipKey::Copy),
+        ("insert", true, false) => Some(ClipKey::Copy),
+        ("insert", false, true) => Some(ClipKey::Paste),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_keys() {
+        use ClipKey::{Copy, Paste};
+        assert_eq!(clipboard_key("v", true, false, false, false), Some(Paste));
+        assert_eq!(clipboard_key("v", true, true, false, false), Some(Paste));
+        assert_eq!(clipboard_key("c", true, false, false, true), Some(Copy));
+        assert_eq!(clipboard_key("c", true, false, false, false), None);
+        assert_eq!(clipboard_key("c", true, true, false, false), Some(Copy));
+        assert_eq!(clipboard_key("c", true, true, false, true), Some(Copy));
+        assert_eq!(clipboard_key("v", true, false, true, false), None);
+        assert_eq!(clipboard_key("c", true, false, true, true), None);
+        assert_eq!(clipboard_key("insert", false, true, false, false), Some(Paste));
+        assert_eq!(clipboard_key("insert", true, false, false, false), Some(Copy));
+        assert_eq!(clipboard_key("insert", true, false, true, false), None);
+        assert_eq!(clipboard_key("v", false, false, false, true), None);
+        assert_eq!(clipboard_key("c", false, false, false, true), None);
+    }
 
     #[test]
     fn prompt_paste_never_carries_a_line_break_without_bracketed_paste() {
