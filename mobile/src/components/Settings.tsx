@@ -2,6 +2,8 @@ import { Minus, Plus, X } from "lucide-react";
 import { useI18n } from "../ctx";
 import { LANGS, type Lang } from "../lib/i18n";
 import { clampFont } from "../lib/termLogic";
+import { THEME_KINDS, setTheme } from "../lib/theme";
+import { useTheme } from "../lib/useTheme";
 
 const LANG_NAMES: Record<Lang, string> = { uk: "Українська", ru: "Русский", en: "English" };
 
@@ -13,6 +15,7 @@ interface Props {
 
 export function Settings({ fontSize, onFont, onClose }: Props) {
   const { t, lang, setLang } = useI18n();
+  const theme = useTheme();
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
@@ -32,6 +35,16 @@ export function Settings({ fontSize, onFont, onClose }: Props) {
             <button className="icon-btn" onClick={() => onFont(clampFont(fontSize + 0.5))} aria-label="+">
               <Plus size={16} />
             </button>
+          </div>
+        </div>
+        <div className="setting">
+          <span>{t("theme")}</span>
+          <div className="seg">
+            {THEME_KINDS.map((k) => (
+              <button key={k} className={`seg-btn ${k === theme ? "on" : ""}`} onClick={() => setTheme(k)}>
+                {t(k === "gray" ? "theme_gray" : "theme_amoled")}
+              </button>
+            ))}
           </div>
         </div>
         <div className="setting">

@@ -26,6 +26,26 @@
   --safe-bottom: env(safe-area-inset-bottom, 0px);
 }
 
+/* Black AMOLED palette (crates/app/src/colors.rs). */
+:root[data-theme="amoled"] {
+  --bg: #000000;
+  --panel: #000000;
+  --border: #1c1c1c;
+  --hover: #121212;
+  --active: #1f1f1f;
+  --text: #e6e6e6;
+  --muted: #7a7a7a;
+  --accent: #3574f0;
+  --accent-text: #ffffff;
+  --agent-waiting: #e0af68;
+  --agent-done: #4ec96b;
+  --agent-failed: #f7768e;
+  --mono: "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
 * {
   box-sizing: border-box;
   -webkit-tap-highlight-color: transparent;

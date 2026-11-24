@@ -10,7 +10,7 @@ import { coverBox, imageCells, scanCover, scanLine, stripBox, type CoverRun, typ
 import type { ImageStore } from "./store";
 import type { StripRect } from "./hit";
 
-export function attachImageOverlay(term: Terminal, store: ImageStore, background: string, onLayout?: (rects: StripRect[], screen: HTMLElement) => void): () => void {
+export function attachImageOverlay(term: Terminal, store: ImageStore, getBackground: () => string, onLayout?: (rects: StripRect[], screen: HTMLElement) => void): () => void {
   let layer: HTMLDivElement | null = null;
   let raf = 0;
   let disposed = false;
@@ -47,6 +47,7 @@ export function attachImageOverlay(term: Terminal, store: ImageStore, background
       });
     }
 
+    const background = getBackground();
     const rects: StripRect[] = [];
     const frag = document.createDocumentFragment();
     // Background boxes first: every placeholder cell is hidden, even without a loaded image.

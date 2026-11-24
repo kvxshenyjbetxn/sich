@@ -12,33 +12,11 @@ import { ImageStore, applyEvent } from "../lib/kitty/store";
 import { attachImageOverlay } from "../lib/kitty/overlay";
 import { hitStrip, isTap, type PointerSample, type StripRect } from "../lib/kitty/hit";
 import { ImageViewer } from "./ImageViewer";
+import { getTheme, terminalTheme } from "../lib/theme";
+import { useTheme } from "../lib/useTheme";
 
 import { FONT_FAMILY, loadTermFonts } from "../lib/fonts";
 export { FONT_FAMILY };
-
-// Colors from crates/app/src/colors.rs (Gray scheme).
-const THEME = {
-  background: "#1e1f22",
-  foreground: "#dfe1e5",
-  cursor: "#dfe1e5",
-  selectionBackground: "#2e436e",
-  black: "#15161e",
-  red: "#f7768e",
-  green: "#9ece6a",
-  yellow: "#e0af68",
-  blue: "#7aa2f7",
-  magenta: "#bb9af7",
-  cyan: "#7dcfff",
-  white: "#a9b1d6",
-  brightBlack: "#414868",
-  brightRed: "#ff899d",
-  brightGreen: "#b9f27c",
-  brightYellow: "#ffc777",
-  brightBlue: "#9abdf5",
-  brightMagenta: "#cfb2ff",
-  brightCyan: "#a4daff",
-  brightWhite: "#c0caf5",
-};
 
 /** Glyph advance / font size of the terminal font, measured once with a canvas. */
 let cachedRatio: number | null = null;
@@ -80,6 +58,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
   const fitAddon = useRef<FitAddon | null>(null);
   const lastSent = useRef({ cols: 0, rows: 0 });
   const [viewer, setViewer] = useState<string | null>(null);
+  const theme = useTheme();
 
   // Latest props for callbacks created once per terminal.
   const live = useRef({ fit, baseFont, ptyCols, ptyRows, onData, onPinchFont, onReset, disabled, term, paused });
@@ -135,7 +114,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
       x = new XTerm({
         fontFamily: FONT_FAMILY,
         fontSize: live.current.baseFont,
-        theme: THEME,
+        theme: terminalTheme(getTheme()),
         cursorBlink: false,
         scrollback: 5000,
         allowProposedApi: true, // required by @xterm/addon-image
@@ -154,7 +133,7 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
       let strips: StripRect[] = [];
       let screenEl: HTMLElement | null = null;
       cleanups.push(
-        attachImageOverlay(x, images, THEME.background, (r, scr) => {
+        attachImageOverlay(x, images, () => terminalTheme(getTheme()).background ?? "#000000", (r, scr) => {
           strips = r;
           screenEl = scr;
         }),
@@ -283,6 +262,14 @@ export function TerminalView({ term, fit, baseFont, ptyCols, ptyRows, disabled, 
   useEffect(() => {
     if (fit) lastSent.current = { cols: 0, rows: 0 };
   }, [fit]);
+
+  // Live theme switch: recolor xterm and force a repaint so the kitty overlay redraws too.
+  useEffect(() => {
+    const x = xRef.current;
+    if (!x) return;
+    x.options.theme = terminalTheme(theme);
+    x.refresh(0, Math.max(0, x.rows - 1));
+  }, [theme]);
 
   // Mode / size / font changes.
   useEffect(() => {

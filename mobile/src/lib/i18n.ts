@@ -96,6 +96,9 @@ export const DICT = {
   select_terminal: { uk: "Оберіть термінал", ru: "Выберите терминал", en: "Select a terminal" },
   settings: { uk: "Налаштування", ru: "Настройки", en: "Settings" },
   font_size: { uk: "Розмір шрифту терміналу", ru: "Размер шрифта терминала", en: "Terminal font size" },
+  theme: { uk: "Тема оформлення", ru: "Тема оформления", en: "Theme" },
+  theme_gray: { uk: "Сіра", ru: "Серая", en: "Gray" },
+  theme_amoled: { uk: "Чорна (AMOLED)", ru: "Чёрная (AMOLED)", en: "Black (AMOLED)" },
   language: { uk: "Мова", ru: "Язык", en: "Language" },
 
   agent_working: { uk: "Працює", ru: "Работает", en: "Working" },
