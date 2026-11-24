@@ -322,10 +322,50 @@ fn dot(id: impl Into<gpui_kit::ElementId>, color: Hsla) -> Stateful<Div> {
     div().id(id).flex_shrink_0().size(px(7.)).rounded_full().bg(color)
 }
 
+/// Minimum gap between the card's left edge and the agent badge's left edge.
+const CARD_BADGE_MARGIN: f32 = 3.;
+/// Card border width.
+const CARD_BORDER: f32 = 1.;
+/// Card right margin and vertical gap between cards.
+const CARD_MR: f32 = 6.;
+const CARD_GAP: f32 = 2.;
+
+/// Left offset of a terminal/agent card from the sidebar content edge: keeps the badge
+/// (hanging left of the icon) at least `CARD_BADGE_MARGIN` inside the card.
+fn card_left(indent: f32) -> f32 {
+    (left_badge_x(indent) - CARD_BADGE_MARGIN).max(0.)
+}
+
+/// Left padding of a row inside the card, so its content stays at the same x as `8 + indent`.
+fn card_inner_pl(indent: f32) -> f32 {
+    8. + indent - card_left(indent) - CARD_BORDER
+}
+
+/// Wraps one terminal/agent entry (row plus any subagent rows) in a subtle bordered card.
+fn term_card(selected: bool, indent: f32, theme: &gpui_kit::component::Theme) -> Div {
+    v_flex()
+        .mt(px(CARD_GAP))
+        .ml(px(card_left(indent)))
+        .mr(px(CARD_MR))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(if selected { theme.muted_foreground.opacity(0.45) } else { theme.border })
+        .overflow_hidden()
+}
+
 fn row_base(
     id: impl Into<gpui_kit::ElementId>,
     selected: bool,
     indent: f32,
+    theme: &gpui_kit::component::Theme,
+) -> Stateful<Div> {
+    row_base_pl(id, selected, 8. + indent, theme)
+}
+
+fn row_base_pl(
+    id: impl Into<gpui_kit::ElementId>,
+    selected: bool,
+    pl: f32,
     theme: &gpui_kit::component::Theme,
 ) -> Stateful<Div> {
     let (active, hover) = (theme.list_active, theme.list_hover);
@@ -334,7 +374,7 @@ fn row_base(
         .w_full()
         .h(px(ROW_H))
         .flex_shrink_0()
-        .pl(px(8. + indent))
+        .pl(px(pl))
         .pr_2()
         .gap_1p5()
         .items_center()
@@ -901,7 +941,8 @@ impl AppView {
                             }))
                         })
                 };
-                let row = row_base(("side-term", id), selected, indent, &theme)
+                let card = term_card(selected, indent, &theme);
+                let row = row_base_pl(("side-term", id), selected, card_inner_pl(indent), &theme)
                     .group(group.clone())
                     .text_color(if exited { muted } else { theme.sidebar_foreground })
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -916,12 +957,12 @@ impl AppView {
                     );
                 let Some(status) = entry.info.agent.as_ref() else {
                     return Some(
-                        with_menu(row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
+                        card.child(with_menu(row.child(Icon::new(Ic::SquareTerminal).small().text_color(muted))
                             .child(div().flex_1().min_w_0().truncate().text_size(px(12.)).child(label))
                             .children(coord_chip(self.orch.is_coordinator(id), lang, &theme))
                             .children(badge)
                             .child(close)
-                            .children(restart))
+                            .children(restart)))
                             .into_any_element(),
                     );
                 };
@@ -1008,7 +1049,7 @@ impl AppView {
                     .child(v_flex().flex_1().min_w_0().gap(px(2.)).child(line1).children(line2));
                 let row = with_menu(row);
                 if status.subagents.is_empty() {
-                    return Some(row.into_any_element());
+                    return Some(card.child(row).into_any_element());
                 }
                 let (shown, hidden) = visible_subagents(&status.subagents, MAX_VISIBLE_SUBAGENTS);
                 let mut children: Vec<AnyElement> = shown
@@ -1022,7 +1063,7 @@ impl AppView {
                             .w_full()
                             .h(px(SUB_ROW_H))
                             .flex_shrink_0()
-                            .pl(px(8. + indent + LEAD_SLOT_W + ROW_GAP))
+                            .pl(px(card_inner_pl(indent) + LEAD_SLOT_W + ROW_GAP))
                             .pr_2()
                             .items_center()
                             .text_size(px(11.5))
@@ -1031,7 +1072,7 @@ impl AppView {
                             .into_any_element(),
                     );
                 }
-                Some(v_flex().child(row).children(children).into_any_element())
+                Some(card.child(row).children(children).into_any_element())
             })
             .collect()
     }
@@ -1096,7 +1137,7 @@ impl AppView {
                     .text_color(muted)
                     .child(relative_time(lang, now_unix_ms(), sub.since_unix_ms)),
             );
-        row_base(("side-sub", uid), false, indent, &theme)
+        row_base_pl(("side-sub", uid), false, card_inner_pl(indent), &theme)
             .h(px(height))
             .text_color(theme.sidebar_foreground)
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
@@ -1180,6 +1221,21 @@ mod tests {
     use super::*;
     use crate::agent_badge::BadgeKind;
     use sich_proto::{AgentKind, AgentState, AgentStatus};
+
+    #[test]
+    fn card_layout_keeps_content_x_and_badge_inside() {
+        for indent in [0., 8., 14., 22., 30.] {
+            let left = card_left(indent);
+            // Content x (card left + border + inner padding) is unchanged.
+            assert_eq!(left + CARD_BORDER + card_inner_pl(indent), 8. + indent);
+            assert!(card_inner_pl(indent) >= 0.);
+            // The badge (when it fits) sits at least the margin inside the card.
+            let badge_x = left_badge_x(indent);
+            if badge_x >= 0. {
+                assert!(badge_x - left >= CARD_BADGE_MARGIN);
+            }
+        }
+    }
 
     #[test]
     fn project_drop_keeps_folders_and_ignores_files_and_missing_paths() {
