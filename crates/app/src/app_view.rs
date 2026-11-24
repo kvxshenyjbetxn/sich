@@ -159,6 +159,7 @@ pub struct AppView {
     /// Terminal that last received keyboard focus.
     focused: Option<TermId>,
     pub(crate) usage_bar: crate::usage_bar::UsageBar,
+    pub(crate) resources: crate::resource_usage::ResourceState,
     pub(crate) ctx_ui: ContextUi,
     pub(crate) images_ui: ImagesUi,
     pub(crate) agents_panel: Entity<AgentsPanel>,
@@ -364,6 +365,7 @@ impl AppView {
             shown_error: None,
             focused: None,
             usage_bar: crate::usage_bar::UsageBar::default(),
+            resources: crate::resource_usage::ResourceState::default(),
             ctx_ui: ContextUi::default(),
             images_ui: ImagesUi::default(),
             agents_panel: {
@@ -529,6 +531,7 @@ impl AppView {
     /// window-bounds tracking for the session.
     pub fn watch_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.usage_bar.watch(window, cx);
+        crate::resource_usage::watch(window, cx);
         ContextUi::watch(window, cx);
         ImagesUi::watch(self.images_ui.receiver(), window, cx);
         Self::start_update_checks(window, cx);
@@ -2364,6 +2367,7 @@ impl AppView {
                 context_panel::status_item(view, lang, crate::claude_ctx::now_ms(), &theme, cx)
             }))
             .children(self.usage_bar.render(lang, cx))
+            .child(crate::resource_usage::status_item(self, snap, lang, cx))
             .child(
                 Button::new("open-settings")
                     .ghost()

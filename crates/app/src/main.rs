@@ -51,6 +51,7 @@ mod orch_watch;
 mod os;
 mod pane_chrome;
 mod pr_store;
+mod resource_usage;
 mod settings;
 mod session;
 mod settings_dialog;
