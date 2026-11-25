@@ -1013,7 +1013,8 @@ impl AppView {
         if self.restored || self.restore.is_some() {
             return;
         }
-        let Some(count) = self.client.first_list_count() else { return };
+        // `seen_projects_rev > 0`: the first Projects reply has been applied to `self.projects`.
+        let Some(count) = restore_ready(self.client.first_list_count(), self.seen_projects_rev > 0) else { return };
         self.restored = true;
         let attached: Vec<_> = infos.iter().filter_map(|info| Some((info.id, self.client.owner(info.id)?))).collect();
         let peers = self.client.connected_peers();
@@ -2760,9 +2761,26 @@ fn should_refresh_on_activation(last: Option<Instant>, now: Instant) -> bool {
     last.is_none_or(|t| now.saturating_duration_since(t) >= ACTIVATION_REFRESH_GAP)
 }
 
+/// The session restore may run only once both the first terminal list and the first Projects
+/// reply have arrived; without projects every worktree workspace would be skipped (and lost).
+/// Returns the terminal count of the first list when ready.
+fn restore_ready(first_list_count: Option<usize>, projects_loaded: bool) -> Option<usize> {
+    first_list_count.filter(|_| projects_loaded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_waits_for_terminals_and_projects() {
+        assert_eq!(restore_ready(None, false), None);
+        assert_eq!(restore_ready(None, true), None);
+        assert_eq!(restore_ready(Some(0), false), None);
+        assert_eq!(restore_ready(Some(3), false), None);
+        assert_eq!(restore_ready(Some(0), true), Some(0));
+        assert_eq!(restore_ready(Some(3), true), Some(3));
+    }
 
     #[test]
     fn activation_refresh_is_throttled() {

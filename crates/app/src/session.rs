@@ -263,8 +263,13 @@ impl Session {
         Ok(())
     }
 
+    /// Loads the session at startup, first keeping a copy of the file as `session.json.bak`.
     pub fn load() -> Option<Session> {
-        Self::load_from(&file_path()?)
+        let path = file_path()?;
+        if let Some(dir) = path.parent() {
+            backup_session_in(dir);
+        }
+        Self::load_from(&path)
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -340,6 +345,18 @@ pub(crate) fn reattach(
 
 pub(crate) fn file_path() -> Option<PathBuf> {
     crate::settings::config_file("session.json")
+}
+
+/// Copies `<dir>/session.json` to `<dir>/session.json.bak` (overwriting). Works even when the
+/// file is corrupt; a missing file leaves any existing backup alone. Failures only log.
+pub(crate) fn backup_session_in(dir: &Path) {
+    let src = dir.join("session.json");
+    if !src.is_file() {
+        return;
+    }
+    if let Err(e) = std::fs::copy(&src, dir.join("session.json.bak")) {
+        tracing::warn!("failed to back up session file: {e}");
+    }
 }
 
 impl SavedWindow {
@@ -739,6 +756,67 @@ mod tests {
         assert!(s.workspaces[0].terminals.is_empty());
         assert!(!s.home_collapsed);
         assert!(!s.has_terminals());
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = unique_path(tag);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn backup_copies_valid_session() {
+        let dir = temp_dir("bak-valid");
+        std::fs::write(dir.join("session.json"), r#"{"workspaces":[]}"#).unwrap();
+        backup_session_in(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("session.json.bak")).unwrap(), r#"{"workspaces":[]}"#);
+        assert!(dir.join("session.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_copies_corrupt_session() {
+        let dir = temp_dir("bak-corrupt");
+        std::fs::write(dir.join("session.json"), "not json {{").unwrap();
+        backup_session_in(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("session.json.bak")).unwrap(), "not json {{");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_with_missing_session_keeps_old_backup() {
+        let dir = temp_dir("bak-missing");
+        std::fs::write(dir.join("session.json.bak"), "old").unwrap();
+        backup_session_in(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("session.json.bak")).unwrap(), "old");
+        assert!(!dir.join("session.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_overwrites_previous_backup() {
+        let dir = temp_dir("bak-overwrite");
+        std::fs::write(dir.join("session.json.bak"), "old").unwrap();
+        std::fs::write(dir.join("session.json"), "new").unwrap();
+        backup_session_in(&dir);
+        assert_eq!(std::fs::read_to_string(dir.join("session.json.bak")).unwrap(), "new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_plan_needs_projects_to_keep_worktree_workspaces() {
+        let session = Session {
+            workspaces: vec![saved_ws(None, &["/h"], None), saved_ws(Some("/p/wt"), &["/p/wt"], None)],
+            ..Default::default()
+        };
+        // Projects not loaded yet: the worktree workspace is dropped (what the restore gate prevents).
+        let early = restore_plan_with(&session, 0, &[], |_| true, Some(PathBuf::from("/h")));
+        assert_eq!(early.len(), 1);
+        assert_eq!(early[0].0, WorkspaceKey::Home);
+        let projects = vec![project(1, "/p", None, vec![wt("/p", true), wt("/p/wt", false)])];
+        let full = restore_plan_with(&session, 0, &projects, |_| true, Some(PathBuf::from("/h")));
+        assert_eq!(full.len(), 2);
+        assert!(full.iter().any(|(k, _, _)| matches!(k, WorkspaceKey::Worktree(_))));
     }
 
     #[test]
