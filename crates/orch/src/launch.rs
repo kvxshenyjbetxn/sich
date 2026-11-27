@@ -118,7 +118,11 @@ pub fn build_command(spec: &LaunchSpec<'_>) -> Result<String, LaunchError> {
     }
     let mut line = match spec.program {
         Some(p) => program_text(p)?,
+        // Codex attaches to a shared background daemon that keeps the env (SICH_TERM_ID) of the
+        // terminal that started it, so workers always run standalone.
+        None if spec.unattended && spec.agent == Agent::Codex => format!("codex --no-daemon {}", autonomy_flag(spec.agent)),
         None if spec.unattended => format!("{} {}", spec.agent.as_str(), autonomy_flag(spec.agent)),
+        None if spec.agent == Agent::Codex => "codex --no-daemon".to_string(),
         None => spec.agent.as_str().to_string(),
     };
     match spec.agent {
@@ -186,7 +190,7 @@ mod tests {
         let cmd = build_command(&spec(Agent::Codex, Some("gpt-5.4"), Some("xhigh"), &file)).unwrap();
         assert_eq!(
             cmd,
-            r#"codex --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort=xhigh "You are a Sich worker. Read your task and instructions in C:\cfg\t_1.md and follow them exactly.""#
+            r#"codex --no-daemon --dangerously-bypass-approvals-and-sandbox -m gpt-5.4 -c model_reasoning_effort=xhigh "You are a Sich worker. Read your task and instructions in C:\cfg\t_1.md and follow them exactly.""#
         );
     }
 
@@ -223,7 +227,7 @@ mod tests {
         let claude = build_command(&spec(Agent::Claude, None, None, &file)).unwrap();
         assert!(claude.starts_with("claude --dangerously-skip-permissions \"You are a Sich worker."), "{claude}");
         let codex = build_command(&spec(Agent::Codex, None, None, &file)).unwrap();
-        assert!(codex.starts_with("codex --dangerously-bypass-approvals-and-sandbox \"You are a Sich worker."), "{codex}");
+        assert!(codex.starts_with("codex --no-daemon --dangerously-bypass-approvals-and-sandbox \"You are a Sich worker."), "{codex}");
     }
 
     #[test]
@@ -232,7 +236,8 @@ mod tests {
         for agent in [Agent::Claude, Agent::Codex] {
             let launch = LaunchSpec { unattended: false, ..spec(agent, None, None, file) };
             let cmd = build_command(&launch).unwrap();
-            assert_eq!(cmd, format!("{} \"{}\"", agent.as_str(), initial_prompt("/tmp/t.md")));
+            let name = if agent == Agent::Codex { "codex --no-daemon" } else { agent.as_str() };
+            assert_eq!(cmd, format!("{} \"{}\"", name, initial_prompt("/tmp/t.md")));
         }
     }
 

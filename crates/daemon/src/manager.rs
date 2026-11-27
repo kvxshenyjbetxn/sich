@@ -114,10 +114,15 @@ impl Manager {
         true
     }
 
-    /// Feeds a hook payload to the terminal's agent tracker. Unknown terminals are ignored.
+    /// Feeds a hook payload to the terminal's agent tracker. Unknown terminals are logged and ignored.
     pub fn agent_hook(&self, id: TermId, agent: sich_proto::AgentKind, payload: &str) {
         if let Some(t) = self.get(id) {
             t.agent_hook(agent, payload);
+        } else {
+            let event = serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|v| v.get("hook_event_name").and_then(|e| e.as_str().map(str::to_owned)));
+            tracing::warn!(term = id, agent = ?agent, event = event.as_deref().unwrap_or("?"), "dropped agent hook for a terminal that is not live");
         }
     }
 

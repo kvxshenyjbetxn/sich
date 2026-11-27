@@ -6,6 +6,7 @@ pub mod claude_install;
 pub mod claude_mod;
 mod codex_app_server;
 pub mod codex_install;
+pub mod codex_project_trust;
 pub mod codex_trust;
 mod hook;
 pub mod omp_install;

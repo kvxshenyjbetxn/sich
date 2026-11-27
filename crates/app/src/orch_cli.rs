@@ -71,13 +71,38 @@ struct Caller {
     socket: String,
     base: String,
     created_ms: i64,
+    /// Set when the worker identified itself with `--dispatch` (then `term` is its worker_term).
+    dispatch: Option<Dispatch>,
 }
 
-fn caller(rt: &tokio::runtime::Runtime) -> Result<Caller> {
-    let term = std::env::var("SICH_TERM_ID")
-        .ok()
-        .and_then(|v| v.trim().parse::<TermId>().ok())
-        .ok_or_else(|| anyhow!("this command only works inside a Sich terminal (SICH_TERM_ID is not set)"))?;
+/// The terminal named by SICH_TERM_ID, if set and valid.
+fn env_term() -> Option<TermId> {
+    std::env::var("SICH_TERM_ID").ok().and_then(|v| v.trim().parse::<TermId>().ok())
+}
+
+/// Loads the dispatch a worker named with `--dispatch`; refuses unknown, lost or released ones.
+fn load_dispatch(did: &str) -> Result<Dispatch> {
+    let db = open_db()?;
+    let d = db.get_dispatch(did)?.ok_or_else(|| anyhow!("unknown dispatch {did}"))?;
+    if !d.state.is_live() {
+        bail!("dispatch {did} is {}; it can no longer be used", d.state.as_str());
+    }
+    match env_term() {
+        Some(env) if env != d.worker_term => warn(&format!(
+            "sich orch: SICH_TERM_ID={env} does not match dispatch {did} (terminal {}); using the dispatch (stale environment).",
+            d.worker_term
+        )),
+        _ => {}
+    }
+    Ok(d)
+}
+
+fn caller(rt: &tokio::runtime::Runtime, dispatch: Option<Dispatch>) -> Result<Caller> {
+    let term = match &dispatch {
+        Some(d) => d.worker_term,
+        None => env_term()
+            .ok_or_else(|| anyhow!("this command only works inside a Sich terminal (SICH_TERM_ID is not set)"))?,
+    };
     let socket = sich_daemon::socket_name_from_env();
     let entries = sich_daemon::generation::entries();
     let base = sich_daemon::generation::base_for(&socket, &entries).to_owned();
@@ -87,7 +112,7 @@ fn caller(rt: &tokio::runtime::Runtime) -> Result<Caller> {
             .map(|t| t.created_unix_ms as i64)
             .with_context(|| format!("terminal {term} is not running on {socket}"))
     })?;
-    Ok(Caller { term, socket, base, created_ms })
+    Ok(Caller { term, socket, base, created_ms, dispatch })
 }
 
 impl Caller {
@@ -113,10 +138,24 @@ fn open_db() -> Result<Db> {
     Db::open(&path)
 }
 
+fn worker_dispatch_arg(command: &Command) -> Option<&str> {
+    match command {
+        Command::Check { dispatch }
+        | Command::Send { dispatch, .. }
+        | Command::Ask { dispatch, .. }
+        | Command::Done { dispatch, .. } => dispatch.as_deref(),
+        _ => None,
+    }
+}
+
 fn execute(command: Command) -> Result<i32> {
     // Multi-threaded: `release` drives I/O through `Handle::block_on`, which needs worker threads.
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
-    let caller = caller(&rt)?;
+    let dispatch = match worker_dispatch_arg(&command) {
+        Some(did) => Some(load_dispatch(did)?),
+        None => None,
+    };
+    let caller = caller(&rt, dispatch)?;
     match command {
         Command::Help => unreachable!("handled by run"),
         Command::Start { agent, model, effort, title, spec, worktree } => {
@@ -125,11 +164,11 @@ fn execute(command: Command) -> Result<i32> {
         Command::Release { dispatch, remove_worktree } => {
             release(&caller, &dispatch, remove_worktree, rt.handle())
         }
-        Command::Check => check(&caller),
-        Command::Send { to, body, subject } => send(&caller, to, body, subject),
-        Command::Ask { question } => ask(&caller, question),
+        Command::Check { .. } => check(&caller),
+        Command::Send { to, body, subject, .. } => send(&caller, to, body, subject),
+        Command::Ask { question, .. } => ask(&caller, question),
         Command::Reply { id, body } => reply(&caller, id, body),
-        Command::Done { outcome, summary, report, files } => done(&caller, outcome, summary, report, files),
+        Command::Done { outcome, summary, report, files, .. } => done(&caller, outcome, summary, report, files),
         Command::List => list(&caller),
     }
 }
@@ -143,8 +182,13 @@ pub struct Identity {
 }
 
 fn identify(db: &Db, caller: &Caller) -> Result<Identity> {
+    let worker = match &caller.dispatch {
+        // Re-read: the state may have changed since it was loaded.
+        Some(d) => Some(db.get_dispatch(&d.id)?.filter(|d| d.state.is_live()).ok_or_else(|| anyhow!("dispatch {} is no longer active", d.id))?),
+        None => db.dispatch_for_worker_at(caller.term, caller.created_ms, caller.scope())?,
+    };
     Ok(Identity {
-        worker: db.dispatch_for_worker_at(caller.term, caller.created_ms, caller.scope())?,
+        worker,
         run: db.run_for_coordinator_at(caller.term, caller.created_ms, caller.scope())?,
     })
 }
@@ -592,10 +636,11 @@ async fn create_worker_terminal(
             worktree: Some(wt.path.clone()),
         }
     } else {
-        ClientMsg::CreateTerminal {
+        // RestoreTerminal spawns the same default shell but answers only the requester, so a
+        // parallel start cannot pick up another client's TerminalCreated broadcast.
+        ClientMsg::RestoreTerminal {
+            request_id: 1,
             cwd: Some(coordinator.cwd.clone()),
-            shell: None,
-            args: Vec::new(),
             cols: coordinator.cols,
             rows: coordinator.rows,
             worktree: coordinator.worktree.clone(),
@@ -605,9 +650,10 @@ async fn create_worker_terminal(
     let deadline = Instant::now() + Duration::from_secs(15);
     while let Some(left) = deadline.checked_duration_since(Instant::now()) {
         match link.recv(left).await? {
-            Some(ServerMsg::TerminalCreated(info)) if worker_worktree.is_none() => return Ok(info),
-            Some(ServerMsg::TerminalRestored { request_id: 1, terminal: Some(info) }) if let Some(wt) = worker_worktree => {
-                if !sich_daemon::worker_worktree::same_path(&info.cwd, &wt.path) {
+            Some(ServerMsg::TerminalRestored { request_id: 1, terminal: Some(info) }) => {
+                if let Some(wt) = worker_worktree
+                    && !sich_daemon::worker_worktree::same_path(&info.cwd, &wt.path)
+                {
                     let _ = link.send(&ClientMsg::KillTerminal { id: info.id }).await;
                     let _ = link.list_terminals().await;
                     bail!("the worker worktree disappeared while the terminal was opening");
@@ -692,6 +738,18 @@ async fn start(caller: &Caller, args: StartArgs) -> Result<i32> {
         None
     };
     let owned = worker_worktree.as_ref().map(|(_, _, wt)| wt);
+    if args.agent == Agent::Codex && program.is_none() {
+        // Without a trust entry Codex stops at a folder-trust prompt; failure is not fatal.
+        let cwd = owned.map_or(me.cwd.as_path(), |wt| wt.path.as_path());
+        match sich_hooks::codex_install::default_codex_home() {
+            Some(home) => {
+                if let Err(e) = sich_hooks::codex_project_trust::ensure_trusted(&home, cwd) {
+                    warn(&format!("could not mark {} as trusted for Codex: {e:#}", cwd.display()));
+                }
+            }
+            None => warn("could not locate the Codex home; the worker may ask to trust its folder"),
+        }
+    }
     let exe = exe_text();
     let text = preamble::render(&PreambleInput {
         exe: &exe,

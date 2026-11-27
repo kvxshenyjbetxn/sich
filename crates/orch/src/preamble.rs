@@ -43,11 +43,11 @@ progress only through the commands below.\n\
 \n\
 Run these in your shell (they identify you automatically; in PowerShell keep the leading `&`):\n\
 \n\
-- Read new messages: `{call} orch check`\n\
-- Ask the coordinator a question or report a blocker: `{call} orch ask --question \"<question>\"`\n\
-- Send a note without needing an answer: `{call} orch send --to coordinator --body \"<text>\"`\n\
-- Report completion: `{call} orch done --outcome succeeded --summary \"<what you did>\" [--report <path to a report file>] [--files a,b]`\n\
-- Report failure: `{call} orch done --outcome failed --summary \"<why>\"`\n\
+- Read new messages: `{call} orch check --dispatch {dispatch}`\n\
+- Ask the coordinator a question or report a blocker: `{call} orch ask --dispatch {dispatch} --question \"<question>\"`\n\
+- Send a note without needing an answer: `{call} orch send --dispatch {dispatch} --to coordinator --body \"<text>\"`\n\
+- Report completion: `{call} orch done --dispatch {dispatch} --outcome succeeded --summary \"<what you did>\" [--report <path to a report file>] [--files a,b]`\n\
+- Report failure: `{call} orch done --dispatch {dispatch} --outcome failed --summary \"<why>\"`\n\
 \n\
 ## Rules\n\
 \n\
@@ -92,11 +92,11 @@ mod tests {
         assert!(text.contains("terminal 7"));
         assert!(text.contains("CANNOT see this terminal"));
         for cmd in [
-            "`C:/Apps/sich.exe orch check`",
-            "`C:/Apps/sich.exe orch ask --question \"<question>\"`",
-            "`C:/Apps/sich.exe orch send --to coordinator --body \"<text>\"`",
-            "`C:/Apps/sich.exe orch done --outcome succeeded --summary \"<what you did>\"",
-            "`C:/Apps/sich.exe orch done --outcome failed --summary \"<why>\"`",
+            "`C:/Apps/sich.exe orch check --dispatch d_4e5f6071`",
+            "`C:/Apps/sich.exe orch ask --dispatch d_4e5f6071 --question \"<question>\"`",
+            "`C:/Apps/sich.exe orch send --dispatch d_4e5f6071 --to coordinator --body \"<text>\"`",
+            "`C:/Apps/sich.exe orch done --dispatch d_4e5f6071 --outcome succeeded --summary \"<what you did>\"",
+            "`C:/Apps/sich.exe orch done --dispatch d_4e5f6071 --outcome failed --summary \"<why>\"`",
         ] {
             assert!(text.contains(cmd), "missing {cmd}\n{text}");
         }
@@ -141,6 +141,6 @@ mod tests {
     fn exe_with_spaces_is_quoted_for_powershell() {
         assert_eq!(exe_command("C:/Program Files/Sich/sich.exe"), "\"C:/Program Files/Sich/sich.exe\"");
         let text = render(&input("C:/Program Files/Sich/sich.exe"));
-        assert!(text.contains("`& \"C:/Program Files/Sich/sich.exe\" orch check`"), "{text}");
+        assert!(text.contains("`& \"C:/Program Files/Sich/sich.exe\" orch check --dispatch d_4e5f6071`"), "{text}");
     }
 }

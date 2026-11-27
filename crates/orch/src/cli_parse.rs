@@ -26,11 +26,11 @@ pub enum Command {
         spec: SpecSource,
         worktree: Option<String>,
     },
-    Send { to: Target, body: String, subject: Option<String> },
-    Check,
-    Ask { question: String },
+    Send { to: Target, body: String, subject: Option<String>, dispatch: Option<String> },
+    Check { dispatch: Option<String> },
+    Ask { question: String, dispatch: Option<String> },
     Reply { id: i64, body: String },
-    Done { outcome: Outcome, summary: String, report: Option<String>, files: Vec<String> },
+    Done { outcome: Outcome, summary: String, report: Option<String>, files: Vec<String>, dispatch: Option<String> },
     List,
     Release { dispatch: String, remove_worktree: bool },
     Help,
@@ -39,11 +39,12 @@ pub enum Command {
 pub const USAGE: &str = "\
 usage: sich orch <command>
   start --agent claude|codex|omp [--model M] [--effort E] [--title T] [--worktree NAME] (--spec TEXT | --spec-file PATH)
-  send --to dispatch:<id>|coordinator --body TEXT [--subject S]
-  check
-  ask --question TEXT
+  send --to dispatch:<id>|coordinator --body TEXT [--subject S] [--dispatch ID]
+  check [--dispatch ID]
+  ask --question TEXT [--dispatch ID]
   reply --id MSG_ID --body TEXT
-  done --outcome succeeded|failed --summary TEXT [--report PATH] [--files a,b]
+  done --outcome succeeded|failed --summary TEXT [--report PATH] [--files a,b] [--dispatch ID]
+  (workers: --dispatch ID identifies the worker by its dispatch instead of SICH_TERM_ID)
   list
   release --dispatch ID [--remove-worktree]";
 
@@ -91,6 +92,16 @@ impl Flags {
 
     fn get(&self, name: &str) -> Option<String> {
         self.values.get(name).cloned()
+    }
+
+    /// The optional worker `--dispatch` id (`dispatch:` prefix allowed).
+    fn dispatch_id(&self) -> Result<Option<String>, String> {
+        let Some(raw) = self.get("dispatch") else { return Ok(None) };
+        let id = raw.strip_prefix("dispatch:").unwrap_or(&raw);
+        if !crate::paths::is_id('d', id) {
+            return Err(format!("invalid dispatch id `{id}`"));
+        }
+        Ok(Some(id.to_string()))
     }
 
     fn require(&self, name: &str) -> Result<String, String> {
@@ -145,7 +156,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::Start { agent, model: f.get("model"), effort: f.get("effort"), title: f.get("title"), spec, worktree })
         }
         "send" => {
-            let f = Flags::parse(rest, &["to", "body", "subject"])?;
+            let f = Flags::parse(rest, &["to", "body", "subject", "dispatch"])?;
             let to = f.require("to")?;
             let to = if to == "coordinator" {
                 Target::Coordinator
@@ -157,15 +168,15 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             } else {
                 return Err(format!("invalid --to `{to}` (use dispatch:<id> or coordinator)"));
             };
-            Ok(Command::Send { to, body: f.require_nonempty("body")?, subject: f.get("subject") })
+            Ok(Command::Send { to, body: f.require_nonempty("body")?, subject: f.get("subject"), dispatch: f.dispatch_id()? })
         }
         "check" => {
-            Flags::parse(rest, &[])?;
-            Ok(Command::Check)
+            let f = Flags::parse(rest, &["dispatch"])?;
+            Ok(Command::Check { dispatch: f.dispatch_id()? })
         }
         "ask" => {
-            let f = Flags::parse(rest, &["question"])?;
-            Ok(Command::Ask { question: f.require_nonempty("question")? })
+            let f = Flags::parse(rest, &["question", "dispatch"])?;
+            Ok(Command::Ask { question: f.require_nonempty("question")?, dispatch: f.dispatch_id()? })
         }
         "reply" => {
             let f = Flags::parse(rest, &["id", "body"])?;
@@ -179,7 +190,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             Ok(Command::Reply { id, body: f.require_nonempty("body")? })
         }
         "done" => {
-            let f = Flags::parse(rest, &["outcome", "summary", "report", "files"])?;
+            let f = Flags::parse(rest, &["outcome", "summary", "report", "files", "dispatch"])?;
             let outcome_text = f.require("outcome")?;
             let outcome = Outcome::parse(&outcome_text)
                 .ok_or_else(|| format!("invalid --outcome `{outcome_text}` (use succeeded or failed)"))?;
@@ -187,7 +198,7 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 .get("files")
                 .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
                 .unwrap_or_default();
-            Ok(Command::Done { outcome, summary: f.require_nonempty("summary")?, report: f.get("report"), files })
+            Ok(Command::Done { outcome, summary: f.require_nonempty("summary")?, report: f.get("report"), files, dispatch: f.dispatch_id()? })
         }
         "list" => {
             Flags::parse(rest, &[])?;
@@ -298,14 +309,15 @@ mod tests {
     fn send_targets() {
         assert_eq!(
             p("send --to coordinator --body hi").unwrap(),
-            Command::Send { to: Target::Coordinator, body: "hi".into(), subject: None }
+            Command::Send { to: Target::Coordinator, body: "hi".into(), subject: None, dispatch: None }
         );
         assert_eq!(
             p(r#"send --to dispatch:d_0a1b2c3d --body "more work" --subject Follow"#).unwrap(),
             Command::Send {
                 to: Target::Dispatch("d_0a1b2c3d".into()),
                 body: "more work".into(),
-                subject: Some("Follow".into())
+                subject: Some("Follow".into()),
+                dispatch: None,
             }
         );
         assert!(p("send --to dispatch:nope --body x").unwrap_err().contains("invalid dispatch id"));
@@ -315,7 +327,7 @@ mod tests {
 
     #[test]
     fn check_list_help_take_no_options() {
-        assert_eq!(p("check").unwrap(), Command::Check);
+        assert_eq!(p("check").unwrap(), Command::Check { dispatch: None });
         assert_eq!(p("list").unwrap(), Command::List);
         assert_eq!(p("").unwrap(), Command::Help);
         assert_eq!(p("--help").unwrap(), Command::Help);
@@ -323,8 +335,26 @@ mod tests {
     }
 
     #[test]
+    fn worker_commands_accept_a_dispatch() {
+        assert_eq!(p("check --dispatch d_0a1b2c3d").unwrap(), Command::Check { dispatch: Some("d_0a1b2c3d".into()) });
+        assert_eq!(
+            p("ask --dispatch d_0a1b2c3d --question q").unwrap(),
+            Command::Ask { question: "q".into(), dispatch: Some("d_0a1b2c3d".into()) }
+        );
+        assert!(matches!(
+            p("done --dispatch d_0a1b2c3d --outcome failed --summary x").unwrap(),
+            Command::Done { dispatch: Some(_), .. }
+        ));
+        assert!(matches!(
+            p("send --dispatch d_0a1b2c3d --to coordinator --body x").unwrap(),
+            Command::Send { dispatch: Some(_), .. }
+        ));
+        assert!(p("check --dispatch nope").unwrap_err().contains("invalid dispatch id"));
+    }
+
+    #[test]
     fn ask_and_reply() {
-        assert_eq!(p(r#"ask --question "which file?""#).unwrap(), Command::Ask { question: "which file?".into() });
+        assert_eq!(p(r#"ask --question "which file?""#).unwrap(), Command::Ask { question: "which file?".into(), dispatch: None });
         assert!(p(r#"ask --question """#).is_err());
         assert_eq!(p("reply --id 12 --body ok").unwrap(), Command::Reply { id: 12, body: "ok".into() });
         assert_eq!(p("reply --id #12 --body ok").unwrap(), Command::Reply { id: 12, body: "ok".into() });
@@ -342,11 +372,12 @@ mod tests {
                 summary: "all good".into(),
                 report: Some("r.md".into()),
                 files: vec!["a.rs".into(), "b.rs".into()],
+                dispatch: None,
             }
         );
         assert_eq!(
             p("done --outcome failed --summary broke").unwrap(),
-            Command::Done { outcome: Outcome::Failed, summary: "broke".into(), report: None, files: vec![] }
+            Command::Done { outcome: Outcome::Failed, summary: "broke".into(), report: None, files: vec![], dispatch: None }
         );
         assert!(p("done --outcome maybe --summary x").unwrap_err().contains("invalid --outcome"));
         assert!(p("done --outcome failed").unwrap_err().contains("--summary"));
