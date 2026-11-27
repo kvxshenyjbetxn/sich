@@ -74,6 +74,7 @@ mod view;
 mod win_caret;
 mod win_flash;
 mod win_show;
+mod win_shutdown;
 mod win_toast;
 mod workspace;
 mod workspace_tabs;
@@ -137,6 +138,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run_ui(socket: String, force_takeover: bool) -> anyhow::Result<()> {
+    win_shutdown::install();
     // Pasted clipboard images are temporary: drop old ones in the background.
     std::thread::spawn(|| {
         paste_image::prune(&paste_image::paste_dir(), std::time::SystemTime::now(), paste_image::MAX_AGE);

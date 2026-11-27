@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sich_proto::{AgentKind, AgentState, GroupId, GroupInfo, ProjectId, ProjectInfo, TermId, TerminalInfo};
@@ -160,17 +161,25 @@ pub fn resume_command(kind: AgentKind, session_id: &str) -> Option<String> {
 }
 
 impl SavedTerminal {
-    fn from_info(info: &TerminalInfo) -> Self {
+    /// A live agent with a valid session id is saved as is. Otherwise `fallback` (the agent a
+    /// restored terminal was resumed with, which has not reported in yet) is kept, never
+    /// flagged as interrupted. Otherwise no agent.
+    fn from_info(info: &TerminalInfo, fallback: Option<&SavedAgent>) -> Self {
         let agent = info.agent.as_ref();
+        let live = agent.and_then(|a| {
+            let session_id = a.session_id.as_ref()?;
+            resume_command(a.kind, session_id)?;
+            Some(SavedAgent { kind: a.kind, session_id: session_id.clone() })
+        });
+        let (saved, interrupted) = match live {
+            Some(live) => (Some(live), agent.is_some_and(|a| a.state == AgentState::Working)),
+            None => (fallback.filter(|f| resume_command(f.kind, &f.session_id).is_some()).cloned(), false),
+        };
         Self {
             id: Some(info.id),
             cwd: info.cwd.clone(),
-            agent: agent.and_then(|a| {
-                let session_id = a.session_id.as_ref()?;
-                resume_command(a.kind, session_id)?;
-                Some(SavedAgent { kind: a.kind, session_id: session_id.clone() })
-            }),
-            interrupted: agent.is_some_and(|a| a.state == AgentState::Working),
+            agent: saved,
+            interrupted,
             scrollback: None,
             ..Self::default()
         }
@@ -390,6 +399,8 @@ pub struct SessionInput<'a> {
     pub window: Option<SavedWindow>,
     pub sidebar_w: Option<f32>,
     pub right_panel: RightPanelState,
+    /// Agents restored terminals were resumed with, until they report their own session.
+    pub agent_fallback: &'a HashMap<TermId, SavedAgent>,
 }
 
 /// Builds the session to save. Workspaces come in a stable order (Home, then worktrees in
@@ -416,7 +427,7 @@ pub fn build_session(input: &SessionInput) -> Session {
         let terminals = ids
             .iter()
             .filter_map(|id| live.iter().find(|t| t.id == *id))
-            .map(SavedTerminal::from_info)
+            .map(|t| SavedTerminal::from_info(t, input.agent_fallback.get(&t.id)))
             .collect();
         let active = input.ws.active_in(&key, &ids).and_then(|a| ids.iter().position(|i| *i == a));
         let layout = input.layouts.get(&key)
@@ -450,6 +461,48 @@ pub fn build_session(input: &SessionInput) -> Session {
         sidebar_w: input.sidebar_w,
         right_panel: input.right_panel,
     }
+}
+
+/// Same terminal in two saved sessions. Uses (socket, id, created_ms) when both sides have
+/// them; otherwise falls back to (workspace worktree, cwd, position in the workspace).
+fn same_terminal(old: (&SavedWorkspace, usize), new: (&SavedWorkspace, usize)) -> bool {
+    let (ot, nt) = (&old.0.terminals[old.1], &new.0.terminals[new.1]);
+    let identified = |t: &SavedTerminal| t.id.is_some() && t.socket.is_some() && t.created_ms.is_some();
+    if identified(ot) && identified(nt) {
+        return (&ot.socket, ot.id, ot.created_ms) == (&nt.socket, nt.id, nt.created_ms);
+    }
+    old.0.worktree == new.0.worktree && ot.cwd == nt.cwd && old.1 == new.1
+}
+
+/// True when `new` holds less than `old`: a terminal is gone, or a terminal that had a saved
+/// agent has none now (a changed agent session id is not a shrink).
+pub(crate) fn session_shrank(old: &Session, new: &Session) -> bool {
+    old.workspaces.iter().flat_map(|ow| (0..ow.terminals.len()).map(move |i| (ow, i))).any(|(ow, i)| {
+        let found = new.workspaces.iter()
+            .flat_map(|nw| (0..nw.terminals.len()).map(move |j| (nw, j)))
+            .find(|&(nw, j)| same_terminal((ow, i), (nw, j)));
+        match found {
+            None => true,
+            Some((nw, j)) => ow.terminals[i].agent.is_some() && nw.terminals[j].agent.is_none(),
+        }
+    })
+}
+
+/// When the pending session must be written: `now + fast` normally; a shrinking session waits
+/// `settle` from the first moment it became a shrink (`shrink_since`).
+pub(crate) fn save_due(
+    shrank: bool,
+    shrink_since: Option<Instant>,
+    now: Instant,
+    fast: Duration,
+    settle: Duration,
+) -> Instant {
+    if shrank { shrink_since.unwrap_or(now) + settle } else { now + fast }
+}
+
+/// Updates the "pending session is a shrink since" mark: kept while shrinking, cleared otherwise.
+pub(crate) fn next_shrink_since(prev: Option<Instant>, shrank: bool, now: Instant) -> Option<Instant> {
+    shrank.then(|| prev.unwrap_or(now))
 }
 
 /// Maps the saved collapse state (project paths, group names) back to current ids.
@@ -855,6 +908,7 @@ mod tests {
             terminals: &terminals, ws: &ws, layouts: &layouts, projects: &[], groups: &[],
             home_collapsed: false, collapsed: &collapsed, collapsed_groups: &groups,
             window: None, sidebar_w: None, right_panel: RightPanelState::default(),
+            agent_fallback: &HashMap::new(),
         });
         let expected = Layout::Split { axis: Axis::Vertical, ratio: 0.7,
             first: Box::new(Layout::Leaf(2_usize)), second: Box::new(Layout::Leaf(1_usize)) };
@@ -867,6 +921,7 @@ mod tests {
             terminals: &terminals, ws: &ws, layouts: &solo, projects: &[], groups: &[],
             home_collapsed: false, collapsed: &collapsed, collapsed_groups: &groups,
             window: None, sidebar_w: None, right_panel: RightPanelState::default(),
+            agent_fallback: &HashMap::new(),
         };
         assert_eq!(build_session(&input).workspaces[0].layout, None);
     }
@@ -930,6 +985,7 @@ mod tests {
             window: None,
             sidebar_w: None,
             right_panel: RightPanelState::default(),
+            agent_fallback: &HashMap::new(),
         });
         assert_eq!(s.selected, Some(PathBuf::from("/w/a-x")));
         assert!(s.home_collapsed);
@@ -970,6 +1026,7 @@ mod tests {
             window: Some(SavedWindow { x: 1., y: 2., width: 800., height: 600., maximized: false, display: None }),
             sidebar_w: Some(250.),
             right_panel: RightPanelState::default(),
+            agent_fallback: &HashMap::new(),
         });
         assert_eq!(s.sidebar_w, Some(250.));
         assert_eq!(s.selected, None);
@@ -997,9 +1054,146 @@ mod tests {
             window: None,
             sidebar_w: None,
             right_panel: RightPanelState::default(),
+            agent_fallback: &HashMap::new(),
         });
         assert_eq!(s, Session::default());
     }
+
+    // ---- shrink / save delay / agent fallback ----
+
+    fn sess(wts: Vec<(Option<&str>, Vec<SavedTerminal>)>) -> Session {
+        Session {
+            workspaces: wts.into_iter().map(|(w, terminals)| SavedWorkspace {
+                worktree: w.map(PathBuf::from), terminals, active: None, layout: None,
+            }).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ident(id: u64, created: u64, agent: Option<&str>) -> SavedTerminal {
+        SavedTerminal {
+            id: Some(id), socket: Some("s".into()), created_ms: Some(created), cwd: PathBuf::from("/c"),
+            agent: agent.map(|sid| SavedAgent { kind: AgentKind::Claude, session_id: sid.into() }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn shrank_detects_lost_terminal_and_lost_agent() {
+        let old = sess(vec![(None, vec![ident(1, 10, Some("abcd1234")), ident(2, 20, None)])]);
+        assert!(!session_shrank(&old, &old));
+        // lost terminal / whole workspace
+        assert!(session_shrank(&old, &sess(vec![(None, vec![ident(1, 10, Some("abcd1234"))])])));
+        assert!(session_shrank(&old, &sess(vec![])));
+        // lost agent
+        assert!(session_shrank(&old, &sess(vec![(None, vec![ident(1, 10, None), ident(2, 20, None)])])));
+        // gained terminal, agent gained, agent changed id: not shrinks
+        let more = sess(vec![(None, vec![ident(1, 10, Some("abcd1234")), ident(2, 20, Some("zzzz9999")), ident(3, 30, None)])]);
+        assert!(!session_shrank(&old, &more));
+        let changed = sess(vec![(None, vec![ident(1, 10, Some("other-id-1")), ident(2, 20, None)])]);
+        assert!(!session_shrank(&old, &changed));
+        // same id but another incarnation (created_ms) is a different terminal
+        assert!(session_shrank(&old, &sess(vec![(None, vec![ident(1, 11, Some("abcd1234")), ident(2, 20, None)])])));
+        // terminal moved to another workspace is still the same terminal
+        let moved = sess(vec![(Some("/w"), vec![ident(1, 10, Some("abcd1234")), ident(2, 20, None)])]);
+        assert!(!session_shrank(&old, &moved));
+        assert!(!session_shrank(&Session::default(), &old));
+    }
+
+    #[test]
+    fn shrank_falls_back_to_workspace_cwd_and_position_without_identity() {
+        let plain = |cwd: &str, agent: bool| SavedTerminal {
+            cwd: PathBuf::from(cwd),
+            agent: agent.then(|| SavedAgent { kind: AgentKind::Claude, session_id: "abcd1234".into() }),
+            ..Default::default()
+        };
+        let old = sess(vec![(Some("/w"), vec![plain("/a", true), plain("/b", false)])]);
+        assert!(!session_shrank(&old, &old));
+        assert!(session_shrank(&old, &sess(vec![(Some("/w"), vec![plain("/a", true)])])));
+        assert!(session_shrank(&old, &sess(vec![(Some("/w"), vec![plain("/a", false), plain("/b", false)])])));
+        assert!(session_shrank(&old, &sess(vec![(Some("/x"), vec![plain("/a", true), plain("/b", false)])])));
+        assert!(session_shrank(&old, &sess(vec![(Some("/w"), vec![plain("/b", false), plain("/a", true)])])), "position matters");
+        // Old had identity, new lost it (owner gone): compared by cwd/position.
+        let old = sess(vec![(None, vec![ident(1, 10, None)])]);
+        let new = sess(vec![(None, vec![SavedTerminal { cwd: PathBuf::from("/c"), ..Default::default() }])]);
+        assert!(!session_shrank(&old, &new));
+    }
+
+    #[test]
+    fn save_delay_fast_for_growth_and_settled_for_shrink() {
+        let (fast, settle) = (Duration::from_millis(500), Duration::from_secs(5));
+        let t0 = Instant::now();
+        assert_eq!(save_due(false, None, t0, fast, settle), t0 + fast);
+        // first shrink: waits the full settle
+        let since = next_shrink_since(None, true, t0);
+        assert_eq!(since, Some(t0));
+        assert_eq!(save_due(true, since, t0, fast, settle), t0 + settle);
+        // continuing changes do not push it out
+        let t1 = t0 + Duration::from_secs(3);
+        let since = next_shrink_since(since, true, t1);
+        assert_eq!(since, Some(t0));
+        assert_eq!(save_due(true, since, t1, fast, settle), t0 + settle);
+        // back to a non-shrinking session: fast path again, mark cleared
+        let since = next_shrink_since(since, false, t1);
+        assert_eq!(since, None);
+        assert_eq!(save_due(false, since, t1, fast, settle), t1 + fast);
+        // a new shrink starts a new window
+        let t2 = t1 + Duration::from_secs(1);
+        assert_eq!(next_shrink_since(since, true, t2), Some(t2));
+    }
+
+    fn live_term(id: u64, agent: Option<sich_proto::AgentStatus>) -> TerminalInfo {
+        TerminalInfo { agent, ..term(id, None, "/h", id) }
+    }
+
+    fn agent_status(sid: Option<&str>, state: AgentState) -> sich_proto::AgentStatus {
+        sich_proto::AgentStatus {
+            kind: AgentKind::Claude, state, unread: false, since_unix_ms: 0, detail: None, model: None,
+            title: None, prompt: None, message: None, subagents: Vec::new(), session_id: sid.map(Into::into),
+        }
+    }
+
+    fn build_with(terminals: &[TerminalInfo], fallback: &HashMap<TermId, SavedAgent>) -> Session {
+        let ws = Workspaces::default();
+        let (c, g) = (HashSet::new(), HashSet::new());
+        build_session(&SessionInput {
+            terminals, ws: &ws, layouts: &HashMap::new(), projects: &[], groups: &[],
+            home_collapsed: false, collapsed: &c, collapsed_groups: &g,
+            window: None, sidebar_w: None, right_panel: RightPanelState::default(),
+            agent_fallback: fallback,
+        })
+    }
+
+    fn saved_agent(sid: &str) -> SavedAgent {
+        SavedAgent { kind: AgentKind::Claude, session_id: sid.into() }
+    }
+
+    #[test]
+    fn fallback_agent_is_kept_until_the_live_agent_reports_a_session() {
+        let fallback = HashMap::from([(1, saved_agent("abcd1234")), (2, saved_agent("abcd1234")), (3, saved_agent("bad id!!!"))]);
+        let terminals = [
+            live_term(1, None),
+            live_term(2, Some(agent_status(Some("live-5678"), AgentState::Working))),
+            live_term(3, None),
+            live_term(4, None),
+            live_term(5, Some(agent_status(None, AgentState::Working))),
+        ];
+        let s = build_with(&terminals, &fallback);
+        let t = &s.workspaces[0].terminals;
+        assert_eq!(t[0].agent, Some(saved_agent("abcd1234")), "fallback used when no live agent");
+        assert!(!t[0].interrupted);
+        assert_eq!(t[1].agent, Some(saved_agent("live-5678")), "live agent wins");
+        assert!(t[1].interrupted);
+        assert_eq!(t[2].agent, None, "invalid fallback id rejected");
+        assert_eq!(t[3].agent, None);
+        assert_eq!(t[4].agent, None, "no fallback, no session id");
+        // agent without session id but with fallback: fallback kept, never interrupted
+        let fallback = HashMap::from([(5, saved_agent("abcd1234"))]);
+        let s = build_with(&terminals, &fallback);
+        assert_eq!(s.workspaces[0].terminals[4].agent, Some(saved_agent("abcd1234")));
+        assert!(!s.workspaces[0].terminals[4].interrupted);
+    }
+
 
     // ---- resolve_collapsed ----
 

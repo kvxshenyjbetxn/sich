@@ -68,6 +68,10 @@ const MAX_PENDING_CREATES: usize = 8;
 /// Delay before a changed session is written to disk.
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 
+/// How long a session that lost terminals or agents must stay that way before it is written
+/// (a shutdown kills processes one by one, and that must not reach the file).
+const SESSION_SHRINK_SETTLE: Duration = Duration::from_secs(5);
+
 /// How long a session restore may take before it stops blocking session saves.
 const RESTORE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -81,6 +85,8 @@ fn countdown_changed(state: Option<AutoClose>, previous_ms: i64, now_ms: i64) ->
 struct RestoreTarget {
     key: WorkspaceKey,
     tokens: Vec<u64>,
+    /// Parallel to `tokens`: the agent a terminal is resumed with, if any.
+    agents: Vec<Option<session::SavedAgent>>,
     layout: Option<Layout<session::RestoreLeaf>>,
     active: Option<usize>,
     attached_active: Option<TermId>,
@@ -193,6 +199,14 @@ pub struct AppView {
     last_session: Option<Session>,
     pending_save: Option<Session>,
     save_scheduled: bool,
+    /// When the scheduled flush is due.
+    save_due: Option<Instant>,
+    /// Since when the pending session has been a shrink compared to `last_written`.
+    shrink_since: Option<Instant>,
+    /// The last session actually written to disk.
+    last_written: Option<Session>,
+    /// Agents restored terminals were resumed with, kept until the agent reports its own session.
+    restored_agents: HashMap<TermId, session::SavedAgent>,
     restarting_daemon: bool,
     restart_dialog_shown: bool,
     /// Orchestration data for the sidebar and banner, refreshed by the watcher.
@@ -393,6 +407,10 @@ impl AppView {
             last_session: None,
             pending_save: None,
             save_scheduled: false,
+            save_due: None,
+            shrink_since: None,
+            last_written: None,
+            restored_agents: HashMap::new(),
             restarting_daemon: false,
             restart_dialog_shown: false,
             orch: sich_orch::OrchSnapshot::default(),
@@ -894,6 +912,8 @@ impl AppView {
             let session = self.build_session(&infos);
             session.save()?;
             self.pending_save = None;
+            self.shrink_since = None;
+            self.last_written = Some(session);
         }
         Ok(())
     }
@@ -971,38 +991,93 @@ impl AppView {
             window: self.window_state,
             sidebar_w: Some(self.sidebar_w),
             right_panel: self.right_panel,
+            agent_fallback: &self.restored_agents,
         });
         session.daemon_pid = self.client.daemon_pid();
         session.record_owners(|key| self.client.owner(key));
         session
     }
 
-    /// Schedules a debounced save when the session differs from the last one seen.
+    /// Schedules a debounced save when the session differs from the last one seen. While
+    /// Windows is shutting down nothing is saved. A session that lost terminals or agents is
+    /// only written after `SESSION_SHRINK_SETTLE`.
     fn touch_session(&mut self, infos: &[TerminalInfo], cx: &mut Context<Self>) {
         if !self.session_ready() {
             return;
         }
+        if crate::win_shutdown::session_frozen() {
+            self.drop_frozen_save();
+            return;
+        }
+        self.prune_restored_agents(infos);
         let session = self.build_session(infos);
         if self.last_session.as_ref() == Some(&session) {
             return;
         }
+        let now = Instant::now();
+        let shrank = self.last_written.as_ref().is_some_and(|written| session::session_shrank(written, &session));
+        self.shrink_since = session::next_shrink_since(self.shrink_since, shrank, now);
+        let due = session::save_due(shrank, self.shrink_since, now, SESSION_SAVE_DEBOUNCE, SESSION_SHRINK_SETTLE);
         self.last_session = Some(session.clone());
         self.pending_save = Some(session);
-        if !self.save_scheduled {
-            self.save_scheduled = true;
-            cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(SESSION_SAVE_DEBOUNCE).await;
-                let _ = this.update(cx, |this, _| this.flush_session());
-            })
-            .detach();
-        }
+        self.schedule_save(due, cx);
     }
 
-    fn flush_session(&mut self) {
+    /// Forgets the pending save; `last_session` is cleared so the tick re-evaluates after thaw.
+    fn drop_frozen_save(&mut self) {
+        self.pending_save = None;
+        self.last_session = None;
+        self.shrink_since = None;
+        self.save_due = None;
         self.save_scheduled = false;
+    }
+
+    /// Resume fallbacks end when the terminal reports a session id or is gone.
+    fn prune_restored_agents(&mut self, infos: &[TerminalInfo]) {
+        self.restored_agents.retain(|id, _| {
+            infos.iter().find(|t| t.id == *id).is_some_and(|t| {
+                t.exited.is_none() && !t.agent.as_ref().is_some_and(|a| a.session_id.is_some())
+            })
+        });
+    }
+
+    /// Makes sure a flush runs at `due` (or earlier).
+    fn schedule_save(&mut self, due: Instant, cx: &mut Context<Self>) {
+        if self.save_scheduled && self.save_due.is_some_and(|scheduled| scheduled <= due) {
+            return;
+        }
+        self.save_scheduled = true;
+        self.save_due = Some(due);
+        let delay = due.saturating_duration_since(Instant::now());
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |this, cx| this.flush_session(cx));
+        })
+        .detach();
+    }
+
+    fn flush_session(&mut self, cx: &mut Context<Self>) {
+        if crate::win_shutdown::session_frozen() {
+            self.drop_frozen_save();
+            return;
+        }
+        if let Some(due) = self.save_due {
+            // A stale or early timer: the real deadline is still ahead.
+            if Instant::now() < due {
+                self.save_scheduled = false;
+                self.schedule_save(due, cx);
+                return;
+            }
+        }
+        self.save_scheduled = false;
+        self.save_due = None;
         if let Some(session) = self.pending_save.take() {
-            if let Err(e) = session.save() {
-                tracing::error!("failed to save session: {e:#}");
+            match session.save() {
+                Ok(()) => {
+                    self.shrink_since = None;
+                    self.last_written = Some(session);
+                }
+                Err(e) => tracing::error!("failed to save session: {e:#}"),
             }
         }
     }
@@ -1048,12 +1123,16 @@ impl AppView {
         for (key, terminals, active) in plan {
             let worktree = key.path().map(PathBuf::from);
             let mut tokens = Vec::with_capacity(terminals.len());
+            let mut agents = Vec::with_capacity(terminals.len());
             for term in terminals {
                 self.next_restore_token += 1;
                 let token = self.next_restore_token;
                 tokens.push(token);
-                let resume = term.agent.filter(|_| resume_agents)
+                let resume_agent = term.agent.filter(|_| resume_agents)
+                    .filter(|a| session::resume_command(a.kind, &a.session_id).is_some());
+                let resume = resume_agent.as_ref()
                     .and_then(|a| session::resume_command(a.kind, &a.session_id));
+                agents.push(resume_agent);
                 let data = RestoreData {
                     token,
                     scrollback: term.scrollback,
@@ -1070,7 +1149,7 @@ impl AppView {
             self.restore_targets.push(RestoreTarget {
                 attached_active: attached_active.get(&key).copied(),
                 layout: layouts.remove(&key),
-                key, tokens, active,
+                key, tokens, agents, active,
             });
         }
         self.restore_started = Some(Instant::now());
@@ -1091,6 +1170,7 @@ impl AppView {
     /// Resolve restored identities only by their request token and workspace.
     fn finish_restore_targets(&mut self, snap: &Snapshot) {
         let timed_out = self.restore_started.is_some_and(|t| t.elapsed() > RESTORE_TIMEOUT);
+        let mut restored_agents = std::mem::take(&mut self.restored_agents);
         self.restore_targets.retain(|target| {
             let ids: Vec<_> = target.tokens.iter().map(|token| {
                 snap.terminals.iter().find(|entry| {
@@ -1100,6 +1180,11 @@ impl AppView {
             }).collect();
             if ids.iter().any(Option::is_none) && !timed_out {
                 return true;
+            }
+            for (id, agent) in ids.iter().zip(&target.agents) {
+                if let (Some(id), Some(agent)) = (id, agent) {
+                    restored_agents.insert(*id, agent.clone());
+                }
             }
             let mapped = target.layout.as_ref().and_then(|layout| layout.remap(|leaf| match leaf {
                 session::RestoreLeaf::Live(id) => snap.terminals.iter()
@@ -1118,6 +1203,7 @@ impl AppView {
             }
             false
         });
+        self.restored_agents = restored_agents;
     }
 
     fn update_tray(&mut self, infos: &[TerminalInfo], cx: &mut Context<Self>) {
